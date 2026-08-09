@@ -10,6 +10,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	hostport "tornato.dev/ggrok/v2/internal"
+	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/mtls"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
@@ -36,13 +37,26 @@ type Config struct {
 	// CertFile, KeyFile, and CAFile identify relay to its peers and
 	// verify their certificates, per internal/mtls.
 	CertFile, KeyFile, CAFile string
+
+	// RevokedFile is an optional path to a newline-delimited serial list
+	// (see ca.RevokedSerials and the ca crl subcommand). A connecting peer
+	// whose certificate serial appears in it is rejected even though its
+	// chain still verifies against CAFile - without this, ca revoke is
+	// pure bookkeeping, since a revoked cert otherwise keeps authenticating
+	// until it naturally expires.
+	RevokedFile string
 }
 
 // Run listens for QUIC connections on Config.Listen and brokers them
 // between share (publisher) and listen (subscriber) peers until ctx is
 // canceled.
 func Run(ctx context.Context, cfg Config) error {
-	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, true)
+	revoked, err := loadRevokedSerials(cfg.RevokedFile)
+	if err != nil {
+		return fmt.Errorf("relay: %w", err)
+	}
+
+	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, true, revoked)
 	if err != nil {
 		return fmt.Errorf("relay: %w", err)
 	}
@@ -71,6 +85,28 @@ func Run(ctx context.Context, cfg Config) error {
 
 		go handleConn(ctx, logger, registry, conn)
 	}
+}
+
+// loadRevokedSerials reads path via ca.ParseRevokedSerials. An empty path
+// is not an error - it just means Run skips revocation checking entirely,
+// same as an operator who never ran ca crl.
+func loadRevokedSerials(path string) (map[string]struct{}, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open revoked file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	serials, err := ca.ParseRevokedSerials(f)
+	if err != nil {
+		return nil, fmt.Errorf("parse revoked file %s: %w", path, err)
+	}
+
+	return serials, nil
 }
 
 // handleConn reads the peer's Hello off the first stream it opens and

@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -27,6 +28,7 @@ Usage:
   ggrok ca issue  [flags]
   ggrok ca list   [flags]
   ggrok ca revoke [flags]
+  ggrok ca crl    [flags]
 `
 
 // caCertFile and caKeyFile are the well-known names `ca init` writes the
@@ -54,6 +56,7 @@ var caCommands = map[string]func(args []string) error{
 	"issue":  runCAIssue,
 	"list":   runCAList,
 	"revoke": runCARevoke,
+	"crl":    runCACRL,
 }
 
 // runCA dispatches to the proper ca sub-verb. Unlike the top-level share
@@ -397,6 +400,61 @@ func runCARevoke(args []string) error {
 	}
 
 	fmt.Fprintf(os.Stdout, "revoked certificate(s) for %q\n", cfg.commonName)
+
+	return nil
+}
+
+// caCRLConfig is the parsed and validated input to `ca crl`.
+type caCRLConfig struct {
+	// caDir is the directory containing the root CA's key and certificate.
+	caDir string
+
+	// out is the path to write the revoked-serial list to.
+	out string
+}
+
+// runCACRL exports every revoked certificate's serial number to a plain
+// newline-delimited file, meant to be copied out to the relay (see the
+// relay -revoked-file flag) so ca revoke actually cuts a peer off instead
+// of being pure local bookkeeping - relay never holds the CA's private key
+// or directory, so this file is the only way it learns what's revoked.
+func runCACRL(args []string) error {
+	fs := flag.NewFlagSet("ca crl", flag.ExitOnError)
+	fs.SetOutput(os.Stderr)
+
+	var cfg caCRLConfig
+	fs.StringVar(&cfg.caDir, "ca-dir", "", caDirFlagHelp)
+	fs.StringVar(&cfg.out, "out", "", "path to write the revoked-serial list to")
+
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+
+	if cfg.out == "" {
+		fs.Usage()
+		return fmt.Errorf("-out is required")
+	}
+
+	if err := resolveCADir(&cfg.caDir); err != nil {
+		return err
+	}
+
+	serials, err := ca.RevokedSerials(cfg.caDir)
+	if err != nil {
+		return fmt.Errorf("read revoked certificates: %w", err)
+	}
+
+	var b strings.Builder
+	for serial := range serials {
+		b.WriteString(serial)
+		b.WriteByte('\n')
+	}
+
+	if err := os.WriteFile(cfg.out, []byte(b.String()), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", cfg.out, err)
+	}
+
+	fmt.Fprintf(os.Stdout, "wrote %d revoked serial(s) to %s\n", len(serials), cfg.out)
 
 	return nil
 }

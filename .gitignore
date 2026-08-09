@@ -1,3 +1,4 @@
 /ggrok
 build/
 dist/
+.DS_Store

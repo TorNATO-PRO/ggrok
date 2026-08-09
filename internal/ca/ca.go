@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"bufio"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -9,10 +10,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -297,6 +300,49 @@ func Revoke(caDirectory, commonName string) error {
 	}
 
 	return nil
+}
+
+// RevokedSerials returns the serial number (SerialTextBase-encoded) of
+// every certificate under caDirectory's revoked subdirectory. It's the
+// write side of the relay's revocation check: relay never holds the CA's
+// private key or directory, so it can't consult List/Revoke directly - an
+// operator instead exports this set (see the ca crl subcommand) and copies
+// it to the relay out of band.
+func RevokedSerials(caDirectory string) (map[string]struct{}, error) {
+	revoked, err := readCertDir(filepath.Join(caDirectory, revokedDirName))
+	if err != nil {
+		return nil, fmt.Errorf("read revoked certificates: %w", err)
+	}
+
+	serials := make(map[string]struct{}, len(revoked))
+	for _, c := range revoked {
+		serials[c.Cert.SerialNumber.Text(SerialTextBase)] = struct{}{}
+	}
+
+	return serials, nil
+}
+
+// ParseRevokedSerials reads the newline-delimited serial list RevokedSerials
+// produces, so a relay can load it without ever needing the CA's directory
+// or private key. Blank lines are ignored so the file can be hand-edited.
+func ParseRevokedSerials(r io.Reader) (map[string]struct{}, error) {
+	serials := make(map[string]struct{})
+
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		serials[line] = struct{}{}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan revoked serials: %w", err)
+	}
+
+	return serials, nil
 }
 
 // Store persists a freshly issued certificate's public half under

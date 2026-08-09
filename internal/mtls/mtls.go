@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
 
@@ -21,7 +22,13 @@ import (
 // and verify the connecting client's certificate) from a dialing share or
 // listen client (which verifies relay's server certificate via the same CA
 // pool instead of the public web PKI, so no InsecureSkipVerify is needed).
-func LoadConfig(certFile, keyFile, caFile string, server bool) (*tls.Config, error) {
+//
+// revokedSerials is relay's revocation list (see ca.ParseRevokedSerials);
+// nil or empty skips the check entirely, and it's only ever consulted when
+// server is true - a chain-valid cert of relay's own is never revoked out
+// from under a dialing share/listen client mid-flow the way a client's can
+// be by its operator.
+func LoadConfig(certFile, keyFile, caFile string, server bool, revokedSerials map[string]struct{}) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load certificate/key: %w", err)
@@ -54,9 +61,38 @@ func LoadConfig(certFile, keyFile, caFile string, server bool) (*tls.Config, err
 	if server {
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		cfg.ClientCAs = pool
+
+		if len(revokedSerials) > 0 {
+			cfg.VerifyPeerCertificate = verifyNotRevoked(revokedSerials)
+		}
 	} else {
 		cfg.RootCAs = pool
 	}
 
 	return cfg, nil
+}
+
+// verifyNotRevoked returns a VerifyPeerCertificate callback rejecting a
+// peer whose certificate serial appears in revoked. By the time
+// VerifyPeerCertificate runs, tls.RequireAndVerifyClientCert has already
+// confirmed the chain is valid and unexpired - revocation is the one thing
+// standard chain verification can't express, since a revoked cert would
+// otherwise keep authenticating until it naturally expires (see
+// ca.DefaultDeviceValidity).
+func verifyNotRevoked(revoked map[string]struct{}) func([][]byte, [][]*x509.Certificate) error {
+	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+		for _, chain := range verifiedChains {
+			if len(chain) == 0 {
+				continue
+			}
+
+			leaf := chain[0]
+			if _, isRevoked := revoked[leaf.SerialNumber.Text(ca.SerialTextBase)]; isRevoked {
+				return fmt.Errorf("certificate %q (serial %s) has been revoked",
+					leaf.Subject.CommonName, leaf.SerialNumber.Text(ca.SerialTextBase))
+			}
+		}
+
+		return nil
+	}
 }

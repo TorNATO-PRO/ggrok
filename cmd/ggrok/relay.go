@@ -37,6 +37,12 @@ type relayConfig struct {
 	// caFile is the path to the CA certificate used to verify a peer's
 	// (share/get client's) certificate.
 	caFile string
+
+	// revokedFile is an optional path to a newline-delimited serial list
+	// (ggrok ca crl) of certificates the CA has since revoked; a
+	// connecting peer matching one is rejected even though its chain
+	// still verifies against caFile.
+	revokedFile string
 }
 
 // relayUsage marks the usage string for the relay subcommand.
@@ -72,6 +78,8 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 	fs.StringVar(&cfg.certFile, "cert-file", "", "path to the relay's own certificate")
 	fs.StringVar(&cfg.keyFile, "key-file", "", "path to the relay's private key")
 	fs.StringVar(&cfg.caFile, "ca-file", "", "path to the CA certificate used to verify peers")
+	fs.StringVar(&cfg.revokedFile, "revoked-file", "",
+		"path to a revoked-serial list from `ggrok ca crl` (optional; omit to skip revocation checks)")
 
 	if err := parseFlags(fs, args); err != nil {
 		return relayConfig{}, err
@@ -92,9 +100,10 @@ func runRelay(args []string) error {
 	defer stop()
 
 	return relay.Run(ctx, relay.Config{
-		Listen:   cfg.listen,
-		CertFile: cfg.certFile,
-		KeyFile:  cfg.keyFile,
-		CAFile:   cfg.caFile,
+		Listen:      cfg.listen,
+		CertFile:    cfg.certFile,
+		KeyFile:     cfg.keyFile,
+		CAFile:      cfg.caFile,
+		RevokedFile: cfg.revokedFile,
 	})
 }

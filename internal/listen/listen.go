@@ -57,7 +57,7 @@ type Config struct {
 // Config.Addr's local traffic through the tunnel until ctx is canceled or
 // an unrecoverable error occurs.
 func Run(ctx context.Context, cfg Config) error {
-	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, false)
+	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, false, nil)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
