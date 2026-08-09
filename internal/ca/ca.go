@@ -173,7 +173,8 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 	if notAfter := now.Add(request.Validity); notAfter.After(c.Cert.NotAfter) {
 		return nil, fmt.Errorf(
 			"requested validity outlives the CA certificate (CA expires %s)",
-			c.Cert.NotAfter.Format(time.RFC3339))
+			c.Cert.NotAfter.Format(time.RFC3339),
+		)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

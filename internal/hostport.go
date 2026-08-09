@@ -1,7 +1,6 @@
-// This type was driven out of the need for proper parsed
-// and validated type indicating that we do indeed have a valid
-// DNS name, IPv4, IPv6 address and port pairing. This will help
-// make callsites cleaner down the line.
+// Package hostport provides a parsed and validated type indicating that we
+// do indeed have a valid DNS name, IPv4, IPv6 address and port pairing. This
+// will help make callsites cleaner down the line.
 package hostport
 
 import (
@@ -18,7 +17,7 @@ import (
 type Kind uint8
 
 const (
-	// KindIP is the kind when a HostPort is a resolved IP address
+	// KindIP is the kind when a HostPort is a resolved IP address.
 	KindIP Kind = iota
 
 	// KindName is when the HostPort is a DNS name.
@@ -26,6 +25,8 @@ const (
 )
 
 // HostPort is host:port where host is either a resolved IP or a DNS name.
+//
+//nolint:recvcheck // UnmarshalText needs a pointer receiver to satisfy encoding.TextUnmarshaler; every other method uses a value receiver since HostPort is a small, cheaply-copied value type.
 type HostPort struct {
 	// kind is the kind of the HostPort
 	kind Kind
@@ -47,12 +48,12 @@ var ErrInvalidHostPort = errors.New("hostport: invalid host:port")
 func Parse(s string) (HostPort, error) {
 	host, portStr, err := net.SplitHostPort(s)
 	if err != nil {
-		return HostPort{}, fmt.Errorf("%w: %v", ErrInvalidHostPort, err)
+		return HostPort{}, fmt.Errorf("%w: %w", ErrInvalidHostPort, err)
 	}
 
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return HostPort{}, fmt.Errorf("%w: bad port: %v", ErrInvalidHostPort, err)
+		return HostPort{}, fmt.Errorf("%w: bad port: %w", ErrInvalidHostPort, err)
 	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {

@@ -1,18 +1,22 @@
 // The relay subcommand runs the QUIC-based rendezvous server that brokers
-// between a share and a get. It maps a token to a client's session and can
-// ask that client "send the file for token X", but it never reads or stores
-// the file itself. It authenticates to its peers with a certificate issued
-// by our CA (see the ca subcommand), and they authenticate to it the same
-// way - all mTLS, no public web PKI involved.
+// between a share (publisher) and any number of listen (subscriber) peers
+// holding the matching token. It pairs their connections and mirrors
+// QUIC-level events (new stream, datagram) between them - it never
+// terminates TCP or UDP itself. It authenticates to its peers with a
+// certificate issued by our CA (see the ca subcommand), and they
+// authenticate to it the same way - all mTLS, no public web PKI involved.
 
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 
 	hostport "tornato.dev/ggrok/v2/internal"
+	"tornato.dev/ggrok/v2/internal/relay"
 )
 
 // relayConfig is the parsed and validated input to a relay.
@@ -77,13 +81,20 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 }
 
 // runRelay runs the relay command, brokering QUIC connections between
-// shares and gets without ever reading the shared file itself.
+// shares and listeners without ever terminating TCP or UDP itself.
 func runRelay(args []string) error {
-	_, err := parseRelayFlags(args)
+	cfg, err := parseRelayFlags(args)
 	if err != nil {
 		return err
 	}
 
-	// TODO: unimplemented
-	return nil
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	return relay.Run(ctx, relay.Config{
+		Listen:   cfg.listen,
+		CertFile: cfg.certFile,
+		KeyFile:  cfg.keyFile,
+		CAFile:   cfg.caFile,
+	})
 }

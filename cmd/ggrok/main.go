@@ -26,7 +26,8 @@ const usage = `ggrok: share and receive one local file at a public URL.
 
 Usage:
   ggrok share [flags] <file>
-  ggrok get [flags] <url>
+  ggrok share -tcp|-udp <addr> [flags]
+  ggrok listen -tcp|-udp <addr> [flags] <token>
   ggrok relay [flags]
   ggrok ca <init|issue|list|revoke> [flags]
 
@@ -44,6 +45,10 @@ var errUsage = errors.New("invalid flags")
 // recognizes, whether at the top level (e.g. `ggrok bogus`) or within a
 // space that has its own sub-verbs (e.g. `ggrok ca bogus`).
 var errUnknownCommand = errors.New("unknown command")
+
+// exitUsageError is the conventional Unix exit code for a command invoked
+// with invalid arguments, as opposed to exitFailure for everything else.
+const exitUsageError = 2
 
 // dispatch looks up args[0] in cmds and invokes it with the remaining
 // arguments. When args is empty, or its first element is a help flag,
@@ -87,10 +92,10 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 // accepts as a list of argument strings as an input. When no command
 // is provided, we default to the share functionality.
 var commands = map[string]func(args []string) error{
-	"share": runShare,
-	"get":   runGet,
-	"relay": runRelay,
-	"ca":    runCA,
+	"share":  runShare,
+	"listen": runListen,
+	"relay":  runRelay,
+	"ca":     runCA,
 }
 
 // run runs a command over arguments passed by a user. It will
@@ -107,7 +112,7 @@ func main() {
 		return
 	case errors.Is(err, errUsage):
 		// The flag package already described the problem and printed usage.
-		os.Exit(2)
+		os.Exit(exitUsageError)
 	default:
 		fmt.Fprintf(os.Stderr, "ggrok: %v\n", err)
 		os.Exit(1)

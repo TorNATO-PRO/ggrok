@@ -10,6 +10,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"text/tabwriter"
@@ -191,6 +192,20 @@ type caIssueConfig struct {
 
 	// ttl is how long the issued certificate is valid for.
 	ttl time.Duration
+
+	// server marks the certificate for server authentication as well as
+	// client authentication - required for relay's own identity, since
+	// share/listen verify relay's certificate as a TLS server cert when
+	// they dial it.
+	server bool
+
+	// dnsNames and ips are the Subject Alternative Names embedded in the
+	// certificate. Required for -server certificates: a TLS client
+	// verifies the server's certificate against the address it dialed,
+	// so relay's cert needs a SAN matching however share/listen will
+	// reach it (e.g. -ip 127.0.0.1, or -dns-name relay.example.com).
+	dnsNames []string
+	ips      []net.IP
 }
 
 // runCAIssue issues a leaf certificate, signed by the root CA, for a given
@@ -204,6 +219,33 @@ func runCAIssue(args []string) error {
 	fs.StringVar(&cfg.commonName, "common-name", "", "identity to issue a certificate for")
 	fs.StringVar(&cfg.out, "out", "", "directory to write the issued certificate, key, and CA certificate to")
 	fs.DurationVar(&cfg.ttl, "ttl", ca.DefaultDeviceValidity, "how long the issued certificate is valid for")
+	fs.BoolVar(
+		&cfg.server,
+		"server",
+		false,
+		"also mark the certificate for server authentication (required for relay's identity)",
+	)
+	fs.Func(
+		"dns-name",
+		"a DNS name SAN to embed (repeatable; required for -server certs reached by hostname)",
+		func(name string) error {
+			cfg.dnsNames = append(cfg.dnsNames, name)
+			return nil
+		},
+	)
+	fs.Func(
+		"ip",
+		"an IP SAN to embed (repeatable; required for -server certs reached by IP, e.g. 127.0.0.1)",
+		func(s string) error {
+			ip := net.ParseIP(s)
+			if ip == nil {
+				return fmt.Errorf("invalid IP %q", s)
+			}
+
+			cfg.ips = append(cfg.ips, ip)
+			return nil
+		},
+	)
 
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -228,7 +270,13 @@ func runCAIssue(args []string) error {
 		return err
 	}
 
-	bundle, err := root.Issue(ca.IssueRequest{CommonName: cfg.commonName, Validity: cfg.ttl})
+	bundle, err := root.Issue(ca.IssueRequest{
+		CommonName: cfg.commonName,
+		Validity:   cfg.ttl,
+		Server:     cfg.server,
+		DNSNames:   cfg.dnsNames,
+		IPs:        cfg.ips,
+	})
 	if err != nil {
 		return fmt.Errorf("issue certificate: %w", err)
 	}
