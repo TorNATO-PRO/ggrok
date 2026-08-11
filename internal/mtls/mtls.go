@@ -1,7 +1,10 @@
 // Package mtls builds the mutual-TLS config shared by share, listen, and
-// relay. All three speak QUIC to each other over a private CA instead of
-// the public web PKI - every node needs a certificate issued by that same
-// CA, and every node verifies its peer against it.
+// relay: TCP-mode connections and UDP-mode's control connections use it
+// directly for TLS 1.3 over TCP, and UDP-mode's data plane derives its
+// per-packet AEAD keys from it (see internal/udpcrypto). All three verify
+// each other against a private CA instead of the public web PKI - every
+// node needs a certificate issued by that same CA, and every node
+// verifies its peer against it.
 package mtls
 
 import (
@@ -28,7 +31,11 @@ import (
 // server is true - a chain-valid cert of relay's own is never revoked out
 // from under a dialing share/listen client mid-flow the way a client's can
 // be by its operator.
-func LoadConfig(certFile, keyFile, caFile string, server bool, revokedSerials map[string]struct{}) (*tls.Config, error) {
+func LoadConfig(
+	certFile, keyFile, caFile string,
+	server bool,
+	revokedSerials map[string]struct{},
+) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load certificate/key: %w", err)
@@ -65,6 +72,14 @@ func LoadConfig(certFile, keyFile, caFile string, server bool, revokedSerials ma
 		if len(revokedSerials) > 0 {
 			cfg.VerifyPeerCertificate = verifyNotRevoked(revokedSerials)
 		}
+
+		// A resumed TLS 1.3 connection skips the client Certificate
+		// message and doesn't re-run VerifyPeerCertificate, which is
+		// the hook verifyNotRevoked above depends on - so leaving
+		// session tickets enabled would let a revoked cert keep
+		// authenticating via a cached ticket for the ticket's
+		// lifetime, silently undermining -revoked-file.
+		cfg.SessionTicketsDisabled = true
 	} else {
 		cfg.RootCAs = pool
 	}
@@ -74,7 +89,7 @@ func LoadConfig(certFile, keyFile, caFile string, server bool, revokedSerials ma
 
 // verifyNotRevoked returns a VerifyPeerCertificate callback rejecting a
 // peer whose certificate serial appears in revoked. By the time
-// VerifyPeerCertificate runs, tls.RequireAndVerifyClientCert has already
+// VerifyPeerCertificate runs, [tls.RequireAndVerifyClientCert] has already
 // confirmed the chain is valid and unexpired - revocation is the one thing
 // standard chain verification can't express, since a revoked cert would
 // otherwise keep authenticating until it naturally expires (see

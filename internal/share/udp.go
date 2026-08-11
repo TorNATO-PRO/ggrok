@@ -2,15 +2,15 @@ package share
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/proto"
+	"tornato.dev/ggrok/v2/internal/udpcrypto"
 )
 
 const (
@@ -22,9 +22,67 @@ const (
 	udpSweepInterval = 30 * time.Second
 
 	// udpReadBufferSize is the max size of a single reply read from a
-	// NAT entry's local socket before it's forwarded as a datagram.
+	// NAT entry's local socket, or a single datagram read off udpSession,
+	// before it's forwarded on.
 	udpReadBufferSize = 64 * 1024
 )
+
+// setupUDPSession reads the ControlUDPSession frame relay sends
+// immediately after a successful UDP-mode Handshake, derives this hop's
+// AEAD key pair off control's own connection state (RFC 5705 - no key
+// material crosses the wire; both ends of the same TLS connection derive
+// identical output for identical inputs), dials relay's UDP data socket,
+// and returns a ready-to-use udpcrypto.Session.
+func setupUDPSession(
+	ctx context.Context,
+	control *tls.Conn,
+	server hostport.HostPort,
+	token proto.Token,
+) (*udpcrypto.Session, error) {
+	typ, payload, err := proto.ReadControlFrame(control)
+	if err != nil {
+		return nil, fmt.Errorf("read udp session: %w", err)
+	}
+	if typ != proto.ControlUDPSession {
+		return nil, fmt.Errorf("expected ControlUDPSession, got frame type %d", typ)
+	}
+
+	routing, err := proto.ReadUDPSession(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	state := control.ConnectionState()
+	sendKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionUplink)
+	if err != nil {
+		return nil, err
+	}
+	recvKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionDownlink)
+	if err != nil {
+		return nil, err
+	}
+
+	var dialer net.Dialer
+	udpConn, err := dialer.DialContext(ctx, "udp", server.String())
+	if err != nil {
+		return nil, fmt.Errorf("dial %s udp: %w", server, err)
+	}
+
+	session, err := udpcrypto.NewSession(udpConn, routing, sendKey, recvKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// relay only learns this hop's source address from a packet it
+	// actually receives - an empty punch datagram right now guarantees
+	// that happens before any real traffic needs to flow, rather than
+	// leaving it to chance which side happens to send first.
+	if err := session.Send(nil); err != nil {
+		return nil, fmt.Errorf("punch udp session: %w", err)
+	}
+
+	return session, nil
+}
 
 // natKey identifies one virtual remote client: a specific local client of
 // a specific subscriber, disambiguated since many subscribers' traffic
@@ -50,20 +108,30 @@ type natTable struct {
 	entries map[natKey]*natEntry
 }
 
-// runUDP is the UDP-mode counterpart to runTCP: it reads relay-framed
-// datagrams off conn, routes each to a per-(subscriber, flow) local UDP
+// runUDP is share's UDP-mode data plane: it reads relay-framed datagrams
+// off udpSession, routes each to a per-(subscriber, flow) local UDP
 // socket dialed to addr, and forwards that socket's replies back the same
-// way.
-func runUDP(ctx context.Context, conn *quic.Conn, addr hostport.HostPort) error {
+// way. It runs until ctx is canceled, udpSession errors, or the control
+// connection's heartbeat loop decides relay is dead.
+func runUDP(ctx context.Context, control *tls.Conn, udpSession *udpcrypto.Session, addr hostport.HostPort) error {
 	table := &natTable{entries: make(map[natKey]*natEntry)}
 	defer table.closeAll()
 
 	go table.sweep(ctx)
 
+	heartbeatErr := make(chan error, 1)
+	go func() { heartbeatErr <- runControlLoop(ctx, control, func(uint64) {}) }()
+
+	buf := make([]byte, udpReadBufferSize)
 	for {
-		data, err := conn.ReceiveDatagram(ctx)
+		data, err := udpSession.Recv(buf)
 		if err != nil {
-			return fmt.Errorf("receive datagram: %w", err)
+			select {
+			case hErr := <-heartbeatErr:
+				return fmt.Errorf("control connection: %w", hErr)
+			default:
+				return fmt.Errorf("receive datagram: %w", err)
+			}
 		}
 
 		sub, flow, payload, err := proto.DecodePublisherFrame(data)
@@ -71,7 +139,7 @@ func runUDP(ctx context.Context, conn *quic.Conn, addr hostport.HostPort) error 
 			continue // malformed frame from a misbehaving relay; drop it
 		}
 
-		entry, err := table.get(ctx, conn, addr, sub, flow)
+		entry, err := table.get(ctx, udpSession, addr, sub, flow)
 		if err != nil {
 			continue // local dial failed; drop this datagram, the next one retries
 		}
@@ -85,7 +153,7 @@ func runUDP(ctx context.Context, conn *quic.Conn, addr hostport.HostPort) error 
 // that (subscriber, flow) pair.
 func (t *natTable) get(
 	ctx context.Context,
-	conn *quic.Conn,
+	udpSession *udpcrypto.Session,
 	addr hostport.HostPort,
 	sub proto.SubscriberID,
 	flow proto.FlowID,
@@ -115,16 +183,16 @@ func (t *natTable) get(
 	t.entries[key] = entry
 	t.mu.Unlock()
 
-	go t.pump(conn, local, key)
+	go t.pump(udpSession, local, key)
 
 	return entry, nil
 }
 
 // pump reads replies from a NAT entry's local socket and forwards them
-// back through conn, tagged with the header that routes them to the right
-// subscriber's right local client. It runs until the local socket errors
-// or closes, then evicts its own entry.
-func (t *natTable) pump(conn *quic.Conn, local net.Conn, key natKey) {
+// back through udpSession, tagged with the header that routes them to the
+// right subscriber's right local client. It runs until the local socket
+// errors or closes, then evicts its own entry.
+func (t *natTable) pump(udpSession *udpcrypto.Session, local net.Conn, key natKey) {
 	buf := make([]byte, udpReadBufferSize)
 	for {
 		n, err := local.Read(buf)
@@ -133,7 +201,7 @@ func (t *natTable) pump(conn *quic.Conn, local net.Conn, key natKey) {
 			return
 		}
 
-		if err := conn.SendDatagram(proto.EncodePublisherFrame(key.sub, key.flow, buf[:n])); err != nil {
+		if err := udpSession.Send(proto.EncodePublisherFrame(key.sub, key.flow, buf[:n])); err != nil {
 			t.evict(key)
 			return
 		}

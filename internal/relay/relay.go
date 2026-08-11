@@ -2,12 +2,12 @@ package relay
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
-
-	"github.com/quic-go/quic-go"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/ca"
@@ -15,23 +15,21 @@ import (
 	"tornato.dev/ggrok/v2/internal/proto"
 )
 
-// keepAlivePeriod and maxIdleTimeout keep a connection alive through long
-// idle stretches between forwarded connections/flows. quic-go disables
-// keep-alives by default, which would otherwise let MaxIdleTimeout tear
-// down an otherwise-healthy tunnel.
-const (
-	keepAlivePeriod = 15 * time.Second
-	maxIdleTimeout  = 30 * time.Second
+// helloTimeout bounds how long relay waits for a freshly accepted
+// connection to send its ConnKind and then a Hello (control) or Attach
+// (data) - a peer that connects and never sends anything would otherwise
+// sit open forever.
+const helloTimeout = 10 * time.Second
 
-	// maxIncomingStreams is raised from quic-go's default of 100 since
-	// relay multiplexes every subscriber's every forwarded TCP
-	// connection as a new incoming stream on the publisher's connection.
-	maxIncomingStreams = 10_000
-)
+// heartbeatSilenceTimeout is how long relay waits without receiving
+// anything on a control connection before treating the peer as dead.
+// share/listen send a ControlPing well inside this window, so exceeding
+// it means the peer is gone or hung - see runHeartbeatLoop.
+const heartbeatSilenceTimeout = 30 * time.Second
 
 // Config is the input to Run.
 type Config struct {
-	// Listen is the address relay's QUIC listener binds to.
+	// Listen is the address relay's TCP listener binds to.
 	Listen hostport.HostPort
 
 	// CertFile, KeyFile, and CAFile identify relay to its peers and
@@ -47,7 +45,7 @@ type Config struct {
 	RevokedFile string
 }
 
-// Run listens for QUIC connections on Config.Listen and brokers them
+// Run listens for TCP connections on Config.Listen and brokers them
 // between share (publisher) and listen (subscriber) peers until ctx is
 // canceled.
 func Run(ctx context.Context, cfg Config) error {
@@ -61,29 +59,56 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("relay: %w", err)
 	}
 
-	quicConf := &quic.Config{
-		EnableDatagrams:    true,
-		KeepAlivePeriod:    keepAlivePeriod,
-		MaxIdleTimeout:     maxIdleTimeout,
-		MaxIncomingStreams: maxIncomingStreams,
-	}
-
-	listener, err := quic.ListenAddr(cfg.Listen.String(), tlsConf, quicConf)
+	listener, err := tls.Listen("tcp", cfg.Listen.String(), tlsConf)
 	if err != nil {
 		return fmt.Errorf("relay: listen on %s: %w", cfg.Listen, err)
 	}
 	defer func() { _ = listener.Close() }()
 
-	registry := NewRegistry()
+	// UDP mode's data plane is a second, independent socket at the same
+	// host:port - TCP and UDP have separate port namespaces, so this
+	// never conflicts with the listener above.
+	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Listen.String())
+	if err != nil {
+		return fmt.Errorf("relay: resolve %s: %w", cfg.Listen, err)
+	}
+	udpSocket, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("relay: listen udp on %s: %w", cfg.Listen, err)
+	}
+	defer func() { _ = udpSocket.Close() }()
+
+	router := newUDPRouter(udpSocket)
+	go router.run(ctx)
+
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+		_ = udpSocket.Close()
+	}()
+
+	registry := NewRegistry(router)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	for {
-		conn, err := listener.Accept(ctx)
+		conn, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("relay: accept: %w", err)
 		}
 
-		go handleConn(ctx, logger, registry, conn)
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			// tls.Listen's Listener always hands back *tls.Conn from
+			// Accept; this is unreachable in practice, but fail closed
+			// rather than panic on a type assertion further down.
+			_ = conn.Close()
+			continue
+		}
+
+		go handleConn(ctx, logger, registry, tlsConn)
 	}
 }
 
@@ -92,7 +117,7 @@ func Run(ctx context.Context, cfg Config) error {
 // same as an operator who never ran ca crl.
 func loadRevokedSerials(path string) (map[string]struct{}, error) {
 	if path == "" {
-		return nil, nil
+		return map[string]struct{}{}, nil
 	}
 
 	f, err := os.Open(path)
@@ -109,34 +134,48 @@ func loadRevokedSerials(path string) (map[string]struct{}, error) {
 	return serials, nil
 }
 
-// handleConn reads the peer's Hello off the first stream it opens and
-// dispatches to Registry.Register (publish) or Registry.Bridge
-// (subscribe) for the life of the connection.
-//
-// Deliberately absent: any call to conn.CloseWithError. Every path here
-// either ends because the peer (or quic-go's own MaxIdleTimeout) already
-// closed the connection - so conn.Context() is already Done and an active
-// close would be a no-op - or ends right after writing a rejection ack,
-// where an active close could race the peer's read of that very ack (see
-// Registry.Bridge's doc comment). Letting quic-go's idle timeout reap
-// anything that goes quiet, instead of racing to close it ourselves, is
-// what makes every path here safe by construction rather than by a tuned
-// grace period.
-func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *quic.Conn) {
-	stream, err := conn.AcceptStream(ctx)
+// handleConn reads the ConnKind a peer sends immediately after connecting
+// - before anything else, including the TLS handshake proper, which
+// Read/Write trigger lazily - and dispatches to handleControlConn or
+// handleDataConn. It owns closing conn only for the cases where neither
+// of those takes over that responsibility (see their doc comments).
+func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(helloTimeout))
+
+	kind, err := proto.ReadConnKind(conn)
 	if err != nil {
+		logger.WarnContext(ctx, "read conn kind", "peer", conn.RemoteAddr(), "err", err)
+		_ = conn.Close()
 		return
 	}
 
-	hello, err := proto.ReadHello(stream)
+	switch kind {
+	case proto.ConnControl:
+		handleControlConn(ctx, logger, registry, conn)
+	case proto.ConnData:
+		handleDataConn(ctx, logger, registry, conn)
+	default:
+		_ = conn.Close()
+	}
+}
+
+// handleControlConn reads a Hello and dispatches to Registry.Register
+// (publish) or Registry.Subscribe (subscribe), then runs the heartbeat
+// loop for the life of the session. It always closes conn before
+// returning.
+func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	hello, err := proto.ReadHello(conn)
 	if err != nil {
 		logger.WarnContext(ctx, "read hello", "peer", conn.RemoteAddr(), "err", err)
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{}) // runHeartbeatLoop manages its own deadlines from here
 
 	switch hello.Role {
 	case proto.RolePublish:
-		unregister, err := registry.Register(stream, hello.Token, hello.Mode, conn)
+		unregister, err := registry.Register(conn, hello.Token, hello.Mode)
 		if err != nil {
 			logger.WarnContext(ctx, "register publisher", "peer", conn.RemoteAddr(), "err", err)
 			return
@@ -144,12 +183,74 @@ func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, co
 		defer unregister()
 
 		logger.InfoContext(ctx, "publisher registered", "peer", conn.RemoteAddr(), "mode", hello.Mode)
-		<-conn.Context().Done()
+		runHeartbeatLoop(ctx, conn)
 
 	case proto.RoleSubscribe:
-		logger.InfoContext(ctx, "subscriber bridging", "peer", conn.RemoteAddr(), "mode", hello.Mode)
-		if err := registry.Bridge(ctx, stream, hello.Token, hello.Mode, conn); err != nil {
-			logger.WarnContext(ctx, "bridge subscriber", "peer", conn.RemoteAddr(), "err", err)
+		_, release, err := registry.Subscribe(conn, hello.Token, hello.Mode)
+		if err != nil {
+			logger.WarnContext(ctx, "subscribe", "peer", conn.RemoteAddr(), "err", err)
+			return
 		}
+		defer release()
+
+		logger.InfoContext(ctx, "subscriber attached", "peer", conn.RemoteAddr(), "mode", hello.Mode)
+		runHeartbeatLoop(ctx, conn)
+	}
+}
+
+// runHeartbeatLoop reads ControlType frames off conn, replying to every
+// ControlPing with a ControlPong, until conn errors, goes silent for
+// longer than heartbeatSilenceTimeout, or ctx is canceled. share/listen
+// are the ones that periodically send ControlPing (see their own
+// heartbeatInterval) - relay only ever replies - so a silence timeout
+// here is what lets relay notice a publisher/subscriber that's gone or
+// hung, symmetric to how share/listen notice a dead relay by timing out
+// waiting for a ControlPong.
+func runHeartbeatLoop(ctx context.Context, conn *tls.Conn) {
+	for ctx.Err() == nil {
+		_ = conn.SetReadDeadline(time.Now().Add(heartbeatSilenceTimeout))
+
+		typ, _, err := proto.ReadControlFrame(conn)
+		if err != nil {
+			return
+		}
+
+		if typ == proto.ControlPing {
+			if err := proto.WriteControlFrame(conn, proto.ControlPong, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// handleDataConn reads the Attach a peer sends on a fresh TCP-mode data
+// connection and pairs it with its counterpart via the registry. It
+// closes conn itself only on a failure path - on success, ownership of
+// conn has passed into Registry.AttachSubscriberData/AttachPublisherData
+// (see their doc comments for why).
+func handleDataConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
+	attach, err := proto.ReadAttach(conn)
+	if err != nil {
+		logger.WarnContext(ctx, "read attach", "peer", conn.RemoteAddr(), "err", err)
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	switch attach.Kind {
+	case proto.AttachSubscriber:
+		if err := registry.AttachSubscriberData(conn, attach.Token); err != nil {
+			logger.WarnContext(ctx, "attach subscriber data", "peer", conn.RemoteAddr(), "err", err)
+			_ = conn.Close()
+		}
+
+	case proto.AttachPublisher:
+		if err := registry.AttachPublisherData(attach.Token, attach.RequestID, conn); err != nil {
+			logger.WarnContext(ctx, "attach publisher data", "peer", conn.RemoteAddr(), "err", err)
+			_ = conn.Close()
+		}
+
+	default:
+		_ = conn.Close()
 	}
 }

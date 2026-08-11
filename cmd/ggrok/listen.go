@@ -1,9 +1,10 @@
-// The listen subcommand creates a QUIC connection to the relay server and
-// subscribes to a share's session by token, then binds a local port: for
-// -tcp, every local connection accepted is bridged to a fresh stream on the
-// tunnel; for -udp, every local client's datagrams are forwarded the same
-// way, framed with a FlowID so relay can route replies back to the right
-// local client of the right listen subscriber.
+// The listen subcommand creates a control connection to the relay server
+// and subscribes to a share's session by token, then binds a local port:
+// for -tcp, every local connection accepted dials a fresh data connection
+// to relay, attached to the session by token; for -udp, every local
+// client's datagrams are forwarded the same way, framed with a FlowID so
+// relay can route replies back to the right local client of the right
+// listen subscriber.
 //
 // Unlike get, which pulls one file and exits, listen is a persistent local
 // listener - forwarding a TCP/UDP service is inherently repeatable, not a

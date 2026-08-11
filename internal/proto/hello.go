@@ -7,9 +7,10 @@ import (
 	"io"
 )
 
-// ALPN is the protocol identifier both dial and listen sides of every QUIC
-// connection in ggrok negotiate. quic-go refuses to complete a handshake
-// without ALPN agreement on both ends.
+// ALPN is the protocol identifier both ends of every TLS connection in
+// ggrok negotiate (see internal/mtls.LoadConfig's NextProtos), so a peer
+// speaking some other protocol on the same port can't be mistaken for a
+// ggrok node.
 const ALPN = "ggrok/1"
 
 // Role says which end of a session a connection belongs to. The zero value

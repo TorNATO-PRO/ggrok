@@ -1,11 +1,13 @@
-// The share subcommand creates a QUIC connection to the relay server in which a file
-// hosted on your device may be relayed to a downstream consumer.
+// The share subcommand creates a TCP+mTLS connection to the relay server
+// in which a file hosted on your device may be relayed to a downstream
+// consumer.
 //
-// With -tcp or -udp, share instead forwards a local TCP or UDP service through the
-// tunnel to any number of concurrent listen subscribers holding the session's token,
-// instead of sharing a file. UDP is forwarded using QUIC's unreliable datagram
-// extension (RFC 9221), so it keeps UDP's unordered, unreliable delivery semantics
-// rather than being flattened into an ordered, retransmitted stream.
+// With -tcp or -udp, share instead forwards a local TCP or UDP service
+// through the tunnel to any number of concurrent listen subscribers
+// holding the session's token, instead of sharing a file. UDP is
+// forwarded as raw, AEAD-encrypted UDP datagrams (see internal/udpcrypto),
+// so it keeps UDP's unordered, unreliable delivery semantics rather than
+// being flattened into an ordered, retransmitted stream.
 
 package main
 
@@ -129,10 +131,10 @@ func parseShareFlags(args []string) (shareConfig, error) {
 	return cfg, nil
 }
 
-// runShare creates a QUIC connection to the relay server, and creates a unique
-// token to address the QUIC connection. Terminating this connection will terminate
-// the share. Additionally, post quantum encryption is enabled on top of classical
-// encryption for they key exchange.
+// runShare creates a control connection to the relay server, and creates
+// a unique token to address it. Terminating this connection will
+// terminate the share. Additionally, post quantum encryption is enabled
+// on top of classical encryption for the key exchange.
 func runShare(args []string) error {
 	cfg, err := parseShareFlags(args)
 	if err != nil {

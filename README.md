@@ -1,18 +1,26 @@
 ## GGrok
 
-GGrok is a secure stream sharing service, where you may share TCP/UDP streams
-directly from your laptop to anyone who has permission to access the stream.
+GGrok is a private TCP/UDP tunnel: `share` forwards a local service from your
+laptop, `listen` forwards it back out on someone else's, and `relay` brokers
+the two over the public internet without ever terminating your traffic at
+the application layer. Every node `share`, `listen`, and `relay` is
+mutually authenticated by a private CA you run yourself (`ggrok ca`), never
+the public web PKI.
 
-The share/get/relay link runs over QUIC (via `quic-go`), which gives
-real UDP datagram forwarding, connection migration (survives a laptop
-roaming between networks), and TLS 1.3-native mTLS between nodes with post quantum key exchange.
+The share/listen/relay link runs over plain TCP+TLS 1.3. UDP-mode
+tunnels get their own encryption on top: each hop's traffic is sealed with
+ChaCha20-Poly1305 using a key derived straight from that hop's TLS
+connection (RFC 5705 keying-material export, no separate handshake), with a
+sliding replay window standing in for the ordering guarantees a stream
+transport gets for free. See `internal/udpcrypto` and `internal/relay/udp.go`
+for the mechanism.
 
 Features:
 
-- **The relay server never teminates anything**: The relay server serves as a broker for QUIC streams/datagrams by token, so it cannot read your traffic even if compromised, and only metadata (who's talking to whom). Additionally, only UDP needs to be allowed by a firewall since QUIC is an application-level protocol over UDP.
+- **The relay server never parses your traffic**: relay pairs a `share` and its `listen` subscribers by token and splices bytes/datagrams between them, and it authenticates and terminates mTLS with each peer independently, but it never understands the protocol running over your forwarded service. In UDP mode it does have to read (and re-frame) a small routing header per datagram to fan traffic out to the right subscriber. For more information, see the "Fan-out design" section of `docs/plans/tcp-udp-tunnel.md`.
 
-- **QUIC connection migration**: The share/listen sessions will survive a network change (Wifi -> Cellular, VPN -> No VPN). This is something that a plain TCP tunnel cannot do for free, but since we are using QUIC we automatically get this feature.
+- **Post-quantum hybrid KEX**: `X25519MLKEM768` is pinned as the only option rather than a negotiable fallback - since every peer speaks the `ggrok/1` protocol over our own CA, there's no interop reason to allow downgrade.
 
-- **Post-quantum hybrid KEX**: `X25519MLKEM768` is pinned as the only option rather than the negotiable fallback - since every peer is one that speaks the `ggrok/1` protocol, there's no interop reason to allow downgrade.
+- **Two-tier trust model**: cert = "you're allowed on my network", token = "you're allowed in *this* tunnel."
 
-- **Two-tier trust model**: Cert = "you're allowed on my network", Token = "You're allowed in *this* tunnel."
+- **Firewall note**: relay needs *both* the TCP and UDP ports open at whatever `-listen` address you give it. That same port recognizes both TCP and UDP.

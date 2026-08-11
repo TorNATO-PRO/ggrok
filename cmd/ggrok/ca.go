@@ -1,9 +1,8 @@
 // The ca subcommand manages the private certificate authority that share,
 // get, and relay use to identify each other. We do mTLS with a self-signed
 // root instead of the public web PKI, so every node needs a certificate
-// issued by this same CA. These are ordinary TLS 1.3 certificates - QUIC
-// requires TLS 1.3, so the cert model here is exactly what the QUIC
-// handshake between nodes needs.
+// issued by this same CA. These are ordinary TLS 1.3 certificates - every
+// mTLS handshake between nodes, TCP or UDP, is pinned to TLS 1.3.
 
 package main
 

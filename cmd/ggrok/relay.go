@@ -1,7 +1,7 @@
-// The relay subcommand runs the QUIC-based rendezvous server that brokers
-// between a share (publisher) and any number of listen (subscriber) peers
-// holding the matching token. It pairs their connections and mirrors
-// QUIC-level events (new stream, datagram) between them - it never
+// The relay subcommand runs the rendezvous server that brokers between a
+// share (publisher) and any number of listen (subscriber) peers holding
+// the matching token. It pairs their connections and, for TCP-mode
+// sessions, splices their forwarded connections together - it never
 // terminates TCP or UDP itself. It authenticates to its peers with a
 // certificate issued by our CA (see the ca subcommand), and they
 // authenticate to it the same way - all mTLS, no public web PKI involved.
@@ -21,10 +21,11 @@ import (
 
 // relayConfig is the parsed and validated input to a relay.
 type relayConfig struct {
-	// listen is the address the QUIC listener binds - this is a UDP address
-	// at the packet level, since that's how QUIC's wire protocol works, but
-	// it has nothing to do with a share's -udp forwarding mode, which is an
-	// application-level concept layered on top of a QUIC connection.
+	// listen is the address relay binds - both a TCP listener (the
+	// control/data-connection plane) and, in UDP mode, a UDP socket at
+	// the same host:port. Independent port namespaces mean this has
+	// nothing to do with a share's -udp forwarding mode, which is an
+	// application-level concept layered on top of relay's connections.
 	listen hostport.HostPort
 
 	// certFile is the path to the relay's own certificate, proving to peers
@@ -65,7 +66,7 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 	}
 
 	var cfg relayConfig
-	fs.Func("listen", "the address to bind the QUIC listener to", func(hostPortPair string) error {
+	fs.Func("listen", "the address to bind relay's listener to", func(hostPortPair string) error {
 		pair, err := hostport.Parse(hostPortPair)
 		if err != nil {
 			return err
@@ -88,8 +89,8 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 	return cfg, nil
 }
 
-// runRelay runs the relay command, brokering QUIC connections between
-// shares and listeners without ever terminating TCP or UDP itself.
+// runRelay runs the relay command, brokering connections between shares
+// and listeners without ever terminating TCP or UDP itself.
 func runRelay(args []string) error {
 	cfg, err := parseRelayFlags(args)
 	if err != nil {
