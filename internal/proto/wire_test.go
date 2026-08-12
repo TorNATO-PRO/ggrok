@@ -162,48 +162,128 @@ func TestRequestDataRoundTrip(t *testing.T) {
 	}
 }
 
-func TestUDPSessionRoundTrip(t *testing.T) {
+func TestSubscriberIDRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	want, err := proto.NewRoutingID()
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	var buf bytes.Buffer
-	if writeErr := proto.WriteUDPSession(&buf, want); writeErr != nil {
-		t.Fatal(writeErr)
+	want := proto.SubscriberID(0x1234)
+	if err := proto.WriteSubscriberID(&buf, want); err != nil {
+		t.Fatal(err)
 	}
 
 	typ, payload, err := proto.ReadControlFrame(&buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if typ != proto.ControlUDPSession {
-		t.Errorf("type: got %v, want ControlUDPSession", typ)
+	if typ != proto.ControlSubscriberID {
+		t.Errorf("type: got %v, want ControlSubscriberID", typ)
 	}
 
-	got, err := proto.ReadUDPSession(payload)
+	got, err := proto.ReadSubscriberID(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
-		t.Errorf("got %x, want %x", got, want)
+		t.Errorf("got %#x, want %#x", got, want)
 	}
 }
 
-func TestNewRoutingIDIsRandom(t *testing.T) {
+func TestReadSubscriberIDRejectsWrongLength(t *testing.T) {
 	t.Parallel()
 
-	a, err := proto.NewRoutingID()
+	for _, payload := range [][]byte{nil, {1}, {1, 2, 3}} {
+		if _, err := proto.ReadSubscriberID(payload); err == nil {
+			t.Errorf("expected error for %d-byte payload, got nil", len(payload))
+		}
+	}
+}
+
+func TestSessionClosedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	want := proto.ReasonPublisherGone
+	if err := proto.WriteSessionClosed(&buf, want); err != nil {
+		t.Fatal(err)
+	}
+
+	typ, payload, err := proto.ReadControlFrame(&buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := proto.NewRoutingID()
+	if typ != proto.ControlSessionClosed {
+		t.Errorf("type: got %v, want ControlSessionClosed", typ)
+	}
+
+	got, err := proto.ReadSessionClosed(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a == b {
-		t.Error("two calls to NewRoutingID produced the same id")
+	if got != want {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestReadSessionClosedRejectsWrongLength(t *testing.T) {
+	t.Parallel()
+
+	for _, payload := range [][]byte{nil, {1, 2}} {
+		if _, err := proto.ReadSessionClosed(payload); err == nil {
+			t.Errorf("expected error for %d-byte payload, got nil", len(payload))
+		}
+	}
+}
+
+// A reason this build doesn't know still has to render as something a
+// human can read, since a newer relay may send one.
+func TestSessionCloseReasonStringsUnknownValue(t *testing.T) {
+	t.Parallel()
+
+	if got := proto.SessionCloseReason(200).String(); got == "" {
+		t.Error("unknown reason rendered as empty string")
+	}
+}
+
+func TestUDPAttachRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	token, err := proto.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []proto.UDPAttach{
+		{Role: proto.RolePublish, Token: token},
+		{Role: proto.RoleSubscribe, Token: token, SubscriberID: 0x2a2a},
+	}
+
+	for _, want := range cases {
+		var buf bytes.Buffer
+		if err := proto.WriteUDPAttach(&buf, want); err != nil {
+			t.Fatalf("WriteUDPAttach(%+v): %v", want, err)
+		}
+
+		got, err := proto.ReadUDPAttach(&buf)
+		if err != nil {
+			t.Fatalf("ReadUDPAttach: %v", err)
+		}
+		if got != want {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	}
+}
+
+func TestReadUDPAttachRejectsInvalidRole(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	if err := proto.WriteUDPAttach(&buf, proto.UDPAttach{Role: proto.RolePublish}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := buf.Bytes()
+	raw[0] = 0 // corrupt the Role byte
+	if _, err := proto.ReadUDPAttach(bytes.NewReader(raw)); err == nil {
+		t.Error("expected error for invalid role, got nil")
 	}
 }

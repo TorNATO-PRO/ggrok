@@ -1,7 +1,6 @@
 package proto
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -25,11 +24,67 @@ const (
 	// request - payload is the RequestID (8 bytes).
 	ControlRequestData
 
-	// ControlUDPSession is relay handing a peer the RoutingID for
-	// UDP-mode's AEAD-encrypted data plane - payload is the RoutingID
-	// (8 bytes).
-	ControlUDPSession
+	// ControlSubscriberID is relay handing a UDP-mode subscriber the
+	// SubscriberID it assigned - payload is the SubscriberID (2 bytes).
+	// The subscriber presents this same ID in its UDPAttach handshake when
+	// it dials relay's QUIC data connection, so relay can tell which
+	// already-registered subscriber that datagram-only connection belongs
+	// to (a session can have many concurrent subscribers, and the QUIC
+	// connection carries no other identifying information beyond the
+	// token, which every subscriber shares).
+	ControlSubscriberID
+
+	// ControlSessionClosed is relay telling a subscriber that the session
+	// it is attached to has ended - payload is a single
+	// SessionCloseReason byte. Nothing else on the wire carries that news:
+	// a subscriber whose publisher has gone away still holds a perfectly
+	// healthy control connection to relay, so without this frame it goes
+	// on heartbeating and binding its local port, indistinguishable from
+	// an idle-but-working tunnel, until someone notices traffic vanishing.
+	ControlSessionClosed
 )
+
+// SessionCloseReason says why a session ended. It travels as the
+// single-byte payload of a ControlSessionClosed frame; a receiver that
+// doesn't recognize the value should still treat the session as over,
+// since the frame type alone is the verdict and the reason is only
+// explanation.
+type SessionCloseReason uint8
+
+const (
+	// ReasonPublisherGone means the session's publisher (share)
+	// disconnected, leaving nothing on the other end to forward to.
+	ReasonPublisherGone SessionCloseReason = iota + 1
+)
+
+// String renders a reason for a human - including ones this build
+// doesn't know, which a newer relay may send.
+func (r SessionCloseReason) String() string {
+	switch r {
+	case ReasonPublisherGone:
+		return "publisher disconnected"
+	default:
+		return fmt.Sprintf("unspecified reason (%d)", uint8(r))
+	}
+}
+
+// sessionClosedSize is the width of a ControlSessionClosed frame's
+// payload: a single SessionCloseReason byte.
+const sessionClosedSize = 1
+
+// WriteSessionClosed writes a ControlSessionClosed frame for reason.
+func WriteSessionClosed(w io.Writer, reason SessionCloseReason) error {
+	return WriteControlFrame(w, ControlSessionClosed, []byte{byte(reason)})
+}
+
+// ReadSessionClosed decodes a ControlSessionClosed frame's payload.
+func ReadSessionClosed(payload []byte) (SessionCloseReason, error) {
+	if len(payload) != sessionClosedSize {
+		return 0, fmt.Errorf("read session closed: want %d byte, got %d", sessionClosedSize, len(payload))
+	}
+
+	return SessionCloseReason(payload[0]), nil
+}
 
 // controlHeaderSize is the frame header width: 1 byte ControlType + 4
 // byte big-endian payload length.
@@ -103,41 +158,22 @@ func ReadRequestData(payload []byte) (uint64, error) {
 	return binary.BigEndian.Uint64(payload), nil
 }
 
-// routingIDSize is the width of a RoutingID in bytes.
-const routingIDSize = 8
+// subscriberIDSize is the width of a ControlSubscriberID frame's payload:
+// a single big-endian SubscriberID.
+const subscriberIDSize = 2
 
-// RoutingID is an opaque, per-UDP-session identifier relay mints at
-// registration and hands back to both peers over their (encrypted)
-// control connections. Unlike Token, a RoutingID travels in cleartext on
-// every raw UDP data-plane packet so relay can demux which session's AEAD
-// key to try before it can decrypt anything - it's deliberately not the
-// Token itself (which today never appears in cleartext on the wire) and
-// grants nothing on its own without the session's separately-derived AEAD
-// key.
-type RoutingID [routingIDSize]byte
-
-// NewRoutingID draws a fresh, cryptographically random routing ID.
-func NewRoutingID() (RoutingID, error) {
-	var id RoutingID
-	if _, err := rand.Read(id[:]); err != nil {
-		return RoutingID{}, fmt.Errorf("generate routing id: %w", err)
-	}
-
-	return id, nil
+// WriteSubscriberID writes a ControlSubscriberID frame for id.
+func WriteSubscriberID(w io.Writer, id SubscriberID) error {
+	var payload [subscriberIDSize]byte
+	binary.BigEndian.PutUint16(payload[:], uint16(id))
+	return WriteControlFrame(w, ControlSubscriberID, payload[:])
 }
 
-// WriteUDPSession writes a ControlUDPSession frame for id.
-func WriteUDPSession(w io.Writer, id RoutingID) error {
-	return WriteControlFrame(w, ControlUDPSession, id[:])
-}
-
-// ReadUDPSession decodes a ControlUDPSession frame's payload.
-func ReadUDPSession(payload []byte) (RoutingID, error) {
-	if len(payload) != routingIDSize {
-		return RoutingID{}, fmt.Errorf("read udp session: want %d bytes, got %d", routingIDSize, len(payload))
+// ReadSubscriberID decodes a ControlSubscriberID frame's payload.
+func ReadSubscriberID(payload []byte) (SubscriberID, error) {
+	if len(payload) != subscriberIDSize {
+		return 0, fmt.Errorf("read subscriber id: want %d bytes, got %d", subscriberIDSize, len(payload))
 	}
 
-	var id RoutingID
-	copy(id[:], payload)
-	return id, nil
+	return SubscriberID(binary.BigEndian.Uint16(payload)), nil
 }

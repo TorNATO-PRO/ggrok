@@ -5,9 +5,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"time"
+
+	"github.com/quic-go/quic-go"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/ca"
@@ -15,11 +16,14 @@ import (
 	"tornato.dev/ggrok/v2/internal/proto"
 )
 
-// helloTimeout bounds how long relay waits for a freshly accepted
+// helloTimeout bounds how long relay waits for a freshly accepted TCP
 // connection to send its ConnKind and then a Hello (control) or Attach
 // (data) - a peer that connects and never sends anything would otherwise
-// sit open forever.
-const helloTimeout = 10 * time.Second
+// sit open forever. udpAttachTimeout is its QUIC-listener counterpart.
+const (
+	helloTimeout     = 10 * time.Second
+	udpAttachTimeout = 10 * time.Second
+)
 
 // heartbeatSilenceTimeout is how long relay waits without receiving
 // anything on a control connection before treating the peer as dead.
@@ -27,9 +31,22 @@ const helloTimeout = 10 * time.Second
 // it means the peer is gone or hung - see runHeartbeatLoop.
 const heartbeatSilenceTimeout = 30 * time.Second
 
+// udpKeepAlivePeriod and udpMaxIdleTimeout keep a UDP-mode data-plane QUIC
+// connection alive through long idle stretches between datagrams, and let
+// relay notice one that's gone dark. There's no application-level
+// heartbeat on this connection (unlike the TCP control connection) - its
+// liveness is entirely quic-go's own PING-frame keepalive, which these
+// enable (quic-go disables keep-alives by default).
+const (
+	udpKeepAlivePeriod = 15 * time.Second
+	udpMaxIdleTimeout  = 30 * time.Second
+)
+
 // Config is the input to Run.
 type Config struct {
-	// Listen is the address relay's TCP listener binds to.
+	// Listen is the address relay's TCP listener binds to. Its UDP-mode
+	// QUIC listener binds the same host:port - TCP and UDP have separate
+	// port namespaces, so this never conflicts.
 	Listen hostport.HostPort
 
 	// CertFile, KeyFile, and CAFile identify relay to its peers and
@@ -45,9 +62,12 @@ type Config struct {
 	RevokedFile string
 }
 
-// Run listens for TCP connections on Config.Listen and brokers them
-// between share (publisher) and listen (subscriber) peers until ctx is
-// canceled.
+// Run listens for TCP and QUIC connections on Config.Listen and brokers
+// them between share (publisher) and listen (subscriber) peers until ctx
+// is canceled. TCP carries every control connection and TCP-mode's data
+// connections; QUIC carries only UDP-mode's data-plane connections, one
+// per attached publisher/subscriber, each already implied to exist by a
+// prior TCP control connection's successful Register/Subscribe.
 func Run(ctx context.Context, cfg Config) error {
 	revoked, err := loadRevokedSerials(cfg.RevokedFile)
 	if err != nil {
@@ -65,30 +85,27 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = listener.Close() }()
 
-	// UDP mode's data plane is a second, independent socket at the same
-	// host:port - TCP and UDP have separate port namespaces, so this
-	// never conflicts with the listener above.
-	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Listen.String())
-	if err != nil {
-		return fmt.Errorf("relay: resolve %s: %w", cfg.Listen, err)
+	quicConf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: udpKeepAlivePeriod,
+		MaxIdleTimeout:  udpMaxIdleTimeout,
 	}
-	udpSocket, err := net.ListenUDP("udp", udpAddr)
+	quicListener, err := quic.ListenAddr(cfg.Listen.String(), tlsConf, quicConf)
 	if err != nil {
-		return fmt.Errorf("relay: listen udp on %s: %w", cfg.Listen, err)
+		return fmt.Errorf("relay: listen quic on %s: %w", cfg.Listen, err)
 	}
-	defer func() { _ = udpSocket.Close() }()
-
-	router := newUDPRouter(udpSocket)
-	go router.run(ctx)
+	defer func() { _ = quicListener.Close() }()
 
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
-		_ = udpSocket.Close()
+		_ = quicListener.Close()
 	}()
 
-	registry := NewRegistry(router)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	registry := NewRegistry(logger)
+
+	go runQUICAcceptLoop(ctx, logger, registry, quicListener)
 
 	for {
 		conn, err := listener.Accept()
@@ -162,7 +179,9 @@ func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, co
 // handleControlConn reads a Hello and dispatches to Registry.Register
 // (publish) or Registry.Subscribe (subscribe), then runs the heartbeat
 // loop for the life of the session. It always closes conn before
-// returning.
+// returning. The registry logs the session lifecycle itself - who
+// registered, who attached, and when each of them went away - so what's
+// left here is only the connections that never got that far.
 func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
 	defer func() { _ = conn.Close() }()
 
@@ -182,7 +201,6 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 		}
 		defer unregister()
 
-		logger.InfoContext(ctx, "publisher registered", "peer", conn.RemoteAddr(), "mode", hello.Mode)
 		runHeartbeatLoop(ctx, conn)
 
 	case proto.RoleSubscribe:
@@ -193,7 +211,6 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 		}
 		defer release()
 
-		logger.InfoContext(ctx, "subscriber attached", "peer", conn.RemoteAddr(), "mode", hello.Mode)
 		runHeartbeatLoop(ctx, conn)
 	}
 }
@@ -252,5 +269,58 @@ func handleDataConn(ctx context.Context, logger *slog.Logger, registry *Registry
 
 	default:
 		_ = conn.Close()
+	}
+}
+
+// runQUICAcceptLoop accepts every UDP-mode data-plane connection relay's
+// QUIC listener receives and dispatches each to its own handleQUICConn
+// goroutine, until ctx is canceled.
+func runQUICAcceptLoop(ctx context.Context, logger *slog.Logger, registry *Registry, quicListener *quic.Listener) {
+	for {
+		conn, err := quicListener.Accept(ctx)
+		if err != nil {
+			return
+		}
+
+		go handleQUICConn(ctx, logger, registry, conn)
+	}
+}
+
+// handleQUICConn reads the UDPAttach a peer sends on the first stream of
+// a fresh UDP-mode data connection and dispatches to Registry.
+// AttachPublisherUDP or AttachSubscriberUDP, which write the ack
+// themselves (mirroring AttachSubscriberData's pattern) and, on success,
+// block for the connection's whole life pumping its datagrams. It always
+// closes conn before returning, since (unlike TCP-mode's data
+// connections) nothing else ever takes over that responsibility - a QUIC
+// connection isn't spliced into anything, it's read and written directly
+// by the pump functions.
+func handleQUICConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *quic.Conn) {
+	defer func() { _ = conn.CloseWithError(0, "") }()
+
+	streamCtx, cancel := context.WithTimeout(ctx, udpAttachTimeout)
+	stream, err := conn.AcceptStream(streamCtx)
+	cancel()
+	if err != nil {
+		logger.WarnContext(ctx, "accept udp attach stream", "peer", conn.RemoteAddr(), "err", err)
+		return
+	}
+
+	attach, err := proto.ReadUDPAttach(stream)
+	if err != nil {
+		logger.WarnContext(ctx, "read udp attach", "peer", conn.RemoteAddr(), "err", err)
+		return
+	}
+
+	switch attach.Role {
+	case proto.RolePublish:
+		if err := registry.AttachPublisherUDP(ctx, stream, conn, attach.Token); err != nil {
+			logger.WarnContext(ctx, "attach publisher udp", "peer", conn.RemoteAddr(), "err", err)
+		}
+
+	case proto.RoleSubscribe:
+		if err := registry.AttachSubscriberUDP(ctx, stream, conn, attach.Token, attach.SubscriberID); err != nil {
+			logger.WarnContext(ctx, "attach subscriber udp", "peer", conn.RemoteAddr(), "err", err)
+		}
 	}
 }

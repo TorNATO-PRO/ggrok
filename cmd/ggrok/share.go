@@ -5,9 +5,11 @@
 // With -tcp or -udp, share instead forwards a local TCP or UDP service
 // through the tunnel to any number of concurrent listen subscribers
 // holding the session's token, instead of sharing a file. UDP is
-// forwarded as raw, AEAD-encrypted UDP datagrams (see internal/udpcrypto),
-// so it keeps UDP's unordered, unreliable delivery semantics rather than
-// being flattened into an ordered, retransmitted stream.
+// forwarded over a dedicated QUIC connection's unreliable datagram
+// extension (RFC 9221), so it keeps UDP's unordered, unreliable delivery
+// semantics - and gets QUIC's congestion control on that connection for
+// free - rather than being flattened into an ordered, retransmitted
+// stream.
 
 package main
 
@@ -107,12 +109,22 @@ func parseShareFlags(args []string) (shareConfig, error) {
 	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg.nodeConnConfig)
 	registerModeFlags(fs, &cfg)
 
+	// The env var fallback keeps the bearer token off the command line,
+	// where it would be visible to every local user via ps and persisted
+	// in shell history. It's applied after parsing rather than as the
+	// flag's default so PrintDefaults never echoes the secret into usage
+	// or flag-error output.
 	var tokenStr string
 	fs.StringVar(&tokenStr, "token", "",
-		"token that scopes which listen subscribers may reach this session (generated and printed if omitted)")
+		"token that scopes which listen subscribers may reach this session "+
+			"(env GGROK_TOKEN; generated and printed if omitted)")
 
 	if err := parseFlags(fs, args); err != nil {
 		return shareConfig{}, err
+	}
+
+	if tokenStr == "" {
+		tokenStr = os.Getenv("GGROK_TOKEN")
 	}
 
 	if err := finishConn(); err != nil {

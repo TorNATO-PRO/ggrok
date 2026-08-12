@@ -2,219 +2,278 @@ package relay
 
 import (
 	"context"
-	"crypto/cipher"
-	"net"
-	"sync"
-	"sync/atomic"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+
+	"github.com/quic-go/quic-go"
 
 	"tornato.dev/ggrok/v2/internal/proto"
-	"tornato.dev/ggrok/v2/internal/udpcrypto"
 )
 
-// udpReadBufferSize bounds a single incoming UDP datagram relay will
-// accept before decoding - generous relative to any realistic path MTU.
-const udpReadBufferSize = 64 * 1024
+// errNotSubscriberCert mirrors errNotPublisherCert for the subscriber
+// side: a UDP-mode subscriber's data connection must present the same
+// certificate its control connection authenticated with, or a
+// differently-certified peer holding the same token and a guessed
+// SubscriberID could hijack that subscriber's traffic.
+var errNotSubscriberCert = errors.New("data connection certificate does not match this subscriber's control connection")
 
-// routingIDSize mirrors proto.RoutingID's width, used to peel the
-// cleartext routing prefix off an incoming packet before anything else.
-const routingIDSize = 8
+// udpSenderQueueDepth bounds how many outbound datagrams a udpSender
+// buffers for one destination connection. quic-go's own per-connection
+// datagram send queue holds only 32 entries, and its SendDatagram call
+// blocks the caller once that fills (e.g. while the connection's
+// congestion window is closed) - see maxDatagramSendQueueLen in
+// quic-go's datagram_queue.go. This just needs to comfortably outlast a
+// brief stall on the sending side without growing unbounded; see
+// udpSender's doc comment for why that stall must never propagate back
+// to a receive loop.
+const udpSenderQueueDepth = 256
 
-// udpRoute is relay's per-hop-endpoint UDP routing/crypto state: either
-// the publisher's hop (relay<->share) or one subscriber's hop
-// (relay<->that listen). It's looked up by RoutingID out of every
-// incoming raw UDP packet, before any of it can be decrypted - relay
-// mints one of these (and a fresh RoutingID to go with it) whenever a
-// UDP-mode publisher registers or a UDP-mode subscriber attaches, via
-// Registry.setupUDPRoute.
-type udpRoute struct {
-	routing proto.RoutingID
-	sess    *session
-
-	// isPublisher distinguishes which of session's two kinds of hop this
-	// route is - not the same as testing subID against a sentinel, since
-	// proto.SubscriberID's zero value is itself a validly minted ID.
-	isPublisher bool
-	subID       proto.SubscriberID
-
-	sendAEAD cipher.AEAD
-	sendCtr  atomic.Uint64
-
-	recvAEAD cipher.AEAD
-	recv     udpcrypto.ReplayWindow
-
-	mu   sync.Mutex
-	peer *net.UDPAddr // last-known source address; nil until a first packet arrives
+// udpSender decouples receiving from sending on relay's UDP fan-out
+// path. quic-go's ReceiveDatagram queue is only 128 entries deep
+// (maxDatagramRcvQueueLen) and silently drops anything received once
+// it's full - no error, no backpressure. Calling SendDatagram directly
+// from inside a pump's ReceiveDatagram loop means a slow or congested
+// destination (blocked on its own 32-entry send queue) stalls that same
+// goroutine's next ReceiveDatagram call, which lets its *source*
+// connection's receive queue back up and silently drop packets that
+// have nothing to do with the slow destination - a self-inflicted,
+// platform-independent loss bug. A udpSender gives each destination
+// connection its own goroutine and bounded queue, so a congested
+// destination only ever costs itself datagrams (dropped once its queue
+// is full) instead of stalling whichever pump loop is trying to hand it
+// work.
+type udpSender struct {
+	conn  *quic.Conn
+	queue chan []byte
 }
 
-// udpRouter is relay's single shared UDP socket, demultiplexing every
-// UDP-mode session's traffic - both directions, every subscriber - by
-// the cleartext RoutingID at the front of each packet (see
-// internal/udpcrypto's package doc for why that prefix has to stay
-// cleartext even though everything after it is encrypted).
-type udpRouter struct {
-	socket *net.UDPConn
-
-	mu     sync.Mutex
-	routes map[proto.RoutingID]*udpRoute
+// newUDPSender starts a udpSender for conn. Its goroutine runs until ctx
+// is canceled.
+func newUDPSender(ctx context.Context, conn *quic.Conn) *udpSender {
+	s := &udpSender{conn: conn, queue: make(chan []byte, udpSenderQueueDepth)}
+	go s.run(ctx)
+	return s
 }
 
-// newUDPRouter wraps socket - relay's shared UDP data-plane listener -
-// with an empty route table.
-func newUDPRouter(socket *net.UDPConn) *udpRouter {
-	return &udpRouter{socket: socket, routes: make(map[proto.RoutingID]*udpRoute)}
-}
-
-// run reads and dispatches packets off ur.socket until ctx is canceled.
-func (ur *udpRouter) run(ctx context.Context) {
-	buf := make([]byte, udpReadBufferSize)
+func (s *udpSender) run(ctx context.Context) {
 	for {
-		n, peerAddr, err := ur.socket.ReadFromUDP(buf)
+		select {
+		case data := <-s.queue:
+			_ = s.conn.SendDatagram(data)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// enqueue best-effort hands data to the sender goroutine, dropping it
+// immediately instead of blocking if the queue is already full - see
+// udpSender's doc comment for why the caller must never block here.
+func (s *udpSender) enqueue(data []byte) {
+	select {
+	case s.queue <- data:
+	default:
+	}
+}
+
+// AttachPublisherUDP validates token (and that quicConn's peer
+// certificate matches the one the session's publisher registered with -
+// see AttachPublisherData's doc comment for why that check exists; the
+// same impersonation risk applies here), writes the corresponding ack to
+// stream, and - on success - pairs quicConn with the session as its
+// relay<->share UDP data-plane connection. It then blocks for the life of
+// quicConn, pumping every datagram it receives out to whichever
+// subscriber it names; it returns once quicConn errors or ctx is
+// canceled, having already cleared the session's reference to it.
+func (r *Registry) AttachPublisherUDP(
+	ctx context.Context,
+	stream io.Writer,
+	quicConn *quic.Conn,
+	token proto.Token,
+) error {
+	sess, ok := r.sessionFor(token)
+	if !ok {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return errNoSuchSession
+	}
+	if sess.mode != proto.ModeUDP {
+		_ = proto.WriteAck(stream, proto.AckModeMismatch)
+		return errModeMismatch
+	}
+
+	cert, err := quicPeerLeafCert(quicConn)
+	if err != nil {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return fmt.Errorf("attach publisher udp: %w", err)
+	}
+	if !cert.Equal(sess.publisherCert) {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return errNotPublisherCert
+	}
+
+	if err := proto.WriteAck(stream, proto.AckOK); err != nil {
+		return fmt.Errorf("ack publisher udp: %w", err)
+	}
+
+	senderCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sess.setUDPPublisher(newUDPSender(senderCtx, quicConn))
+	defer sess.setUDPPublisher(nil)
+
+	r.logger.InfoContext(ctx, "publisher udp attached", quicPeerAttr(quicConn), sessionAttr(token))
+	defer func() {
+		r.logger.InfoContext(ctx, "publisher udp detached", quicPeerAttr(quicConn), sessionAttr(token))
+	}()
+
+	return pumpPublisherDatagrams(ctx, sess, quicConn)
+}
+
+// AttachSubscriberUDP validates token, id (a subscriber id relay already
+// assigned over that subscriber's control connection - see
+// Registry.Subscribe's ControlSubscriberID frame), and that quicConn's
+// peer certificate matches the one that control connection authenticated
+// with, writes the corresponding ack to stream, and - on success - pairs
+// quicConn with id as its relay<->listen UDP data-plane connection. It
+// then blocks for the life of quicConn, pumping every datagram it
+// receives to the session's publisher, tagged with id; it returns once
+// quicConn errors or ctx is canceled, having already removed the
+// session's reference to it.
+func (r *Registry) AttachSubscriberUDP(
+	ctx context.Context,
+	stream io.Writer,
+	quicConn *quic.Conn,
+	token proto.Token,
+	id proto.SubscriberID,
+) error {
+	sess, ok := r.sessionFor(token)
+	if !ok {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return errNoSuchSession
+	}
+	if sess.mode != proto.ModeUDP {
+		_ = proto.WriteAck(stream, proto.AckModeMismatch)
+		return errModeMismatch
+	}
+
+	wantCert, err := sess.subscriberCert(id)
+	if err != nil {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return fmt.Errorf("attach subscriber udp: %w", err)
+	}
+
+	cert, err := quicPeerLeafCert(quicConn)
+	if err != nil {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return fmt.Errorf("attach subscriber udp: %w", err)
+	}
+	if !cert.Equal(wantCert) {
+		_ = proto.WriteAck(stream, proto.AckNoSuchSession)
+		return errNotSubscriberCert
+	}
+
+	if err := proto.WriteAck(stream, proto.AckOK); err != nil {
+		return fmt.Errorf("ack subscriber udp: %w", err)
+	}
+
+	senderCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sess.setUDPSubscriber(id, newUDPSender(senderCtx, quicConn))
+	defer sess.removeUDPSubscriber(id)
+
+	r.logger.InfoContext(ctx, "subscriber udp attached",
+		quicPeerAttr(quicConn), sessionAttr(token), slog.Any("sub", id))
+	defer func() {
+		r.logger.InfoContext(ctx, "subscriber udp detached", sessionAttr(token), slog.Any("sub", id))
+	}()
+
+	return pumpSubscriberDatagrams(ctx, sess, id, quicConn)
+}
+
+// pumpPublisherDatagrams reads datagrams off pubConn, decodes the
+// (SubscriberID, FlowID) header, and forwards each to the live subscriber
+// it names - the publisher-to-subscribers direction of UDP fan-out. A
+// datagram naming a subscriber that hasn't attached its own UDP
+// connection yet (or has already left) is dropped, same as any other
+// malformed or stale frame. Forwarding goes through that subscriber's
+// udpSender rather than a direct SendDatagram call - see udpSender's doc
+// comment for why this loop must never block on a slow destination.
+func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Conn) error {
+	for {
+		data, err := pubConn.ReceiveDatagram(ctx)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			continue // a single bad read shouldn't take the whole router down
+			return err
 		}
 
-		packet := make([]byte, n) // buf is reused by the next ReadFromUDP
-		copy(packet, buf[:n])
-		ur.handlePacket(peerAddr, packet)
+		sub, flow, payload, err := proto.DecodePublisherFrame(data)
+		if err != nil {
+			continue
+		}
+
+		sender, ok := sess.udpSubscriber(sub)
+		if !ok {
+			continue
+		}
+
+		sender.enqueue(proto.EncodeSubscriberFrame(flow, payload))
 	}
 }
 
-// handlePacket decrypts one raw UDP packet via whichever route its
-// cleartext RoutingID prefix names, decodes the Subscriber/PublisherFrame
-// header inside, finds that datagram's other leg (the publisher's route
-// for a subscriber's packet, or the named subscriber's route for a
-// publisher's packet), and re-seals/forwards it there. Every failure mode
-// here - unknown route, forged/corrupt packet, unknown subscriber, no
-// route on the other leg yet - is a silent drop: a misbehaving peer or a
-// stale route shouldn't be distinguishable on the wire from an ordinary
-// lost UDP packet.
-func (ur *udpRouter) handlePacket(peerAddr *net.UDPAddr, packet []byte) {
-	if len(packet) < routingIDSize {
-		return
+// pumpSubscriberDatagrams reads datagrams off subConn, tags them with id,
+// and forwards each to the session's publisher - the subscriber-to-
+// publisher direction of UDP fan-out. A datagram arriving before the
+// publisher has attached its own UDP connection is dropped rather than
+// buffered, same as any other UDP packet with nowhere to go yet.
+// Forwarding goes through the publisher's udpSender rather than a direct
+// SendDatagram call - see udpSender's doc comment for why this loop must
+// never block on a slow destination.
+func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.SubscriberID, subConn *quic.Conn) error {
+	for {
+		data, err := subConn.ReceiveDatagram(ctx)
+		if err != nil {
+			return err
+		}
+
+		flow, payload, err := proto.DecodeSubscriberFrame(data)
+		if err != nil {
+			continue
+		}
+
+		sender, ok := sess.udpPublisherSender()
+		if !ok {
+			continue
+		}
+
+		sender.enqueue(proto.EncodePublisherFrame(id, flow, payload))
+	}
+}
+
+// quicPeerLeafCert returns conn's verified peer leaf certificate. relay's
+// QUIC listener uses the same mTLS config as its TCP listener
+// (RequireAndVerifyClientCert), so by the time any post-handshake read
+// has succeeded this is always present - but fail closed rather than
+// panic if it somehow isn't.
+func quicPeerLeafCert(conn *quic.Conn) (*x509.Certificate, error) {
+	certs := conn.ConnectionState().TLS.PeerCertificates
+	if len(certs) == 0 {
+		return nil, errors.New("no peer certificate")
 	}
 
-	var routing proto.RoutingID
-	copy(routing[:], packet[:routingIDSize])
+	return certs[0], nil
+}
 
-	ur.mu.Lock()
-	route, ok := ur.routes[routing]
-	ur.mu.Unlock()
-	if !ok {
-		return
-	}
+// quicPeerAttr is peerAttr's counterpart for a QUIC connection.
+func quicPeerAttr(conn *quic.Conn) slog.Attr {
+	addr := slog.Any("addr", conn.RemoteAddr())
 
-	plaintext, err := udpcrypto.Open(route.recvAEAD, &route.recv, packet)
+	cert, err := quicPeerLeafCert(conn)
 	if err != nil {
-		return
+		return slog.Group("peer", addr)
 	}
 
-	route.mu.Lock()
-	route.peer = peerAddr
-	route.mu.Unlock()
-
-	pair, reencoded, ok := route.pairFor(plaintext)
-	if !ok {
-		return
-	}
-
-	pair.mu.Lock()
-	dst := pair.peer
-	pair.mu.Unlock()
-	if dst == nil {
-		return // haven't heard from that peer yet - nowhere to send
-	}
-
-	counter := pair.sendCtr.Add(1) - 1
-	datagram := udpcrypto.Seal(pair.sendAEAD, pair.routing, counter, reencoded)
-	_, _ = ur.socket.WriteToUDP(datagram, dst)
-}
-
-// pairFor decodes plaintext (already decrypted via route's own key) per
-// route's kind, and resolves the datagram's other leg: the publisher's
-// route for a subscriber's packet, or the named subscriber's route for a
-// publisher's packet. ok is false if the frame is malformed or that leg
-// isn't known (yet, or ever).
-func (route *udpRoute) pairFor(plaintext []byte) (*udpRoute, []byte, bool) {
-	if route.isPublisher {
-		return route.publisherPair(plaintext)
-	}
-	return route.subscriberPair(plaintext)
-}
-
-// publisherPair is pairFor's publisher-route case: plaintext names which
-// subscriber it's destined for.
-func (route *udpRoute) publisherPair(plaintext []byte) (*udpRoute, []byte, bool) {
-	sub, flow, payload, err := proto.DecodePublisherFrame(plaintext)
-	if err != nil {
-		return nil, nil, false
-	}
-
-	subRoute, ok := route.sess.subscriberUDPRoute(sub)
-	if !ok {
-		return nil, nil, false
-	}
-
-	return subRoute, proto.EncodeSubscriberFrame(flow, payload), true
-}
-
-// subscriberPair is pairFor's subscriber-route case: the destination is
-// always this session's one publisher route.
-func (route *udpRoute) subscriberPair(plaintext []byte) (*udpRoute, []byte, bool) {
-	flow, payload, err := proto.DecodeSubscriberFrame(plaintext)
-	if err != nil {
-		return nil, nil, false
-	}
-
-	pair := route.sess.udpPublisherRoute
-	if pair == nil {
-		return nil, nil, false
-	}
-
-	return pair, proto.EncodePublisherFrame(route.subID, flow, payload), true
-}
-
-// addRoute builds a route's AEAD ciphers from sendKey/recvKey and
-// registers it under routing (freshly minted by the caller - see
-// Registry.setupUDPRoute).
-func (ur *udpRouter) addRoute(
-	routing proto.RoutingID,
-	sess *session,
-	isPublisher bool,
-	subID proto.SubscriberID,
-	sendKey, recvKey [udpcrypto.KeySize]byte,
-) (*udpRoute, error) {
-	sendAEAD, err := udpcrypto.NewAEAD(sendKey)
-	if err != nil {
-		return nil, err
-	}
-	recvAEAD, err := udpcrypto.NewAEAD(recvKey)
-	if err != nil {
-		return nil, err
-	}
-
-	route := &udpRoute{
-		routing:     routing,
-		sess:        sess,
-		isPublisher: isPublisher,
-		subID:       subID,
-		sendAEAD:    sendAEAD,
-		recvAEAD:    recvAEAD,
-	}
-
-	ur.mu.Lock()
-	ur.routes[routing] = route
-	ur.mu.Unlock()
-
-	return route, nil
-}
-
-// removeRoute forgets route, so its RoutingID is no longer routable -
-// called when the session or subscriber it belongs to goes away.
-func (ur *udpRouter) removeRoute(route *udpRoute) {
-	ur.mu.Lock()
-	delete(ur.routes, route.routing)
-	ur.mu.Unlock()
+	return slog.Group("peer", addr, slog.String("cn", cert.Subject.CommonName))
 }

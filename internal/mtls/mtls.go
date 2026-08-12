@@ -1,10 +1,10 @@
 // Package mtls builds the mutual-TLS config shared by share, listen, and
-// relay: TCP-mode connections and UDP-mode's control connections use it
-// directly for TLS 1.3 over TCP, and UDP-mode's data plane derives its
-// per-packet AEAD keys from it (see internal/udpcrypto). All three verify
-// each other against a private CA instead of the public web PKI - every
-// node needs a certificate issued by that same CA, and every node
-// verifies its peer against it.
+// relay: every TCP control/data connection uses it directly for TLS 1.3
+// over TCP, and relay's QUIC listener (UDP-mode's data plane) reuses the
+// exact same config, since QUIC's handshake is TLS 1.3 underneath. All
+// three verify each other against a private CA instead of the public web
+// PKI - every node needs a certificate issued by that same CA, and every
+// node verifies its peer against it.
 package mtls
 
 import (

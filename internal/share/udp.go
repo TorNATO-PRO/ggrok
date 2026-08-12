@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/proto"
-	"tornato.dev/ggrok/v2/internal/udpcrypto"
 )
 
 const (
@@ -22,66 +23,76 @@ const (
 	udpSweepInterval = 30 * time.Second
 
 	// udpReadBufferSize is the max size of a single reply read from a
-	// NAT entry's local socket, or a single datagram read off udpSession,
-	// before it's forwarded on.
+	// NAT entry's local socket before it's forwarded as a datagram.
 	udpReadBufferSize = 64 * 1024
+
+	// udpUplinkQueueDepth bounds how many locally-read replies natTable's
+	// per-flow pump goroutine buffers before quicConn.SendDatagram
+	// actually sends them. Without this, SendDatagram's blocking behavior
+	// once quic-go's own internal send queue fills (see
+	// internal/relay/udp.go's udpSender doc comment for the underlying
+	// quic-go behavior this guards against) would stall the loop reading
+	// that flow's local socket, letting its OS receive buffer overflow
+	// and silently drop replies long before they ever reach quicConn.
+	udpUplinkQueueDepth = 256
+
+	// udpKeepAlivePeriod and udpMaxIdleTimeout keep share's UDP-mode
+	// data-plane QUIC connection to relay alive through long idle
+	// stretches between flows, and let share notice one that's gone dark.
+	// There's no application-level heartbeat on this connection (that's
+	// the TCP control connection's job) - its liveness is entirely
+	// quic-go's own PING-frame keepalive, which these enable (quic-go
+	// disables keep-alives by default).
+	udpKeepAlivePeriod = 15 * time.Second
+	udpMaxIdleTimeout  = 30 * time.Second
 )
 
-// setupUDPSession reads the ControlUDPSession frame relay sends
-// immediately after a successful UDP-mode Handshake, derives this hop's
-// AEAD key pair off control's own connection state (RFC 5705 - no key
-// material crosses the wire; both ends of the same TLS connection derive
-// identical output for identical inputs), dials relay's UDP data socket,
-// and returns a ready-to-use udpcrypto.Session.
-func setupUDPSession(
+// dialUDPConn dials relay's UDP-mode QUIC listener and performs the
+// UDPAttach handshake identifying this connection as token's publisher,
+// returning it ready for SendDatagram/ReceiveDatagram use. tlsConf is the
+// same config Run already built for the TCP control connection - relay's
+// QUIC listener authenticates with the same CA and requires the same
+// client certificate.
+func dialUDPConn(
 	ctx context.Context,
-	control *tls.Conn,
+	tlsConf *tls.Config,
 	server hostport.HostPort,
 	token proto.Token,
-) (*udpcrypto.Session, error) {
-	typ, payload, err := proto.ReadControlFrame(control)
-	if err != nil {
-		return nil, fmt.Errorf("read udp session: %w", err)
-	}
-	if typ != proto.ControlUDPSession {
-		return nil, fmt.Errorf("expected ControlUDPSession, got frame type %d", typ)
+) (*quic.Conn, error) {
+	quicConf := &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: udpKeepAlivePeriod,
+		MaxIdleTimeout:  udpMaxIdleTimeout,
 	}
 
-	routing, err := proto.ReadUDPSession(payload)
+	conn, err := quic.DialAddr(ctx, server.String(), tlsConf, quicConf)
 	if err != nil {
+		return nil, fmt.Errorf("dial %s quic: %w", server, err)
+	}
+
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, fmt.Errorf("open udp attach stream: %w", err)
+	}
+
+	attach := proto.UDPAttach{Role: proto.RolePublish, Token: token}
+	if writeErr := proto.WriteUDPAttach(stream, attach); writeErr != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, writeErr
+	}
+
+	status, err := proto.ReadAck(stream)
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
+	}
+	if err := status.Err(); err != nil {
+		_ = conn.CloseWithError(0, "")
 		return nil, err
 	}
 
-	state := control.ConnectionState()
-	sendKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionUplink)
-	if err != nil {
-		return nil, err
-	}
-	recvKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionDownlink)
-	if err != nil {
-		return nil, err
-	}
-
-	var dialer net.Dialer
-	udpConn, err := dialer.DialContext(ctx, "udp", server.String())
-	if err != nil {
-		return nil, fmt.Errorf("dial %s udp: %w", server, err)
-	}
-
-	session, err := udpcrypto.NewSession(udpConn, routing, sendKey, recvKey)
-	if err != nil {
-		return nil, err
-	}
-
-	// relay only learns this hop's source address from a packet it
-	// actually receives - an empty punch datagram right now guarantees
-	// that happens before any real traffic needs to flow, rather than
-	// leaving it to chance which side happens to send first.
-	if err := session.Send(nil); err != nil {
-		return nil, fmt.Errorf("punch udp session: %w", err)
-	}
-
-	return session, nil
+	return conn, nil
 }
 
 // natKey identifies one virtual remote client: a specific local client of
@@ -96,7 +107,14 @@ type natKey struct {
 // service, dedicated to a single (subscriber, flow) pair so the service
 // sees it as a distinct remote peer.
 type natEntry struct {
-	conn       net.Conn
+	conn   net.Conn
+	uplink chan []byte
+	// cancel stops this entry's pumpUplink goroutine. Without it, that
+	// goroutine would outlive the entry itself - runUDP's ctx only ends
+	// when the whole publisher connection does, but individual entries
+	// come and go throughout its life (idle sweep, a dead local socket),
+	// so each eviction needs its own way to stop the goroutine feeding it.
+	cancel     context.CancelFunc
 	lastActive time.Time
 }
 
@@ -109,22 +127,28 @@ type natTable struct {
 }
 
 // runUDP is share's UDP-mode data plane: it reads relay-framed datagrams
-// off udpSession, routes each to a per-(subscriber, flow) local UDP
-// socket dialed to addr, and forwards that socket's replies back the same
-// way. It runs until ctx is canceled, udpSession errors, or the control
+// off quicConn, routes each to a per-(subscriber, flow) local UDP socket
+// dialed to addr, and forwards that socket's replies back the same way.
+// It runs until ctx is canceled, quicConn errors, or the control
 // connection's heartbeat loop decides relay is dead.
-func runUDP(ctx context.Context, control *tls.Conn, udpSession *udpcrypto.Session, addr hostport.HostPort) error {
+func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr hostport.HostPort) error {
 	table := &natTable{entries: make(map[natKey]*natEntry)}
 	defer table.closeAll()
 
 	go table.sweep(ctx)
 
 	heartbeatErr := make(chan error, 1)
-	go func() { heartbeatErr <- runControlLoop(ctx, control, func(uint64) {}) }()
+	go func() {
+		heartbeatErr <- runControlLoop(ctx, control, func(uint64) {})
+		// The ReceiveDatagram below is the only thing keeping this share
+		// alive, and no peer can hang up a QUIC connection - without this
+		// close, a share whose relay has died sits there forever instead
+		// of exiting.
+		_ = quicConn.CloseWithError(0, "")
+	}()
 
-	buf := make([]byte, udpReadBufferSize)
 	for {
-		data, err := udpSession.Recv(buf)
+		data, err := quicConn.ReceiveDatagram(ctx)
 		if err != nil {
 			select {
 			case hErr := <-heartbeatErr:
@@ -139,7 +163,7 @@ func runUDP(ctx context.Context, control *tls.Conn, udpSession *udpcrypto.Sessio
 			continue // malformed frame from a misbehaving relay; drop it
 		}
 
-		entry, err := table.get(ctx, udpSession, addr, sub, flow)
+		entry, err := table.get(ctx, quicConn, addr, sub, flow)
 		if err != nil {
 			continue // local dial failed; drop this datagram, the next one retries
 		}
@@ -153,7 +177,7 @@ func runUDP(ctx context.Context, control *tls.Conn, udpSession *udpcrypto.Sessio
 // that (subscriber, flow) pair.
 func (t *natTable) get(
 	ctx context.Context,
-	udpSession *udpcrypto.Session,
+	quicConn *quic.Conn,
 	addr hostport.HostPort,
 	sub proto.SubscriberID,
 	flow proto.FlowID,
@@ -177,22 +201,31 @@ func (t *natTable) get(
 		return nil, fmt.Errorf("dial %s for new flow: %w", addr, err)
 	}
 
-	entry = &natEntry{conn: local, lastActive: time.Now()}
+	entryCtx, cancel := context.WithCancel(ctx)
+	entry = &natEntry{
+		conn:       local,
+		uplink:     make(chan []byte, udpUplinkQueueDepth),
+		cancel:     cancel,
+		lastActive: time.Now(),
+	}
 
 	t.mu.Lock()
 	t.entries[key] = entry
 	t.mu.Unlock()
 
-	go t.pump(udpSession, local, key)
+	go pumpUplink(entryCtx, quicConn, entry.uplink)
+	go t.pump(local, entry.uplink, key)
 
 	return entry, nil
 }
 
-// pump reads replies from a NAT entry's local socket and forwards them
-// back through udpSession, tagged with the header that routes them to the
-// right subscriber's right local client. It runs until the local socket
-// errors or closes, then evicts its own entry.
-func (t *natTable) pump(udpSession *udpcrypto.Session, local net.Conn, key natKey) {
+// pump reads replies from a NAT entry's local socket and hands each,
+// tagged with the header that routes it to the right subscriber's right
+// local client, to uplink for a separate goroutine to actually send - see
+// udpUplinkQueueDepth's doc comment for why reading and sending are kept
+// apart. It runs until the local socket errors or closes, then evicts its
+// own entry.
+func (t *natTable) pump(local net.Conn, uplink chan<- []byte, key natKey) {
 	buf := make([]byte, udpReadBufferSize)
 	for {
 		n, err := local.Read(buf)
@@ -201,12 +234,28 @@ func (t *natTable) pump(udpSession *udpcrypto.Session, local net.Conn, key natKe
 			return
 		}
 
-		if err := udpSession.Send(proto.EncodePublisherFrame(key.sub, key.flow, buf[:n])); err != nil {
-			t.evict(key)
-			return
+		frame := proto.EncodePublisherFrame(key.sub, key.flow, buf[:n])
+		select {
+		case uplink <- frame:
+		default: // uplink congested; drop rather than stall this read loop
 		}
 
 		t.touch(key)
+	}
+}
+
+// pumpUplink drains uplink and sends each frame on quicConn, in its own
+// goroutine so a SendDatagram call that blocks on quic-go's internal send
+// queue never stalls the local-socket read loop feeding uplink. It exits
+// when ctx is canceled.
+func pumpUplink(ctx context.Context, quicConn *quic.Conn, uplink <-chan []byte) {
+	for {
+		select {
+		case data := <-uplink:
+			_ = quicConn.SendDatagram(data)
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -231,6 +280,7 @@ func (t *natTable) evict(key natKey) {
 	t.mu.Unlock()
 
 	if ok {
+		entry.cancel()
 		_ = entry.conn.Close()
 	}
 }
@@ -255,18 +305,19 @@ func (t *natTable) sweep(ctx context.Context) {
 func (t *natTable) sweepOnce() {
 	cutoff := time.Now().Add(-udpIdleTimeout)
 
-	var stale []net.Conn
+	var stale []*natEntry
 	t.mu.Lock()
 	for key, entry := range t.entries {
 		if entry.lastActive.Before(cutoff) {
-			stale = append(stale, entry.conn)
+			stale = append(stale, entry)
 			delete(t.entries, key)
 		}
 	}
 	t.mu.Unlock()
 
-	for _, conn := range stale {
-		_ = conn.Close()
+	for _, entry := range stale {
+		entry.cancel()
+		_ = entry.conn.Close()
 	}
 }
 

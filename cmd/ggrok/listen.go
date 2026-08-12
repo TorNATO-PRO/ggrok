@@ -46,6 +46,9 @@ const listenUsage = `ggrok listen - subscribe to a share's session and forward i
 Usage:
   ggrok listen [flags] <token>
 
+The token may instead be supplied via the GGROK_TOKEN environment
+variable, which keeps it out of process listings and shell history.
+
 Flags:
 `
 
@@ -118,12 +121,16 @@ func parseListenFlags(args []string) (listenConfig, error) {
 		return listenConfig{}, fmt.Errorf("exactly one of -tcp or -udp is required")
 	}
 
-	if fs.NArg() != 1 {
+	tokenStr := os.Getenv("GGROK_TOKEN")
+	switch {
+	case fs.NArg() == 1:
+		tokenStr = fs.Arg(0)
+	case fs.NArg() != 0 || tokenStr == "":
 		fs.Usage()
-		return listenConfig{}, fmt.Errorf("exactly one token argument is required")
+		return listenConfig{}, fmt.Errorf("exactly one token argument (or GGROK_TOKEN) is required")
 	}
 
-	token, err := proto.ParseToken(fs.Arg(0))
+	token, err := proto.ParseToken(tokenStr)
 	if err != nil {
 		return listenConfig{}, fmt.Errorf("invalid token: %w", err)
 	}

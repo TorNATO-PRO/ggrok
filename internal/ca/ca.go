@@ -203,10 +203,13 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		Subject:      pkix.Name{CommonName: request.CommonName},
 		NotBefore:    now.Add(-5 * time.Minute),
 		NotAfter:     now.Add(request.Validity),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  usages,
-		DNSNames:     request.DNSNames,
-		IPAddresses:  request.IPs,
+		// Digital signature only: keyEncipherment is an RSA key-transport
+		// concept and is prohibited for EC public keys (RFC 8813), which
+		// is all this CA ever issues.
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: usages,
+		DNSNames:    request.DNSNames,
+		IPAddresses: request.IPs,
 
 		BasicConstraintsValid: true,
 		IsCA:                  false,

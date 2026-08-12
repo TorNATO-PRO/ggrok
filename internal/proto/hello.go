@@ -42,6 +42,19 @@ const (
 	ModeUDP
 )
 
+// String names a mode for logs and error messages, where the raw number
+// says nothing to anyone reading them.
+func (m Mode) String() string {
+	switch m {
+	case ModeTCP:
+		return "tcp"
+	case ModeUDP:
+		return "udp"
+	default:
+		return fmt.Sprintf("invalid mode (%d)", uint8(m))
+	}
+}
+
 // helloSize is the fixed wire size of a Hello: 1 byte Role + 1 byte Mode +
 // 16 byte Token. Fixed width means no length prefix is needed.
 const helloSize = 1 + 1 + tokenSize

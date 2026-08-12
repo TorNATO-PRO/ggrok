@@ -77,11 +77,11 @@ func Run(ctx context.Context, cfg Config) error {
 	case proto.ModeTCP:
 		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token)
 	case proto.ModeUDP:
-		udpSession, err := setupUDPSession(ctx, control, cfg.Server, cfg.Token)
+		quicConn, err := dialUDPConn(ctx, tlsConf, cfg.Server, cfg.Token)
 		if err != nil {
 			return fmt.Errorf("share: %w", err)
 		}
-		return runUDP(ctx, control, udpSession, cfg.Addr)
+		return runUDP(ctx, control, quicConn, cfg.Addr)
 	default:
 		return fmt.Errorf("share: unsupported mode %v", cfg.Mode)
 	}
@@ -97,14 +97,7 @@ func dialControl(ctx context.Context, server hostport.HostPort, tlsConf *tls.Con
 		return nil, err
 	}
 
-	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
-		_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-			Enable:   true,
-			Idle:     tcpKeepAliveIdle,
-			Interval: tcpKeepAliveInterval,
-			Count:    tcpKeepAliveProbeCount,
-		})
-	}
+	setTCPKeepAlive(conn)
 
 	if err := proto.WriteConnKind(conn, proto.ConnControl); err != nil {
 		_ = conn.Close()
@@ -116,12 +109,18 @@ func dialControl(ctx context.Context, server hostport.HostPort, tlsConf *tls.Con
 
 // dialData dials a fresh TCP-mode data connection to relay and writes the
 // ConnData discriminator - the first step for every connection share
-// opens in response to a ControlRequestData.
+// opens in response to a ControlRequestData. It configures the same TCP
+// keepalive as dialControl: a data connection is spliced raw bytes with no
+// application-level heartbeat of its own, so without this, a path a
+// NAT/firewall silently drops while the tunnel is idle goes unnoticed
+// until the next write.
 func dialData(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config) (*tls.Conn, error) {
 	conn, err := dialTLS(ctx, server, tlsConf)
 	if err != nil {
 		return nil, err
 	}
+
+	setTCPKeepAlive(conn)
 
 	if err := proto.WriteConnKind(conn, proto.ConnData); err != nil {
 		_ = conn.Close()
@@ -129,6 +128,23 @@ func dialData(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config
 	}
 
 	return conn, nil
+}
+
+// setTCPKeepAlive best-effort enables TCP keepalive on conn's underlying
+// socket, per tcpKeepAliveIdle/Interval/ProbeCount - a no-op if conn isn't
+// backed by a [net.TCPConn].
+func setTCPKeepAlive(conn *tls.Conn) {
+	tcpConn, ok := conn.NetConn().(*net.TCPConn)
+	if !ok {
+		return
+	}
+
+	_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     tcpKeepAliveIdle,
+		Interval: tcpKeepAliveInterval,
+		Count:    tcpKeepAliveProbeCount,
+	})
 }
 
 // dialTLS is the raw dial shared by dialControl and dialData.

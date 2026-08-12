@@ -1,36 +1,42 @@
 // Package relay is the rendezvous point between share (publisher) and
-// listen (subscriber) connections: it pairs them by token and, for
-// TCP-mode sessions, splices their forwarded connections together. For
-// UDP-mode sessions it demultiplexes AEAD-encrypted datagrams by a
-// cleartext RoutingID (see internal/udpcrypto and udp.go) - the one place
-// relay loses "dumb pipe" purity, since it has to read that routing
-// header (and, for fan-out, the decrypted SubscriberID/FlowID header
-// inside) to know where a datagram goes. See the "Fan-out design"
-// section of docs/plans/tcp-udp-tunnel.md for the original rationale
-// behind that header, which still holds even though the transport
-// underneath it changed.
+// listen (subscriber) connections: it pairs them by token. For TCP-mode
+// sessions it splices their forwarded connections together (see
+// registry.go's AttachSubscriberData/AttachPublisherData and udp.go's TCP
+// counterparts don't exist - TCP-mode's data plane is plain spliced
+// bytes). For UDP-mode sessions each party holds its own persistent QUIC
+// connection to relay, and relay fans datagrams between them by the
+// SubscriberID/FlowID header inside each one (see udp.go) - the one place
+// relay loses "dumb pipe" purity, since it has to read that header to
+// know where a datagram goes. See the "Fan-out design" section of
+// docs/plans/tcp-udp-tunnel.md for the original rationale behind that
+// header.
 package relay
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
 	"tornato.dev/ggrok/v2/internal/proto"
 	"tornato.dev/ggrok/v2/internal/streamio"
-	"tornato.dev/ggrok/v2/internal/udpcrypto"
 )
 
-// errPublisherExists, errNoSuchSession, and errModeMismatch are the ways
-// Register/Subscribe/AttachSubscriberData deliberately reject a peer.
-// They map 1:1 to proto.AckStatus values.
+// errPublisherExists, errNoSuchSession, errModeMismatch, and
+// errNotPublisherCert are the ways Register/Subscribe/AttachSubscriberData
+// deliberately reject a peer. The first three map 1:1 to proto.AckStatus
+// values.
 var (
-	errPublisherExists = errors.New("token already has an active publisher")
-	errNoSuchSession   = errors.New("no active session for this token")
-	errModeMismatch    = errors.New("mode does not match this session's publisher")
+	errPublisherExists  = errors.New("token already has an active publisher")
+	errNoSuchSession    = errors.New("no active session for this token")
+	errModeMismatch     = errors.New("mode does not match this session's publisher")
+	errNotPublisherCert = errors.New("data connection certificate does not match this session's publisher")
 )
 
 // pendingRequestTimeout bounds how long relay waits for a publisher to
@@ -38,20 +44,66 @@ var (
 // connection that's waiting on it.
 const pendingRequestTimeout = 10 * time.Second
 
+// notifyWriteTimeout bounds how long relay blocks writing a
+// ControlSessionClosed frame to any one subscriber - see
+// session.shutdown.
+const notifyWriteTimeout = 5 * time.Second
+
+// sessionTagBytes is how much of a token's hash sessionAttr logs. Six
+// bytes is far too little to attack the token behind it and far more than
+// enough to keep concurrent sessions distinguishable in a log.
+const sessionTagBytes = 6
+
 // Registry holds every currently-active session, keyed by token.
 type Registry struct {
-	udpRouter *udpRouter
+	logger *slog.Logger
 
 	mu       sync.Mutex
 	sessions map[proto.Token]*session
 }
 
-// NewRegistry returns an empty Registry. router is where Register and
-// Subscribe wire up a UDP-mode session's data-plane routes; it may be nil
-// if this relay will only ever serve TCP-mode sessions, in which case a
-// UDP-mode Register/Subscribe fails cleanly instead of panicking.
-func NewRegistry(router *udpRouter) *Registry {
-	return &Registry{udpRouter: router, sessions: make(map[proto.Token]*session)}
+// NewRegistry returns an empty Registry. logger records session lifecycle
+// - who joined, who left, and what their forwarded connections carried; a
+// nil one falls back to slog's default.
+func NewRegistry(logger *slog.Logger) *Registry {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return &Registry{logger: logger, sessions: make(map[proto.Token]*session)}
+}
+
+// peerAttr describes who is on the other end of conn for a log line: its
+// network address, plus the Common Name of the certificate it
+// authenticated with. The CN is the more durable of the two - relay
+// requires and verifies a client certificate, so it names an identity the
+// CA vouched for, where an address only says where a packet came from
+// this time.
+func peerAttr(conn net.Conn) slog.Attr {
+	addr := slog.Any("addr", conn.RemoteAddr())
+
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return slog.Group("peer", addr)
+	}
+
+	cert, err := peerLeafCert(tlsConn)
+	if err != nil {
+		return slog.Group("peer", addr)
+	}
+
+	return slog.Group("peer", addr, slog.String("cn", cert.Subject.CommonName))
+}
+
+// sessionAttr identifies a session in the logs without ever writing its
+// token there. The token is a bearer secret - anyone reading it out of a
+// log file could subscribe to the session - so what gets logged is a
+// truncated hash of it, which is enough to tie a publisher, its
+// subscribers, and their streams together across log lines and nothing
+// more.
+func sessionAttr(token proto.Token) slog.Attr {
+	sum := sha256.Sum256(token[:])
+	return slog.String("session", hex.EncodeToString(sum[:sessionTagBytes]))
 }
 
 // Register adds control as token's publisher control connection and
@@ -61,6 +113,12 @@ func NewRegistry(router *udpRouter) *Registry {
 // error is nil. On failure the returned func is nil and the error
 // describes why - the caller owns closing control in that case.
 func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mode) (func(), error) {
+	publisherCert, err := peerLeafCert(control)
+	if err != nil {
+		_ = proto.WriteAck(control, proto.AckNoSuchSession)
+		return nil, fmt.Errorf("register publisher: %w", err)
+	}
+
 	r.mu.Lock()
 	if _, exists := r.sessions[token]; exists {
 		r.mu.Unlock()
@@ -68,7 +126,7 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 		return nil, errPublisherExists
 	}
 
-	sess := newSession(mode, control)
+	sess := newSession(mode, control, publisherCert)
 	r.sessions[token] = sess
 	r.mu.Unlock()
 
@@ -79,25 +137,20 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 		return nil, fmt.Errorf("ack publisher: %w", err)
 	}
 
-	if mode == proto.ModeUDP {
-		route, err := r.setupUDPRoute(sess, control, token, true, 0)
-		if err != nil {
-			r.mu.Lock()
-			delete(r.sessions, token)
-			r.mu.Unlock()
-			return nil, fmt.Errorf("set up publisher udp route: %w", err)
-		}
-		sess.udpPublisherRoute = route
-	}
+	r.logger.Info("publisher registered", peerAttr(control), sessionAttr(token), slog.Any("mode", mode))
 
 	return func() {
 		r.mu.Lock()
 		delete(r.sessions, token)
 		r.mu.Unlock()
 
-		if sess.udpPublisherRoute != nil {
-			r.udpRouter.removeRoute(sess.udpPublisherRoute)
-		}
+		// Deleting the session above only stops peers that haven't looked
+		// it up yet; everything already attached has to be told, or it
+		// waits on a publisher that is never coming back.
+		notified := sess.shutdown(proto.ReasonPublisherGone)
+
+		r.logger.Info("publisher disconnected",
+			peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Int("subscribers_notified", notified))
 	}, nil
 }
 
@@ -125,80 +178,40 @@ func (r *Registry) Subscribe(
 		return 0, nil, errModeMismatch
 	}
 
+	// Take the slot before acking, not after: a publisher unregistering
+	// right now has to either see this subscriber (and notify it) or turn
+	// it away here - never ack a subscriber into a session that has
+	// already said its goodbyes.
+	id, release, ok := sess.addSubscriber(control)
+	if !ok {
+		_ = proto.WriteAck(control, proto.AckNoSuchSession)
+		return 0, nil, errNoSuchSession
+	}
+
 	if err := proto.WriteAck(control, proto.AckOK); err != nil {
+		release()
 		return 0, nil, fmt.Errorf("ack subscriber: %w", err)
 	}
 
-	id, release := sess.addSubscriber(control)
-
 	if mode == proto.ModeUDP {
-		route, err := r.setupUDPRoute(sess, control, token, false, id)
-		if err != nil {
+		// listen presents this same id back in its UDPAttach handshake
+		// when it dials relay's QUIC data connection, so relay can tell
+		// which already-registered subscriber that datagram-only
+		// connection belongs to - see AttachSubscriberUDP.
+		if err := proto.WriteSubscriberID(control, id); err != nil {
 			release()
-			return 0, nil, fmt.Errorf("set up subscriber udp route: %w", err)
-		}
-		sess.setSubscriberUDPRoute(id, route)
-
-		release = func() {
-			sess.removeSubscriber(id)
-			r.udpRouter.removeRoute(route)
+			return 0, nil, fmt.Errorf("send subscriber id: %w", err)
 		}
 	}
 
-	return id, release, nil
-}
+	r.logger.Info("subscriber attached",
+		peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Any("sub", id))
 
-// setupUDPRoute mints a fresh RoutingID, derives this hop's AEAD key pair
-// off control's connection state, registers the route with the UDP
-// router, and sends the RoutingID to control via a ControlUDPSession
-// frame so the peer can derive the matching keys off its own end of the
-// same TLS connection and start using it. No key material ever crosses
-// the wire - RFC 5705's TLS exporter guarantees both ends compute the
-// same value for the same (routing, token, direction) inputs.
-//
-// relay's own send direction is always this peer's downlink (relay ->
-// peer) and its recv direction is always this peer's uplink (peer ->
-// relay); the peer derives the same two keys under the same labels off
-// its own end of this connection, with the directions swapped to match
-// its own perspective - see share/listen's udp.go.
-func (r *Registry) setupUDPRoute(
-	sess *session,
-	control *tls.Conn,
-	token proto.Token,
-	isPublisher bool,
-	subID proto.SubscriberID,
-) (*udpRoute, error) {
-	if r.udpRouter == nil {
-		return nil, errors.New("relay has no UDP listener configured")
-	}
-
-	routing, err := proto.NewRoutingID()
-	if err != nil {
-		return nil, fmt.Errorf("mint routing id: %w", err)
-	}
-
-	state := control.ConnectionState()
-
-	sendKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionDownlink)
-	if err != nil {
-		return nil, err
-	}
-	recvKey, err := udpcrypto.DeriveKey(&state, routing, token, udpcrypto.DirectionUplink)
-	if err != nil {
-		return nil, err
-	}
-
-	route, err := r.udpRouter.addRoute(routing, sess, isPublisher, subID, sendKey, recvKey)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := proto.WriteUDPSession(control, routing); err != nil {
-		r.udpRouter.removeRoute(route)
-		return nil, fmt.Errorf("send udp session: %w", err)
-	}
-
-	return route, nil
+	return id, func() {
+		release()
+		r.logger.Info("subscriber detached",
+			peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Any("sub", id))
+	}, nil
 }
 
 // sessionFor looks up token's session, if any.
@@ -233,15 +246,26 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token) err
 		return errModeMismatch
 	}
 
+	// As in Subscribe, take the slot before acking, so a publisher
+	// unregistering right now can't leave an acked connection waiting on
+	// a request it will never make.
+	reqID, ok := sess.addPending(subConn)
+	if !ok {
+		_ = proto.WriteAck(subConn, proto.AckNoSuchSession)
+		return errNoSuchSession
+	}
+
 	if err := proto.WriteAck(subConn, proto.AckOK); err != nil {
+		sess.removePending(reqID)
 		return fmt.Errorf("ack subscriber data conn: %w", err)
 	}
 
-	reqID := sess.addPending(subConn)
 	if err := proto.WriteRequestData(sess.publisher, reqID); err != nil {
 		sess.removePending(reqID)
 		return fmt.Errorf("request publisher data conn: %w", err)
 	}
+
+	r.logger.Info("stream requested", peerAttr(subConn), sessionAttr(token), slog.Uint64("req", reqID))
 
 	return nil
 }
@@ -252,10 +276,25 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token) err
 // returning). Returns an error without blocking, and without closing
 // pubConn, if reqID is unknown - already timed out, already claimed, or
 // forged; the caller owns closing pubConn in that case.
-func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn net.Conn) error {
+//
+// pubConn must present the same client certificate the session's
+// publisher registered with. The token alone can't gate this: every
+// subscriber holds it too, and request IDs are guessable (sequential),
+// so without the cert check a malicious subscriber could race the real
+// publisher to claim another subscriber's pending connection and
+// impersonate the shared service.
+func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn *tls.Conn) error {
 	sess, ok := r.sessionFor(token)
 	if !ok {
 		return errNoSuchSession
+	}
+
+	cert, err := peerLeafCert(pubConn)
+	if err != nil {
+		return fmt.Errorf("attach publisher data: %w", err)
+	}
+	if !cert.Equal(sess.publisherCert) {
+		return errNotPublisherCert
 	}
 
 	subConn, ok := sess.claimPending(reqID)
@@ -263,7 +302,26 @@ func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn 
 		return fmt.Errorf("unknown or expired request id %d", reqID)
 	}
 
-	streamio.Splice(subConn, pubConn)
+	started := time.Now()
+	r.logger.Info(
+		"stream paired",
+		sessionAttr(token), slog.Uint64("req", reqID),
+		slog.Group("subscriber", "addr", subConn.RemoteAddr()),
+		slog.Group("publisher", "addr", pubConn.RemoteAddr()),
+	)
+
+	// Splice blocks for the whole life of the forwarded connection, so
+	// this is the only moment relay can say what it carried - both legs
+	// are closed by the time it returns.
+	toSub, toPub := streamio.Splice(subConn, pubConn)
+
+	r.logger.Info(
+		"stream closed",
+		sessionAttr(token), slog.Uint64("req", reqID),
+		slog.Int64("bytes_to_subscriber", toSub), slog.Int64("bytes_to_publisher", toPub),
+		slog.Duration("duration", time.Since(started).Round(time.Millisecond)),
+	)
+
 	return nil
 }
 
@@ -272,48 +330,88 @@ type session struct {
 	mode      proto.Mode
 	publisher *tls.Conn
 
-	mu          sync.Mutex
+	// publisherCert is the client certificate the publisher's control
+	// connection authenticated with; AttachPublisherData and
+	// AttachPublisherUDP require the publisher's data connection to
+	// present the same one.
+	publisherCert *x509.Certificate
+
+	mu sync.Mutex
+
+	// closed marks a session whose publisher has gone (see shutdown).
+	// The registry has already dropped it by then, so this only matters
+	// to a peer that looked the session up just before that happened and
+	// is only now trying to join it.
+	closed bool
+
 	subscribers map[proto.SubscriberID]*subscriberConn
 	nextSubID   proto.SubscriberID
 
 	nextReqID uint64
 	pending   map[uint64]net.Conn
 
-	// udpPublisherRoute is the publisher's relay<->share UDP data-plane
-	// route - nil for a TCP-mode session, or a UDP-mode session before
-	// setupUDPRoute finishes.
-	udpPublisherRoute *udpRoute
+	// udpPublisher wraps the publisher's relay<->share UDP data-plane QUIC
+	// connection - nil for a TCP-mode session, or a UDP-mode session
+	// before AttachPublisherUDP completes. Sends to it go through the
+	// udpSender rather than a direct SendDatagram call - see udpSender's
+	// doc comment in udp.go for why.
+	udpPublisher *udpSender
+
+	// udpSubscribers holds each attached subscriber's relay<->listen UDP
+	// data-plane connection, wrapped the same way, keyed by the same
+	// SubscriberID assigned in addSubscriber.
+	udpSubscribers map[proto.SubscriberID]*udpSender
 }
 
 // subscriberConn is what session tracks per attached subscriber: its
-// control connection (liveness, and in UDP mode the source of its
-// derived keys) and, in UDP mode only, the relay<->listen route its
-// traffic is demultiplexed through.
+// control connection, used for liveness and (in UDP mode) as the source
+// of the certificate its data-plane QUIC connection must match.
 type subscriberConn struct {
 	control *tls.Conn
-	udp     *udpRoute
 }
 
-func newSession(mode proto.Mode, publisher *tls.Conn) *session {
+func newSession(mode proto.Mode, publisher *tls.Conn, publisherCert *x509.Certificate) *session {
 	return &session{
-		mode:        mode,
-		publisher:   publisher,
-		subscribers: make(map[proto.SubscriberID]*subscriberConn),
-		pending:     make(map[uint64]net.Conn),
+		mode:           mode,
+		publisher:      publisher,
+		publisherCert:  publisherCert,
+		subscribers:    make(map[proto.SubscriberID]*subscriberConn),
+		pending:        make(map[uint64]net.Conn),
+		udpSubscribers: make(map[proto.SubscriberID]*udpSender),
 	}
+}
+
+// peerLeafCert returns conn's verified peer leaf certificate. relay's TLS
+// config uses RequireAndVerifyClientCert, so by the time any post-handshake
+// read has succeeded this is always present - but fail closed rather than
+// panic if it somehow isn't.
+func peerLeafCert(conn *tls.Conn) (*x509.Certificate, error) {
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil, errors.New("no peer certificate")
+	}
+
+	return certs[0], nil
 }
 
 // addSubscriber registers control under a freshly allocated SubscriberID.
 // The returned release func removes it and must be called once the
-// subscriber's control connection is done.
-func (s *session) addSubscriber(control *tls.Conn) (proto.SubscriberID, func()) {
+// subscriber's control connection is done. ok is false if the session has
+// already shut down, in which case nothing was registered and the caller
+// must reject the subscriber.
+func (s *session) addSubscriber(control *tls.Conn) (proto.SubscriberID, func(), bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, nil, false
+	}
+
 	id := s.nextSubID
 	s.nextSubID++
 	s.subscribers[id] = &subscriberConn{control: control}
-	s.mu.Unlock()
 
-	return id, func() { s.removeSubscriber(id) }
+	return id, func() { s.removeSubscriber(id) }, true
 }
 
 // removeSubscriber forgets id.
@@ -323,34 +421,70 @@ func (s *session) removeSubscriber(id proto.SubscriberID) {
 	s.mu.Unlock()
 }
 
-// setSubscriberUDPRoute records route as id's UDP data-plane route, if id
-// is still a live subscriber (it may have already disconnected while its
-// route was being set up).
-func (s *session) setSubscriberUDPRoute(id proto.SubscriberID, route *udpRoute) {
+// subscriberCert returns the certificate id's control connection
+// authenticated with, if id is still a live subscriber.
+func (s *session) subscriberCert(id proto.SubscriberID) (*x509.Certificate, error) {
 	s.mu.Lock()
-	if sc, ok := s.subscribers[id]; ok {
-		sc.udp = route
+	sc, ok := s.subscribers[id]
+	s.mu.Unlock()
+
+	if !ok {
+		return nil, fmt.Errorf("unknown subscriber %d", id)
 	}
+
+	return peerLeafCert(sc.control)
+}
+
+// setUDPPublisher records sender as the session's publisher UDP
+// data-plane connection; a nil sender clears it.
+func (s *session) setUDPPublisher(sender *udpSender) {
+	s.mu.Lock()
+	s.udpPublisher = sender
 	s.mu.Unlock()
 }
 
-// subscriberUDPRoute returns id's UDP data-plane route, if it has one.
-func (s *session) subscriberUDPRoute(id proto.SubscriberID) (*udpRoute, bool) {
+// udpPublisherSender returns the session's publisher UDP data-plane
+// connection, if one has attached.
+func (s *session) udpPublisherSender() (*udpSender, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.udpPublisher, s.udpPublisher != nil
+}
 
-	sc, ok := s.subscribers[id]
-	if !ok || sc.udp == nil {
-		return nil, false
-	}
-	return sc.udp, true
+// setUDPSubscriber records sender as id's UDP data-plane connection.
+func (s *session) setUDPSubscriber(id proto.SubscriberID, sender *udpSender) {
+	s.mu.Lock()
+	s.udpSubscribers[id] = sender
+	s.mu.Unlock()
+}
+
+// removeUDPSubscriber forgets id's UDP data-plane connection.
+func (s *session) removeUDPSubscriber(id proto.SubscriberID) {
+	s.mu.Lock()
+	delete(s.udpSubscribers, id)
+	s.mu.Unlock()
+}
+
+// udpSubscriber returns id's UDP data-plane connection, if it has
+// attached one.
+func (s *session) udpSubscriber(id proto.SubscriberID) (*udpSender, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sender, ok := s.udpSubscribers[id]
+	return sender, ok
 }
 
 // addPending stashes conn under a freshly allocated RequestID and arms a
 // timeout that closes conn and forgets the entry if claimPending never
-// claims it within pendingRequestTimeout.
-func (s *session) addPending(conn net.Conn) uint64 {
+// claims it within pendingRequestTimeout. ok is false if the session has
+// already shut down - there is no publisher left to fulfill the request,
+// so the caller must reject it rather than let conn wait out the timeout.
+func (s *session) addPending(conn net.Conn) (uint64, bool) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, false
+	}
 	id := s.nextReqID
 	s.nextReqID++
 	s.pending[id] = conn
@@ -369,7 +503,7 @@ func (s *session) addPending(conn net.Conn) uint64 {
 		}
 	})
 
-	return id
+	return id, true
 }
 
 // removePending forgets id without claiming it, closing its connection -
@@ -386,6 +520,72 @@ func (s *session) removePending(id uint64) {
 	if ok {
 		_ = conn.Close()
 	}
+}
+
+// shutdown ends the session for everyone still attached to it: it marks
+// the session closed so nothing new can join, closes every subscriber
+// data connection left waiting on a publisher that will never fulfill it,
+// closes every UDP-mode data-plane connection (the publisher's and every
+// attached subscriber's - pumpPublisherDatagrams/pumpSubscriberDatagrams
+// exit once their ReceiveDatagram call errors, which closing does), and
+// sends every attached subscriber a ControlSessionClosed frame carrying
+// reason.
+//
+// Marking closed under the same lock as the snapshot is what makes this
+// airtight: a subscriber that slips into addSubscriber between the
+// registry dropping this session and this call would otherwise never be
+// told, and would wait on the dead session forever - exactly the hang
+// this frame exists to prevent.
+//
+// The pending connections are closed rather than left to their addPending
+// timeouts, since a subscriber whose publisher just vanished shouldn't
+// spend the rest of pendingRequestTimeout finding that out.
+//
+// Subscriber control connections are deliberately left open: the
+// subscriber tears its own end down on reading the frame, and closing
+// here would risk resetting the connection out from under a frame the
+// peer hasn't read yet. A subscriber that ignores the frame is no worse
+// off than before it existed. The writes are best-effort and deadlined,
+// so one wedged subscriber can't hold up the publisher's teardown or the
+// notification owed to everyone behind it.
+// It returns how many subscribers it notified.
+func (s *session) shutdown(reason proto.SessionCloseReason) int {
+	s.mu.Lock()
+	s.closed = true
+
+	pending := s.pending
+	s.pending = make(map[uint64]net.Conn)
+
+	controls := make([]*tls.Conn, 0, len(s.subscribers))
+	for _, sub := range s.subscribers {
+		controls = append(controls, sub.control)
+	}
+
+	udpPublisher := s.udpPublisher
+	udpSubscribers := make([]*udpSender, 0, len(s.udpSubscribers))
+	for _, sender := range s.udpSubscribers {
+		udpSubscribers = append(udpSubscribers, sender)
+	}
+	s.mu.Unlock()
+
+	for _, conn := range pending {
+		_ = conn.Close()
+	}
+
+	if udpPublisher != nil {
+		_ = udpPublisher.conn.CloseWithError(0, "")
+	}
+	for _, sender := range udpSubscribers {
+		_ = sender.conn.CloseWithError(0, "")
+	}
+
+	for _, control := range controls {
+		_ = control.SetWriteDeadline(time.Now().Add(notifyWriteTimeout))
+		_ = proto.WriteSessionClosed(control, reason)
+		_ = control.SetWriteDeadline(time.Time{})
+	}
+
+	return len(controls)
 }
 
 // claimPending removes and returns id's pending connection, if it's still

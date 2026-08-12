@@ -9,6 +9,7 @@ package listen
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -33,6 +34,13 @@ const (
 	tcpKeepAliveInterval    = 15 * time.Second
 	tcpKeepAliveProbeCount  = 2
 )
+
+// ErrSessionClosed reports that relay told this subscriber its session
+// has ended - the publisher went away - rather than listen losing relay
+// itself. Run returns an error wrapping it, so a caller can tell an
+// orderly end of the shared session apart from a broken connection worth
+// retrying.
+var ErrSessionClosed = errors.New("session ended")
 
 // Config is the input to Run.
 type Config struct {
@@ -77,11 +85,15 @@ func Run(ctx context.Context, cfg Config) error {
 	case proto.ModeTCP:
 		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token)
 	case proto.ModeUDP:
-		udpSession, err := setupUDPSession(ctx, control, cfg.Server, cfg.Token)
+		subID, err := readSubscriberID(control)
 		if err != nil {
 			return fmt.Errorf("listen: %w", err)
 		}
-		return runUDP(ctx, control, udpSession, cfg.Addr)
+		quicConn, err := dialUDPConn(ctx, tlsConf, cfg.Server, cfg.Token, subID)
+		if err != nil {
+			return fmt.Errorf("listen: %w", err)
+		}
+		return runUDP(ctx, control, quicConn, cfg.Addr)
 	default:
 		return fmt.Errorf("listen: unsupported mode %v", cfg.Mode)
 	}
@@ -97,14 +109,7 @@ func dialControl(ctx context.Context, server hostport.HostPort, tlsConf *tls.Con
 		return nil, err
 	}
 
-	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
-		_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-			Enable:   true,
-			Idle:     tcpKeepAliveIdle,
-			Interval: tcpKeepAliveInterval,
-			Count:    tcpKeepAliveProbeCount,
-		})
-	}
+	setTCPKeepAlive(conn)
 
 	if err := proto.WriteConnKind(conn, proto.ConnControl); err != nil {
 		_ = conn.Close()
@@ -116,12 +121,17 @@ func dialControl(ctx context.Context, server hostport.HostPort, tlsConf *tls.Con
 
 // dialData dials a fresh TCP-mode data connection to relay and writes the
 // ConnData discriminator - the first step for every local connection
-// listen accepts.
+// listen accepts. It configures the same TCP keepalive as dialControl:
+// a data connection is spliced raw bytes with no application-level
+// heartbeat of its own, so without this, a path a NAT/firewall silently
+// drops while the tunnel is idle goes unnoticed until the next write.
 func dialData(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config) (*tls.Conn, error) {
 	conn, err := dialTLS(ctx, server, tlsConf)
 	if err != nil {
 		return nil, err
 	}
+
+	setTCPKeepAlive(conn)
 
 	if err := proto.WriteConnKind(conn, proto.ConnData); err != nil {
 		_ = conn.Close()
@@ -129,6 +139,23 @@ func dialData(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config
 	}
 
 	return conn, nil
+}
+
+// setTCPKeepAlive best-effort enables TCP keepalive on conn's underlying
+// socket, per tcpKeepAliveIdle/Interval/ProbeCount - a no-op if conn isn't
+// backed by a [net.TCPConn].
+func setTCPKeepAlive(conn *tls.Conn) {
+	tcpConn, ok := conn.NetConn().(*net.TCPConn)
+	if !ok {
+		return
+	}
+
+	_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     tcpKeepAliveIdle,
+		Interval: tcpKeepAliveInterval,
+		Count:    tcpKeepAliveProbeCount,
+	})
 }
 
 // dialTLS is the raw dial shared by dialControl and dialData.
@@ -186,12 +213,7 @@ func runTCP(
 	for {
 		local, err := ln.Accept()
 		if err != nil {
-			select {
-			case cErr := <-controlErr:
-				return fmt.Errorf("control connection: %w", cErr)
-			default:
-				return fmt.Errorf("accept: %w", err)
-			}
+			return ShutdownErr(ctx, controlErr, err, "accept")
 		}
 
 		go func() {
@@ -221,12 +243,12 @@ func runTCP(
 }
 
 // runControlLoop sends a ControlPing on control every heartbeatInterval
-// and reads frames off it until ctx is canceled, control errors, or
-// relay goes silent for longer than heartbeatSilenceTimeout. listen never
-// receives anything meaningful on its control connection beyond
-// ControlPong (ControlRequestData is publisher-only), so every frame
-// read is just liveness - what matters is that reading one at all resets
-// the deadline for the next.
+// and reads frames off it until ctx is canceled, control errors, relay
+// goes silent for longer than heartbeatSilenceTimeout, or relay reports
+// the session over. Apart from ControlSessionClosed, nothing listen
+// receives here carries meaning (ControlRequestData is publisher-only) -
+// every other frame is just liveness, and what matters is that reading
+// one at all resets the deadline for the next.
 func runControlLoop(ctx context.Context, control *tls.Conn) error {
 	stop := make(chan struct{})
 	defer close(stop)
@@ -238,10 +260,65 @@ func runControlLoop(ctx context.Context, control *tls.Conn) error {
 		}
 
 		_ = control.SetReadDeadline(time.Now().Add(heartbeatSilenceTimeout))
-		if _, _, err := proto.ReadControlFrame(control); err != nil {
+		typ, payload, err := proto.ReadControlFrame(control)
+		if err != nil {
 			return fmt.Errorf("read control frame: %w", err)
 		}
+
+		if typ == proto.ControlSessionClosed {
+			return sessionClosedErr(payload)
+		}
 	}
+}
+
+// ShutdownErr explains why a data-plane loop stopped, given the error its
+// local socket returned. The socket is closed from under that loop on the
+// way out - by the caller canceling ctx, or by the control loop giving up
+// and canceling it - so the read/accept error is a symptom of the
+// shutdown, never its cause, and reporting it verbatim ("use of closed
+// network connection") says nothing true about why we stopped.
+//
+// controlErr holds the better answer when the control loop is what failed,
+// but it's only sampled, never waited on: on a plain SIGINT the control
+// loop is still parked in a read with nothing to report, and blocking for
+// it would stall the exit until its deadline elapsed.
+func ShutdownErr(ctx context.Context, controlErr <-chan error, err error, op string) error {
+	select {
+	case cErr := <-controlErr:
+		return stopReason(cErr)
+	default:
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// stopReason labels why the data plane stopped, given whatever
+// runControlLoop returned. A session relay deliberately closed is already
+// a complete explanation of itself; anything else is the control
+// connection failing, and should say so.
+func stopReason(err error) error {
+	if errors.Is(err, ErrSessionClosed) {
+		return err
+	}
+
+	return fmt.Errorf("control connection: %w", err)
+}
+
+// sessionClosedErr renders a ControlSessionClosed frame's payload as an
+// error wrapping ErrSessionClosed. A payload this build can't parse
+// doesn't change the verdict - relay said the session is over either way
+// - only how precisely we can report why.
+func sessionClosedErr(payload []byte) error {
+	reason, err := proto.ReadSessionClosed(payload)
+	if err != nil {
+		return fmt.Errorf("%w: reason unknown", ErrSessionClosed)
+	}
+
+	return fmt.Errorf("%w: %s", ErrSessionClosed, reason)
 }
 
 // sendPings writes a ControlPing on control every heartbeatInterval until

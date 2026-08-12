@@ -16,21 +16,29 @@ const directions = 2
 // directions have finished, closing each side once the direction reading
 // into it is exhausted so a close on one leg propagates to the other
 // instead of leaking a half-open connection.
-func Splice(a, b io.ReadWriteCloser) {
+//
+// It returns how many bytes it wrote into each side - the only record of
+// what a forwarded connection actually carried, since neither leg exists
+// once this returns. Callers with nothing to report may ignore both.
+func Splice(a, b io.ReadWriteCloser) (int64, int64) {
 	var wg sync.WaitGroup
 	wg.Add(directions)
 
+	var intoA, intoB int64
+
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(a, b) // best-effort proxy; the Close below is what matters
+		intoA, _ = io.Copy(a, b) // best-effort proxy; the Close below is what matters
 		_ = a.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(b, a) // best-effort proxy; the Close below is what matters
+		intoB, _ = io.Copy(b, a) // best-effort proxy; the Close below is what matters
 		_ = b.Close()
 	}()
 
 	wg.Wait()
+
+	return intoA, intoB
 }
