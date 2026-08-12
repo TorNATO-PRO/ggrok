@@ -118,7 +118,7 @@ func dialUDPConn(
 // scoped to this one subscriber connection, so relay and share can tell
 // this subscriber's local clients apart from every other subscriber's.
 //
-// Addresses are netip.AddrPort rather than *net.UDPAddr: it's comparable,
+// Addresses are [netip.AddrPort] rather than *[net.UDPAddr]: it's comparable,
 // so it keys byAddr directly, and the read/write paths that produce and
 // consume it (ReadFromUDPAddrPort/WriteToUDPAddrPort) don't allocate -
 // this table is consulted for every datagram, where a per-packet
