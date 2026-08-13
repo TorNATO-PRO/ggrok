@@ -177,6 +177,22 @@ func runTCP(
 	server, addr hostport.HostPort,
 	token proto.Token,
 ) error {
+	// runControlLoop below is the only thing this function blocks on, and
+	// its read has no way to notice ctx being canceled on its own - it
+	// only unblocks whenever the next ControlPong happens to arrive, up to
+	// heartbeatInterval later. Closing control out from under it the
+	// moment ctx is done is what makes Ctrl+C take effect immediately
+	// instead of up to heartbeatInterval late.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = control.Close()
+		case <-stop:
+		}
+	}()
+
 	fulfill := func(reqID uint64) {
 		dataConn, err := dialData(ctx, server, tlsConf)
 		if err != nil {
@@ -221,6 +237,15 @@ func runControlLoop(ctx context.Context, control *tls.Conn, fulfill func(reqID u
 		_ = control.SetReadDeadline(time.Now().Add(heartbeatSilenceTimeout))
 		typ, payload, err := proto.ReadControlFrame(control)
 		if err != nil {
+			// A canceled ctx is what closed control out from under this
+			// read (see runTCP's watcher goroutine) - that's a deliberate,
+			// clean shutdown, and ctx.Err() says so far more usefully than
+			// the raw "use of closed network connection" this read
+			// produced as a side effect of it.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
 			return fmt.Errorf("read control frame: %w", err)
 		}
 
