@@ -7,9 +7,7 @@
 // connection to relay, and relay fans datagrams between them by the
 // SubscriberID/FlowID header inside each one (see udp.go) - the one place
 // relay loses "dumb pipe" purity, since it has to read that header to
-// know where a datagram goes. See the "Fan-out design" section of
-// docs/plans/tcp-udp-tunnel.md for the original rationale behind that
-// header.
+// know where a datagram goes.
 package relay
 
 import (
