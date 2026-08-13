@@ -1,5 +1,7 @@
 ## GGrok
 
+Have you ever developed a web service and wanted to share it with someone else, securely and reliably so that only they may access it? This is the problem that `ggrok` solves.
+
 GGrok is a TCP/UDP tunneling tool. It operates at OSI level 4.
 
 Using `ggrok share <-tcp|-udp>`, you may share a local TCP or UDP service through
