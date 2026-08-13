@@ -166,8 +166,13 @@ func runShare(args []string) error {
 		}
 
 		cfg.token = &token
-		fmt.Fprintf(os.Stdout, "token: %s\n", token)
 	}
+
+	fmt.Fprintf(
+		os.Stdout,
+		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -%s 127.0.0.1:0 -server %s %s\n\n",
+		*cfg.token, cfg.mode, cfg.server, *cfg.token,
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
