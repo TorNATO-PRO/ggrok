@@ -83,20 +83,21 @@ func defaultCADir() (string, error) {
 	return filepath.Join(home, ".ggrok", "ca"), nil
 }
 
-// resolveCADir sets *dir to defaultCADir if it's empty. Every ca sub-verb's
-// -ca-dir (and init's -out) falls back the same way.
+// resolveCADir sets *dir to defaultCADir if it's empty, and expands a
+// leading "~/" either way. Every ca sub-verb's -ca-dir (and init's -out)
+// falls back and expands the same way.
 func resolveCADir(dir *string) error {
-	if *dir != "" {
+	if *dir == "" {
+		def, err := defaultCADir()
+		if err != nil {
+			return err
+		}
+
+		*dir = def
 		return nil
 	}
 
-	def, err := defaultCADir()
-	if err != nil {
-		return err
-	}
-
-	*dir = def
-	return nil
+	return expandHomeInto(dir)
 }
 
 // loadCA reads the root CA's certificate and key out of caDir so a sub-verb
@@ -261,6 +262,10 @@ func runCAIssue(args []string) error {
 	if cfg.out == "" {
 		fs.Usage()
 		return fmt.Errorf("-out is required")
+	}
+
+	if err := expandHomeInto(&cfg.out); err != nil {
+		return err
 	}
 
 	if err := resolveCADir(&cfg.caDir); err != nil {
@@ -432,6 +437,10 @@ func runCACRL(args []string) error {
 	if cfg.out == "" {
 		fs.Usage()
 		return fmt.Errorf("-out is required")
+	}
+
+	if err := expandHomeInto(&cfg.out); err != nil {
+		return err
 	}
 
 	if err := resolveCADir(&cfg.caDir); err != nil {

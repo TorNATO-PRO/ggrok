@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 )
@@ -91,6 +92,42 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// expandHome replaces a leading "~" or "~/" in path with the current
+// user's home directory. Go's os package has no notion of "~" - that's
+// shell syntax the shell itself expands before argv ever reaches us - so
+// a path arriving through config.json or a GGROK_*_FILE env var (which no
+// shell ever touches) needs this done explicitly, or an entirely
+// reasonable-looking "~/.ggrok/cert.pem" silently resolves to a literal
+// "~" subdirectory of wherever the process happens to be running from.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand %s: %w", path, err)
+	}
+
+	if path == "~" {
+		return home, nil
+	}
+
+	return filepath.Join(home, path[len("~/"):]), nil
+}
+
+// expandHomeInto expands *path via expandHome and writes the result back
+// in place - the common shape every path-shaped flag/config value needs.
+func expandHomeInto(path *string) error {
+	expanded, err := expandHome(*path)
+	if err != nil {
+		return err
+	}
+
+	*path = expanded
+	return nil
+}
+
 // defaultConfigDir returns ~/.ggrok, the directory share and listen read
 // their config.json and default cert/key/ca from.
 func defaultConfigDir() (string, error) {
@@ -143,6 +180,12 @@ func registerConnFlags(fs *flag.FlagSet, configDir string, fileCfg nodeFileConfi
 		"path to the CA certificate used to verify the peer (env GGROK_CA_FILE)")
 
 	return func() error {
+		for _, path := range []*string{&cfg.certFile, &cfg.keyFile, &cfg.caFile} {
+			if err := expandHomeInto(path); err != nil {
+				return err
+			}
+		}
+
 		if serverSet {
 			return nil
 		}

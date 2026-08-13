@@ -86,6 +86,12 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 		return relayConfig{}, err
 	}
 
+	for _, path := range []*string{&cfg.certFile, &cfg.keyFile, &cfg.caFile, &cfg.revokedFile} {
+		if err := expandHomeInto(path); err != nil {
+			return relayConfig{}, err
+		}
+	}
+
 	return cfg, nil
 }
 
