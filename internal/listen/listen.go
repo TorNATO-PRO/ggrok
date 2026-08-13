@@ -60,6 +60,14 @@ type Config struct {
 
 	// Token identifies which publisher's session to subscribe to.
 	Token proto.Token
+
+	// OnListen, if non-nil, is called once with the local socket's actual
+	// bound address right after Addr is bound - Addr itself if a specific
+	// port was requested, or whatever port the OS actually chose if it was
+	// left as 0. Run blocks for the life of the session, so this is the
+	// only way a caller finds out which address ended up live, and the
+	// only way for it to know at all when the port was auto-assigned.
+	OnListen func(net.Addr)
 }
 
 // Run dials relay, subscribes to Config.Token's session, and forwards
@@ -83,7 +91,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	switch cfg.Mode {
 	case proto.ModeTCP:
-		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token)
+		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token, cfg.OnListen)
 	case proto.ModeUDP:
 		subID, err := readSubscriberID(control)
 		if err != nil {
@@ -93,7 +101,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("listen: %w", err)
 		}
-		return runUDP(ctx, control, quicConn, cfg.Addr)
+		return runUDP(ctx, control, quicConn, cfg.Addr, cfg.OnListen)
 	default:
 		return fmt.Errorf("listen: unsupported mode %v", cfg.Mode)
 	}
@@ -187,6 +195,7 @@ func runTCP(
 	tlsConf *tls.Config,
 	server, addr hostport.HostPort,
 	token proto.Token,
+	onListen func(net.Addr),
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -197,6 +206,10 @@ func runTCP(
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	defer func() { _ = ln.Close() }()
+
+	if onListen != nil {
+		onListen(ln.Addr())
+	}
 
 	go func() {
 		<-ctx.Done()

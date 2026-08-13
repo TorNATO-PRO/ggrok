@@ -16,6 +16,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 
@@ -159,5 +160,8 @@ func runListen(args []string) error {
 		Mode:     cfg.mode,
 		Addr:     cfg.addr,
 		Token:    cfg.token,
+		OnListen: func(addr net.Addr) {
+			fmt.Fprintf(os.Stdout, "listening on %s\n", addr)
+		},
 	})
 }

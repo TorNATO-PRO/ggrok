@@ -186,7 +186,13 @@ func (t *flowTable) lookup(flow proto.FlowID) (netip.AddrPort, bool) {
 // client it came from (or is destined for). It runs until ctx is
 // canceled, the local socket errors, or the control connection's
 // heartbeat loop decides relay is dead.
-func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr hostport.HostPort) error {
+func runUDP(
+	ctx context.Context,
+	control *tls.Conn,
+	quicConn *quic.Conn,
+	addr hostport.HostPort,
+	onListen func(net.Addr),
+) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -200,6 +206,10 @@ func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr ho
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	defer func() { _ = socket.Close() }()
+
+	if onListen != nil {
+		onListen(socket.LocalAddr())
+	}
 
 	go func() {
 		<-ctx.Done()
