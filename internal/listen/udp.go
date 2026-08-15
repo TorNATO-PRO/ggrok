@@ -22,7 +22,7 @@ const udpReadBufferSize = 64 * 1024
 // udpSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size requested
 // for the local bind socket. Unlike quic-go's own UDP socket (which
 // auto-tunes to several MB - see sys_conn_buffers.go), a plain
-// net.ListenUDP socket keeps whatever small default the OS assigns. This
+// [net.ListenUDP] socket keeps whatever small default the OS assigns. This
 // socket is the single aggregation point for every local client's
 // traffic on this listen instance, so a burst arriving faster than
 // runUDP's read loop drains it can overflow that default and silently

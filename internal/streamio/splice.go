@@ -12,12 +12,12 @@ import (
 // the WaitGroup count isn't a bare magic number.
 const directions = 2
 
-// copyBufferSize is the per-direction io.Copy buffer size. io.Copy's
+// copyBufferSize is the per-direction [io.Copy] buffer size. [io.Copy]'s
 // built-in default is 32KiB; a larger buffer trades a bit of memory for
 // fewer Read/Write calls per byte moved. This only takes effect on legs
-// where neither side is a *net.TCPConn - relay's subscriber<->publisher
-// QUIC streams (internal/relay/registry.go) - since *net.TCPConn
-// implements io.ReaderFrom/io.WriterTo, which io.CopyBuffer detects and
+// where neither side is a *[net.TCPConn] - relay's subscriber<->publisher
+// QUIC streams (internal/relay/registry.go) - since *[net.TCPConn]
+// implements [io.ReaderFrom]/io.WriterTo, which [io.CopyBuffer] detects and
 // hands off to Go's own internal copy loop, silently ignoring this buffer.
 // That's the case on both legs of listen's and share's local-conn<->QUIC
 // splices, so this buffer is a no-op there. Benchmarked ~15% throughput
@@ -49,7 +49,7 @@ func Splice(a, b io.ReadWriteCloser) (int64, int64) {
 
 	go func() {
 		defer wg.Done()
-		buf := bufPool.Get().(*[]byte)
+		buf, _ := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
 		intoA, _ = io.CopyBuffer(a, b, *buf) // best-effort proxy; the Close below is what matters
 		_ = a.Close()
@@ -57,7 +57,7 @@ func Splice(a, b io.ReadWriteCloser) (int64, int64) {
 
 	go func() {
 		defer wg.Done()
-		buf := bufPool.Get().(*[]byte)
+		buf, _ := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
 		intoB, _ = io.CopyBuffer(b, a, *buf) // best-effort proxy; the Close below is what matters
 		_ = b.Close()

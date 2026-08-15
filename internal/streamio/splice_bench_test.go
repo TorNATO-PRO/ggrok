@@ -1,24 +1,26 @@
-package streamio
+package streamio_test
 
 import (
 	"fmt"
 	"io"
 	"net"
 	"testing"
+
+	"tornato.dev/ggrok/v2/internal/streamio"
 )
 
-// plainConn wraps a net.Conn behind the net.Conn interface alone, which
+// plainConn wraps a [net.Conn] behind the [net.Conn] interface alone, which
 // only declares Read/Write/Close (among others) - not ReadFrom/WriteTo. So
-// unlike the concrete *net.TCPConn underneath, plainConn doesn't promote
-// those methods, and io.Copy's type assertions for them fail. This mirrors
-// what a quic.Stream looks like to io.Copy: no shortcut, so the caller's
+// unlike the concrete *[net.TCPConn] underneath, plainConn doesn't promote
+// those methods, and [io.Copy]'s type assertions for them fail. This mirrors
+// what a quic.Stream looks like to [io.Copy]: no shortcut, so the caller's
 // buffer is what actually moves the bytes.
 type plainConn struct {
 	net.Conn
 }
 
 // tcpPipe returns a connected pair of loopback TCP conns, so the benchmark
-// exercises real syscalls rather than the in-memory net.Pipe fast path.
+// exercises real syscalls rather than the in-memory [net.Pipe] fast path.
 func tcpPipe(b *testing.B) (net.Conn, net.Conn) {
 	b.Helper()
 
@@ -31,9 +33,9 @@ func tcpPipe(b *testing.B) (net.Conn, net.Conn) {
 	acceptedCh := make(chan net.Conn, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			errCh <- err
+		c, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			errCh <- acceptErr
 			return
 		}
 		acceptedCh <- c
@@ -53,7 +55,7 @@ func tcpPipe(b *testing.B) (net.Conn, net.Conn) {
 	}
 }
 
-// BenchmarkCopyBufferSizes sweeps io.CopyBuffer's buffer size across a
+// BenchmarkCopyBufferSizes sweeps [io.CopyBuffer]'s buffer size across a
 // single plainConn-wrapped TCP loopback leg (the shape of relay's
 // subConn<->pubConn splice) to find where throughput stops improving.
 // Run with: go test ./internal/streamio/... -run '^$' \
@@ -124,7 +126,7 @@ func BenchmarkSplice(b *testing.B) {
 		// the quic.Stream<->quic.Stream leg (relay/registry.go), which is
 		// the one Splice call site where neither side gets that shortcut
 		// and our buffer is actually the one doing the copying.
-		Splice(plainConn{srcServer}, plainConn{sinkServer})
+		streamio.Splice(plainConn{srcServer}, plainConn{sinkServer})
 	}()
 
 	payload := make([]byte, chunkSize)

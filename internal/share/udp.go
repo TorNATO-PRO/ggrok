@@ -28,7 +28,7 @@ const (
 
 	// udpFlowSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size
 	// requested for each NAT entry's local socket - see listen/udp.go's
-	// udpSocketBufferSize for why a plain net.Dial socket needs this at
+	// udpSocketBufferSize for why a plain [net.Dial] socket needs this at
 	// all. Deliberately much smaller than listen's: this socket is
 	// per-(subscriber, flow), and a long-lived share can have many NAT
 	// entries live at once, so sizing each one for a single busy
