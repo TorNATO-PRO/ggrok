@@ -19,6 +19,25 @@ import (
 // local socket before it's forwarded on.
 const udpReadBufferSize = 64 * 1024
 
+// udpSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size requested
+// for the local bind socket. Unlike quic-go's own UDP socket (which
+// auto-tunes to several MB - see sys_conn_buffers.go), a plain
+// net.ListenUDP socket keeps whatever small default the OS assigns. This
+// socket is the single aggregation point for every local client's
+// traffic on this listen instance, so a burst arriving faster than
+// runUDP's read loop drains it can overflow that default and silently
+// drop packets before udpUplinkQueueDepth's channel-level backpressure
+// ever gets a chance to matter - see that constant's doc comment.
+//
+// 8MiB rather than something more modest because BenchmarkUDPBurstDrop
+// (a burst of 8000x 512B datagrams arriving before any read) measured
+// 3.6% loss at 4MiB but 0% at 8MiB on this machine's ~8MiB
+// kern.ipc.maxsockbuf ceiling - and because SetReadBuffer/SetWriteBuffer
+// are best-effort, a platform whose ceiling is lower (e.g. an untuned
+// Linux host's net.core.rmem_max) just gets clamped down silently,
+// same as quic-go's own request already does.
+const udpSocketBufferSize = 8 * 1024 * 1024
+
 // udpUplinkQueueDepth bounds how many locally-read datagrams runUDP
 // buffers before quicConn.SendDatagram actually sends them. Without this,
 // SendDatagram's blocking behavior once quic-go's own internal send queue
@@ -206,6 +225,12 @@ func runUDP(
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	defer func() { _ = socket.Close() }()
+
+	// Best-effort: a smaller-than-requested buffer (the OS clamps rather
+	// than errors on most platforms) just means less burst headroom, not
+	// a failure worth aborting the listen for.
+	_ = socket.SetReadBuffer(udpSocketBufferSize)
+	_ = socket.SetWriteBuffer(udpSocketBufferSize)
 
 	if onListen != nil {
 		onListen(socket.LocalAddr())

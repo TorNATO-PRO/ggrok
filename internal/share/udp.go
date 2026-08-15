@@ -26,6 +26,16 @@ const (
 	// NAT entry's local socket before it's forwarded as a datagram.
 	udpReadBufferSize = 64 * 1024
 
+	// udpFlowSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size
+	// requested for each NAT entry's local socket - see listen/udp.go's
+	// udpSocketBufferSize for why a plain net.Dial socket needs this at
+	// all. Deliberately much smaller than listen's: this socket is
+	// per-(subscriber, flow), and a long-lived share can have many NAT
+	// entries live at once, so sizing each one for a single busy
+	// aggregation point the way listen's one socket is would multiply
+	// into real memory pressure.
+	udpFlowSocketBufferSize = 1024 * 1024
+
 	// udpUplinkQueueDepth bounds how many locally-read replies natTable's
 	// per-flow pump goroutine buffers before quicConn.SendDatagram
 	// actually sends them. Without this, SendDatagram's blocking behavior
@@ -199,6 +209,13 @@ func (t *natTable) get(
 	local, err := dialer.DialContext(ctx, "udp", addr.String())
 	if err != nil {
 		return nil, fmt.Errorf("dial %s for new flow: %w", addr, err)
+	}
+
+	// Best-effort, same rationale as listen/udp.go's SetReadBuffer call -
+	// a clamped-down buffer just means less burst headroom.
+	if udpConn, ok := local.(*net.UDPConn); ok {
+		_ = udpConn.SetReadBuffer(udpFlowSocketBufferSize)
+		_ = udpConn.SetWriteBuffer(udpFlowSocketBufferSize)
 	}
 
 	entryCtx, cancel := context.WithCancel(ctx)
