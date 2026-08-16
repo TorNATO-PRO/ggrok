@@ -205,6 +205,30 @@ func (b *Batch) Append(frame []byte) bool {
 	return true
 }
 
+// AppendPacked merges an already-packed run of frames into the batch,
+// reporting whether it fit. It exists because a received datagram is
+// itself a batch - a run of length-prefixed frames - so concatenating two
+// of them yields a valid third, and a relay leg that forwards datagrams
+// whole can coalesce them without walking or re-prefixing a single frame.
+//
+// packed must be exactly such a run, with no trailing partial frame: a
+// merged batch is parsed as one sequence, so garbage in the middle would
+// stop [FrameReader] early and swallow every frame merged after it. That
+// is why the subscriber-to-publisher leg truncates each datagram to its
+// valid prefix before enqueueing it - see relay's pumpSubscriberDatagrams.
+func (b *Batch) AppendPacked(packed []byte) bool {
+	if len(packed) < BatchHeaderSize+FrameHeaderSize {
+		return false
+	}
+	if len(b.buf)+len(packed) > MaxBatchSize {
+		return false
+	}
+
+	b.buf = append(b.buf, packed...)
+
+	return true
+}
+
 // Bytes is the packed datagram, valid until the next Reset.
 func (b *Batch) Bytes() []byte { return b.buf }
 
@@ -222,12 +246,25 @@ func (b *Batch) Reset() { b.buf = b.buf[:0] }
 // place.
 type FrameReader struct {
 	rest []byte
+
+	// consumed counts the bytes of complete frames walked so far - see
+	// Consumed.
+	consumed int
 }
 
 // NewFrameReader starts reading the frames packed into datagram.
 func NewFrameReader(datagram []byte) FrameReader {
 	return FrameReader{rest: datagram}
 }
+
+// Consumed is how many leading bytes of the datagram the frames returned
+// so far account for - its valid prefix, once iteration has stopped.
+//
+// It exists for a forwarder that passes a datagram along whole: anything
+// past this point is a malformed tail no reader will get to, and carrying
+// it is worse than dropping it, because a datagram merged in behind it
+// would be swallowed along with it (see [Batch.AppendPacked]).
+func (r *FrameReader) Consumed() int { return r.consumed }
 
 // Next returns the next frame, or false once the datagram is exhausted.
 //
@@ -248,6 +285,7 @@ func (r *FrameReader) Next() ([]byte, bool) {
 
 	frame := r.rest[BatchHeaderSize : BatchHeaderSize+size]
 	r.rest = r.rest[BatchHeaderSize+size:]
+	r.consumed += BatchHeaderSize + size
 
 	return frame, true
 }

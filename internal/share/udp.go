@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -107,8 +108,23 @@ type natKey struct {
 // socket, which stops when that socket closes - so evicting one is just
 // closing its conn.
 type natEntry struct {
-	conn       net.Conn
-	lastActive time.Time
+	conn net.Conn
+
+	// lastActive is when this entry last carried traffic in either
+	// direction, in Unix nanoseconds. It's atomic rather than guarded by
+	// natTable's mutex because it's written on every packet, by every
+	// live entry's pump goroutine at once: taking a table-wide lock there
+	// serializes all of a busy share's flows against each other, which is
+	// precisely the case this path is built for. Only the sweeper reads
+	// it, and it tolerates a stale value - the idle timeout is already
+	// coarse to within a whole udpSweepInterval.
+	lastActive atomic.Int64
+}
+
+// touch records that this entry just carried traffic, keeping the sweeper
+// from evicting it.
+func (e *natEntry) touch() {
+	e.lastActive.Store(time.Now().UnixNano())
 }
 
 // natTable is share's UDP-mode NAT: it demultiplexes datagrams arriving
@@ -202,12 +218,10 @@ func (t *natTable) get(
 
 	t.mu.Lock()
 	entry, ok := t.entries[key]
-	if ok {
-		entry.lastActive = time.Now()
-	}
 	t.mu.Unlock()
 
 	if ok {
+		entry.touch()
 		return entry, nil
 	}
 
@@ -224,13 +238,14 @@ func (t *natTable) get(
 		_ = udpConn.SetWriteBuffer(udpFlowSocketBufferSize)
 	}
 
-	entry = &natEntry{conn: local, lastActive: time.Now()}
+	entry = &natEntry{conn: local}
+	entry.touch()
 
 	t.mu.Lock()
 	t.entries[key] = entry
 	t.mu.Unlock()
 
-	go t.pump(local, key)
+	go t.pump(entry, key)
 
 	return entry, nil
 }
@@ -245,7 +260,11 @@ func (t *natTable) get(
 // replies bound for different subscribers and different flows all pack
 // into the same datagram. A share fronting a busy service has many entries
 // live at once, which is exactly the case coalescing pays off in.
-func (t *natTable) pump(local net.Conn, key natKey) {
+// It takes the entry rather than looking it up by key on every reply:
+// marking an entry active is then one atomic store on memory the pump
+// already holds, instead of a table-wide lock every other pump is
+// contending for - see natEntry.lastActive.
+func (t *natTable) pump(entry *natEntry, key natKey) {
 	for {
 		// Read straight into a pooled buffer, past the space its header
 		// will occupy, so framing the reply below is a header write rather
@@ -253,7 +272,7 @@ func (t *natTable) pump(local net.Conn, key natKey) {
 		// returns the buffer once the frame has been packed.
 		buf := proto.AcquireFrameBuffer()
 
-		n, err := local.Read(proto.FramePayloadSpace(buf))
+		n, err := entry.conn.Read(proto.FramePayloadSpace(buf))
 		if err != nil {
 			proto.ReleaseFrameBuffer(buf)
 			t.evict(key)
@@ -266,19 +285,13 @@ func (t *natTable) pump(local net.Conn, key natKey) {
 		}
 
 		t.uplink.EnqueuePooled(buf)
-		t.touch(key)
-	}
-}
 
-// touch refreshes a NAT entry's idle clock - called on replies too, so a
-// service that pushes data without being written to first still counts as
-// active traffic.
-func (t *natTable) touch(key natKey) {
-	t.mu.Lock()
-	if entry, ok := t.entries[key]; ok {
-		entry.lastActive = time.Now()
+		// Touched on replies too, so a service that pushes data without
+		// being written to first still counts as active traffic. An entry
+		// already evicted out from under this pump is about to have its
+		// socket closed and the loop end, so the store is harmless.
+		entry.touch()
 	}
-	t.mu.Unlock()
 }
 
 // evict removes and closes a single NAT entry.
@@ -313,12 +326,12 @@ func (t *natTable) sweep(ctx context.Context) {
 
 // sweepOnce evicts every entry idle for longer than udpIdleTimeout.
 func (t *natTable) sweepOnce() {
-	cutoff := time.Now().Add(-udpIdleTimeout)
+	cutoff := time.Now().Add(-udpIdleTimeout).UnixNano()
 
 	var stale []*natEntry
 	t.mu.Lock()
 	for key, entry := range t.entries {
-		if entry.lastActive.Before(cutoff) {
+		if entry.lastActive.Load() < cutoff {
 			stale = append(stale, entry)
 			delete(t.entries, key)
 		}

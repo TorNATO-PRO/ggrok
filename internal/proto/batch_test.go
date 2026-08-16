@@ -82,6 +82,114 @@ func TestBatchFillsToCapacity(t *testing.T) {
 	}
 }
 
+// TestBatchAppendPackedMerges checks the property relay's fan-in leg rests
+// on: two datagrams, each already a packed run of frames, concatenate into
+// one batch that reads back as every frame of the first followed by every
+// frame of the second.
+func TestBatchAppendPackedMerges(t *testing.T) {
+	t.Parallel()
+
+	first := proto.NewBatch()
+	firstFrames := [][]byte{
+		proto.EncodeFrame(1, 10, []byte("sub one, flow ten")),
+		proto.EncodeFrame(1, 11, []byte("sub one, flow eleven")),
+	}
+	for _, frame := range firstFrames {
+		if !first.Append(frame) {
+			t.Fatal("Append rejected a frame that should fit")
+		}
+	}
+
+	second := proto.NewBatch()
+	secondFrames := [][]byte{
+		proto.EncodeFrame(2, 20, []byte("sub two")),
+		proto.EncodeFrame(3, 30, bytes.Repeat([]byte{0xcd}, 200)),
+	}
+	for _, frame := range secondFrames {
+		if !second.Append(frame) {
+			t.Fatal("Append rejected a frame that should fit")
+		}
+	}
+
+	merged := proto.NewBatch()
+	if !merged.AppendPacked(first.Bytes()) {
+		t.Fatal("AppendPacked rejected the first packed run")
+	}
+	if !merged.AppendPacked(second.Bytes()) {
+		t.Fatal("AppendPacked rejected the second packed run")
+	}
+
+	want := append(append([][]byte{}, firstFrames...), secondFrames...)
+
+	var got [][]byte
+	frames := proto.NewFrameReader(merged.Bytes())
+	for {
+		frame, ok := frames.Next()
+		if !ok {
+			break
+		}
+		got = append(got, frame)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("merged batch read back %d frames, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Errorf("merged frame %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestBatchAppendPackedStaysInBudget checks that merging respects the same
+// MaxBatchSize ceiling packing does. Overshooting it is the one failure
+// mode that costs more than the frame that caused it: quic-go rejects an
+// oversized datagram whole, so every merged-in frame would go down with it.
+func TestBatchAppendPackedStaysInBudget(t *testing.T) {
+	t.Parallel()
+
+	full := proto.NewBatch()
+	if !full.Append(proto.EncodeFrame(1, 1, make([]byte, proto.MaxFramePayload))) {
+		t.Fatal("a maximal frame did not fit an empty batch")
+	}
+
+	// A maximal frame already fills the budget exactly, so nothing can be
+	// merged onto it - and the batch must be left untouched by the refusal.
+	merged := proto.NewBatch()
+	if !merged.AppendPacked(full.Bytes()) {
+		t.Fatal("AppendPacked rejected a run that exactly fills the budget")
+	}
+
+	small := proto.NewBatch()
+	if !small.Append(proto.EncodeFrame(2, 2, []byte("tiny"))) {
+		t.Fatal("Append rejected a small frame")
+	}
+	if merged.AppendPacked(small.Bytes()) {
+		t.Error("AppendPacked overflowed a batch that was already full")
+	}
+	if len(merged.Bytes()) != proto.MaxBatchSize {
+		t.Errorf("refused merge left the batch at %d bytes, want MaxBatchSize (%d)",
+			len(merged.Bytes()), proto.MaxBatchSize)
+	}
+}
+
+// TestBatchAppendPackedRejectsRunts covers the inputs that can't be a
+// packed run of frames at all: too short to hold even one length prefix
+// and header.
+func TestBatchAppendPackedRejectsRunts(t *testing.T) {
+	t.Parallel()
+
+	batch := proto.NewBatch()
+	for size := range proto.BatchHeaderSize + proto.FrameHeaderSize {
+		if batch.AppendPacked(make([]byte, size)) {
+			t.Errorf("AppendPacked accepted a %d-byte run", size)
+		}
+	}
+	if !batch.Empty() {
+		t.Error("a refused AppendPacked left bytes in the batch")
+	}
+}
+
 // TestBatchRejectsRunts covers the guard that keeps a frame too short to
 // carry a header out of a batch, since every reader decodes what it gets
 // back assuming a header is there.
@@ -127,6 +235,65 @@ func TestFrameReaderStopsOnMalformed(t *testing.T) {
 	}
 	if _, ok := frames.Next(); ok {
 		t.Error("reader restarted after stopping on a malformed frame")
+	}
+}
+
+// TestFrameReaderConsumed checks the valid-prefix length a forwarder uses
+// to strip a malformed tail before passing a datagram on. Getting this
+// wrong is what would let garbage survive into a merged batch and swallow
+// every frame behind it - see [proto.Batch.AppendPacked].
+func TestFrameReaderConsumed(t *testing.T) {
+	t.Parallel()
+
+	batch := proto.NewBatch()
+	for _, frame := range [][]byte{
+		proto.EncodeFrame(1, 1, []byte("first")),
+		proto.EncodeFrame(2, 2, []byte("second")),
+	} {
+		if !batch.Append(frame) {
+			t.Fatal("Append rejected a frame that should fit")
+		}
+	}
+	intact := bytes.Clone(batch.Bytes())
+
+	for _, tc := range []struct {
+		name     string
+		datagram []byte
+		want     int
+	}{
+		{"clean", intact, len(intact)},
+		{"empty", nil, 0},
+		{"runt", []byte{0x00}, 0},
+		// A length prefix claiming more bytes than actually follow: the
+		// two good frames count, the garbage does not.
+		{"malformed tail", append(bytes.Clone(intact), 0xff, 0xff, 0x01), len(intact)},
+		// A tail too short to even hold a length prefix.
+		{"stray byte", append(bytes.Clone(intact), 0x00), len(intact)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := consumedAfterWalk(tc.datagram); got != tc.want {
+				t.Errorf("Consumed() = %d, want %d", got, tc.want)
+			}
+
+			// The prefix it reports must itself be a batch: that is the
+			// whole reason a forwarder trusts it enough to merge it.
+			if tc.want > 0 && !proto.NewBatch().AppendPacked(tc.datagram[:tc.want]) {
+				t.Error("AppendPacked rejected the prefix Consumed reported as valid")
+			}
+		})
+	}
+}
+
+// consumedAfterWalk reads datagram to exhaustion and reports the valid
+// prefix length the reader ended up with.
+func consumedAfterWalk(datagram []byte) int {
+	frames := proto.NewFrameReader(datagram)
+	for {
+		if _, ok := frames.Next(); !ok {
+			return frames.Consumed()
+		}
 	}
 }
 

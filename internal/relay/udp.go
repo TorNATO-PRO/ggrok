@@ -47,11 +47,25 @@ const udpSenderQueueDepth = 256
 // is full) instead of stalling whichever pump loop is trying to hand it
 // work.
 //
-// It forwards whole datagrams as handed to it, which is what the
-// subscriber-to-publisher direction needs: those arrive already packed
+// It takes whole datagrams rather than individual frames, which is what
+// the subscriber-to-publisher direction needs: those arrive already packed
 // for the one destination they're bound for. The opposite direction fans
-// out to many subscribers and has to repack per destination, so it uses a
-// [dgram.Sender] instead.
+// out to many subscribers and has to regroup frame by frame per
+// destination, so it uses a [dgram.Sender] instead.
+//
+// Taking them whole is also what lets this direction coalesce for free.
+// Every subscriber on a session feeds this one sender, and each datagram
+// is itself a run of length-prefixed frames, so merging two is a byte
+// concatenation rather than a walk (see [proto.Batch.AppendPacked]).
+//
+// How much that wins is entirely a question of whether anything is
+// actually waiting when a send completes, which is a property of load and
+// burstiness rather than of the subscriber count: BenchmarkUDPTunnelFanIn
+// measures roughly 1.1 datagrams merged per packet across eight
+// subscribers offering 2500/s each, but about 1.5 for a single subscriber
+// offering 10k/s, whose traffic arrives in tight runs. When nothing is
+// waiting the datagram goes out exactly as it arrived, so the case that
+// gains nothing also costs nothing.
 type udpSender struct {
 	conn  *quic.Conn
 	queue chan []byte
@@ -65,14 +79,73 @@ func newUDPSender(ctx context.Context, conn *quic.Conn) *udpSender {
 	return s
 }
 
+// run sends queued datagrams until ctx ends, merging whatever is already
+// waiting into as few as it can.
+//
+// Nothing is ever waited for. A datagram arriving to an idle sender is
+// sent on its own, exactly as it arrived and without a copy, so coalescing
+// costs no latency and a lone busy subscriber is never repacked - its
+// datagrams are already as full as this relay could make them. Merging
+// only absorbs datagrams that had piled up behind a send, which is the
+// fan-in case it exists for.
 func (s *udpSender) run(ctx context.Context) {
+	batch := proto.NewBatch()
+
+	// A datagram that didn't fit the batch being built starts the next
+	// one, so it has to survive into the following iteration.
+	var carry []byte
+
 	for {
-		select {
-		case data := <-s.queue:
-			_ = s.conn.SendDatagram(data)
-		case <-ctx.Done():
-			return
+		first := carry
+		carry = nil
+		if first == nil {
+			select {
+			case first = <-s.queue:
+			case <-ctx.Done():
+				return
+			}
 		}
+
+		next, more := s.poll()
+		if !more {
+			_ = s.conn.SendDatagram(first) // nothing to merge with
+			continue
+		}
+
+		batch.Reset()
+		if !batch.AppendPacked(first) || !batch.AppendPacked(next) {
+			// Either first is too large to merge into anything - let
+			// quic-go judge it, same as before there was a batch - or the
+			// two simply don't fit together.
+			_ = s.conn.SendDatagram(first)
+			carry = next
+
+			continue
+		}
+
+		for {
+			queued, ok := s.poll()
+			if !ok {
+				break
+			}
+			if !batch.AppendPacked(queued) {
+				carry = queued
+				break
+			}
+		}
+
+		_ = s.conn.SendDatagram(batch.Bytes())
+	}
+}
+
+// poll takes the next queued datagram if one is already waiting, without
+// blocking to wait for one.
+func (s *udpSender) poll() ([]byte, bool) {
+	select {
+	case data := <-s.queue:
+		return data, true
+	default:
+		return nil, false
 	}
 }
 
@@ -222,6 +295,17 @@ func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Co
 			return err
 		}
 
+		// Frames bound for the same subscriber tend to arrive in runs -
+		// a busy local client's traffic packs together - so remember the
+		// last lookup and reuse it across a run rather than hashing the
+		// same id again for every frame. The memo lives and dies with
+		// this datagram, so a subscriber that detaches mid-walk is missed
+		// for at most the remaining frames of one datagram, which is no
+		// staler than a lookup that beat the detach by an instant
+		// already was. lastSub means nothing while lastSender is nil.
+		var lastSub proto.SubscriberID
+		var lastSender *dgram.Sender
+
 		// One datagram from the publisher can hold frames for any number
 		// of different subscribers, so this direction has to take the
 		// batch apart and hand each frame to the sender for the subscriber
@@ -240,9 +324,13 @@ func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Co
 				continue
 			}
 
-			sender, live := sess.udpSubscriber(sub)
-			if !live {
-				continue
+			sender := lastSender
+			if sender == nil || sub != lastSub {
+				found, live := sess.udpSubscriber(sub)
+				if !live {
+					continue
+				}
+				sender, lastSub, lastSender = found, sub, found
 			}
 
 			// The frame aliases data rather than being copied out of it.
@@ -273,6 +361,16 @@ func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Co
 // the session's one publisher - so relay restamps each frame where it lies
 // and forwards the datagram whole. It crosses relay already coalesced,
 // with no allocation and no copy of any payload.
+//
+// What is forwarded is the datagram's valid prefix rather than the
+// datagram: the walk below already visits every frame, so it costs nothing
+// to note where the last good one ends and leave a malformed tail behind.
+// That matters because the publisher's sender may merge this datagram with
+// another subscriber's (see udpSender), and a merged batch is parsed as
+// one sequence - garbage left in the middle of it would stop the reader
+// early and swallow every frame behind it. Truncating changes nothing
+// about what gets delivered: the publisher's own reader would have stopped
+// at exactly the same byte.
 func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.SubscriberID, subConn *quic.Conn) error {
 	for {
 		data, err := subConn.ReceiveDatagram(ctx)
@@ -289,12 +387,17 @@ func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.Subscr
 			_ = proto.SetFrameSubscriber(frame, id) // length already checked by the reader
 		}
 
+		end := frames.Consumed()
+		if end == 0 {
+			continue // nothing parsed out of it; nothing to forward
+		}
+
 		sender, ok := sess.udpPublisherSender()
 		if !ok {
 			continue
 		}
 
-		sender.enqueue(data)
+		sender.enqueue(data[:end])
 	}
 }
 
