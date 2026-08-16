@@ -119,41 +119,53 @@ func dialUDPConn(
 	return conn, nil
 }
 
-// flowTable assigns a FlowID to each distinct local remote address seen on
-// listen's bind socket, and looks it back up to route a reply. FlowIDs are
-// scoped to this one subscriber connection, so relay and share can tell
-// this subscriber's local clients apart from every other subscriber's.
+// flowKey identifies one local client of this subscriber: the address it
+// sends from, and which of listen's bound ports it sent to. The port is
+// part of the identity because the same client talking to two ports of the
+// range is two conversations with two different services, which have to
+// stay apart on the way out and come back to the port they left from.
 //
 // Addresses are [netip.AddrPort] rather than *[net.UDPAddr]: it's comparable,
 // so it keys byAddr directly, and the read/write paths that produce and
 // consume it (ReadFromUDPAddrPort/WriteToUDPAddrPort) don't allocate -
 // this table is consulted for every datagram, where a per-packet
 // UDPAddr + string-key allocation is pure overhead.
+type flowKey struct {
+	addr netip.AddrPort
+	port proto.PortIndex
+}
+
+// flowTable assigns a FlowID to each distinct local client seen on any of
+// listen's bind sockets, and looks it back up to route a reply. FlowIDs
+// are scoped to this one subscriber connection, so relay and share can
+// tell this subscriber's local clients apart from every other
+// subscriber's, and they're drawn from one space across every bound port,
+// so a FlowID alone says which socket a reply goes back out of.
 type flowTable struct {
 	mu     sync.Mutex
-	byAddr map[netip.AddrPort]proto.FlowID
-	byFlow map[proto.FlowID]netip.AddrPort
+	byAddr map[flowKey]proto.FlowID
+	byFlow map[proto.FlowID]flowKey
 	next   proto.FlowID
 }
 
 func newFlowTable() *flowTable {
 	return &flowTable{
-		byAddr: make(map[netip.AddrPort]proto.FlowID),
-		byFlow: make(map[proto.FlowID]netip.AddrPort),
+		byAddr: make(map[flowKey]proto.FlowID),
+		byFlow: make(map[proto.FlowID]flowKey),
 	}
 }
 
-// getOrCreate returns addr's FlowID, assigning a fresh one the first time
-// addr is seen. ok is false when the table is full: FlowID's space is
+// getOrCreate returns key's FlowID, assigning a fresh one the first time
+// key is seen. ok is false when the table is full: FlowID's space is
 // 65536 entries, and handing out an ID that's still bound to another live
-// address would silently deliver one client's traffic to another - so a
-// datagram from a brand-new address is dropped instead once no free ID
+// client would silently deliver one client's traffic to another - so a
+// datagram from a brand-new client is dropped instead once no free ID
 // remains.
-func (t *flowTable) getOrCreate(addr netip.AddrPort) (proto.FlowID, bool) {
+func (t *flowTable) getOrCreate(key flowKey) (proto.FlowID, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if flow, ok := t.byAddr[addr]; ok {
+	if flow, ok := t.byAddr[key]; ok {
 		return flow, true
 	}
 
@@ -172,61 +184,53 @@ func (t *flowTable) getOrCreate(addr netip.AddrPort) (proto.FlowID, bool) {
 
 	flow := t.next
 	t.next++
-	t.byAddr[addr] = flow
-	t.byFlow[flow] = addr
+	t.byAddr[key] = flow
+	t.byFlow[flow] = key
 
 	return flow, true
 }
 
-// lookup returns the local remote address a FlowID was assigned to.
-func (t *flowTable) lookup(flow proto.FlowID) (netip.AddrPort, bool) {
+// lookup returns the local client a FlowID was assigned to.
+func (t *flowTable) lookup(flow proto.FlowID) (flowKey, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	addr, ok := t.byFlow[flow]
-	return addr, ok
+	key, ok := t.byFlow[flow]
+	return key, ok
 }
 
-// runUDP binds addr as a local UDP socket and forwards datagrams both ways
-// between it and quicConn, tagging each with the FlowID of the local
-// client it came from (or is destined for). It runs until ctx is
-// canceled, the local socket errors, or the control connection's
-// heartbeat loop decides relay is dead.
+// runUDP binds a local UDP socket on every port in addr and forwards
+// datagrams both ways between them and quicConn, tagging each with the
+// FlowID of the local client it came from (or is destined for) and the
+// index of the port it arrived on. It runs until ctx is canceled, one of
+// the local sockets errors, or the control connection's heartbeat loop
+// decides relay is dead.
 func runUDP(
 	ctx context.Context,
 	control *tls.Conn,
 	quicConn *quic.Conn,
-	addr hostport.HostPort,
+	addr hostport.Range,
 	subID proto.SubscriberID,
 	onListen func(net.Addr),
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	udpAddr, err := net.ResolveUDPAddr("udp", addr.String())
+	sockets, err := bindRangeUDP(addr)
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", addr, err)
+		return err
 	}
-
-	socket, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
-	}
-	defer func() { _ = socket.Close() }()
-
-	// Best-effort: a smaller-than-requested buffer (the OS clamps rather
-	// than errors on most platforms) just means less burst headroom, not
-	// a failure worth aborting the listen for.
-	_ = socket.SetReadBuffer(udpSocketBufferSize)
-	_ = socket.SetWriteBuffer(udpSocketBufferSize)
+	defer closeAllUDP(sockets)
 
 	if onListen != nil {
-		onListen(socket.LocalAddr())
+		for _, socket := range sockets {
+			onListen(socket.LocalAddr())
+		}
 	}
 
 	go func() {
 		<-ctx.Done()
-		_ = socket.Close()
+		closeAllUDP(sockets)
 	}()
 
 	// Closing the connection on the way out is what stops pumpDownlink,
@@ -235,34 +239,101 @@ func runUDP(
 	defer func() { _ = quicConn.CloseWithError(0, "") }()
 
 	flows := newFlowTable()
-	go pumpDownlink(ctx, quicConn, socket, flows)
+	go pumpDownlink(ctx, quicConn, sockets, flows)
 
 	uplink := dgram.NewSender(ctx, quicConn)
 
 	heartbeatErr := make(chan error, 1)
 	go func() {
 		heartbeatErr <- runControlLoop(ctx, control)
-		// Nothing else would unblock the read below: unlike TCP mode,
+		// Nothing else would unblock the reads below: unlike TCP mode,
 		// where the session ending eventually shows up as a failed data
 		// dial, a UDP socket goes on happily accepting local datagrams
-		// with nowhere left to send them. Canceling closes it (above).
+		// with nowhere left to send them. Canceling closes them (above).
 		cancel()
 	}()
 
+	// One read loop per port, all feeding the one uplink sender, so
+	// traffic from different ports coalesces into the same datagrams the
+	// way traffic from different local clients already does. The channel
+	// is deep enough for every loop, since canceling ctx fails them all at
+	// once - see runTCP's acceptErr for the same reasoning.
+	readErr := make(chan error, len(sockets))
+	for i, socket := range sockets {
+		port := proto.PortIndex(i)
+		go func() {
+			readErr <- pumpUplink(socket, uplink, flows, subID, port)
+		}()
+	}
+
+	return ShutdownErr(ctx, heartbeatErr, <-readErr, "read")
+}
+
+// bindRangeUDP binds a UDP socket on every port in addr, unwinding the
+// ones it already bound if any of them fails - a partially bound range is
+// not a listen anyone asked for.
+func bindRangeUDP(addr hostport.Range) ([]*net.UDPConn, error) {
+	sockets := make([]*net.UDPConn, 0, addr.Len())
+	for i := range addr.Len() {
+		port, _ := addr.At(i) // i is bounded by Len, so this is always ok
+
+		udpAddr, err := net.ResolveUDPAddr("udp", port.String())
+		if err != nil {
+			closeAllUDP(sockets)
+			return nil, fmt.Errorf("resolve %s: %w", port, err)
+		}
+
+		socket, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			closeAllUDP(sockets)
+			return nil, fmt.Errorf("listen on %s: %w", port, err)
+		}
+
+		// Best-effort: a smaller-than-requested buffer (the OS clamps
+		// rather than errors on most platforms) just means less burst
+		// headroom, not a failure worth aborting the listen for.
+		_ = socket.SetReadBuffer(udpSocketBufferSize)
+		_ = socket.SetWriteBuffer(udpSocketBufferSize)
+
+		sockets = append(sockets, socket)
+	}
+
+	return sockets, nil
+}
+
+// closeAllUDP closes every socket, ignoring errors - it runs on teardown
+// paths where there is nothing left to do about one.
+func closeAllUDP(sockets []*net.UDPConn) {
+	for _, socket := range sockets {
+		_ = socket.Close()
+	}
+}
+
+// pumpUplink reads local datagrams off socket - the port at index port of
+// the session's range - frames each with the flow it belongs to, and hands
+// it to the shared uplink sender. It returns once socket errors, which on
+// an orderly shutdown means it was closed out from under it.
+func pumpUplink(
+	socket *net.UDPConn,
+	uplink *dgram.Sender,
+	flows *flowTable,
+	subID proto.SubscriberID,
+	port proto.PortIndex,
+) error {
 	for {
 		// Read straight into a pooled buffer, past the space its header
 		// will occupy, so framing the datagram below is a header write
-		// rather than an allocation and a copy of the whole payload.
-		// pumpUplink returns the buffer once it's been sent.
+		// rather than an allocation and a copy of the whole payload. The
+		// sender returns the buffer once it's been sent.
 		buf := proto.AcquireFrameBuffer()
 
 		n, remoteAddr, err := socket.ReadFromUDPAddrPort(proto.FramePayloadSpace(buf))
 		if err != nil {
 			proto.ReleaseFrameBuffer(buf)
-			return ShutdownErr(ctx, heartbeatErr, err, "read")
+			return err
 		}
 
-		flow, ok := flows.getOrCreate(remoteAddr)
+		flow, ok := flows.getOrCreate(flowKey{addr: remoteAddr, port: port})
 		if !ok {
 			proto.ReleaseFrameBuffer(buf) // flow table full; drop rather than misroute
 			continue
@@ -270,8 +341,10 @@ func runUDP(
 
 		// subID is what listen believes it is; relay overwrites it with
 		// the identity it authenticated this connection as, so this is for
-		// whoever reads a packet capture, not for routing.
-		if !proto.FinishFrame(buf, subID, flow, n) {
+		// whoever reads a packet capture, not for routing. The port, by
+		// contrast, relay passes through untouched - it's the only thing
+		// telling share which of its local ports this belongs to.
+		if !proto.FinishFrame(buf, subID, flow, port, n) {
 			proto.ReleaseFrameBuffer(buf) // larger than any datagram QUIC could carry
 			continue
 		}
@@ -281,9 +354,9 @@ func runUDP(
 }
 
 // pumpDownlink reads datagrams off quicConn and writes each frame packed
-// inside back to the local client its FlowID names. It exits when quicConn
-// errors.
-func pumpDownlink(ctx context.Context, quicConn *quic.Conn, socket *net.UDPConn, flows *flowTable) {
+// inside back to the local client its FlowID names, out of the socket that
+// client is talking to. It exits when quicConn errors.
+func pumpDownlink(ctx context.Context, quicConn *quic.Conn, sockets []*net.UDPConn, flows *flowTable) {
 	for {
 		data, err := quicConn.ReceiveDatagram(ctx)
 		if err != nil {
@@ -299,7 +372,7 @@ func pumpDownlink(ctx context.Context, quicConn *quic.Conn, socket *net.UDPConn,
 			if !ok {
 				break
 			}
-			deliverDownlink(frame, socket, flows)
+			deliverDownlink(frame, sockets, flows)
 		}
 	}
 }
@@ -307,19 +380,22 @@ func pumpDownlink(ctx context.Context, quicConn *quic.Conn, socket *net.UDPConn,
 // deliverDownlink writes one frame's payload back to the local client its
 // FlowID was assigned to, dropping it if the frame is malformed or names a
 // flow that has since gone.
-func deliverDownlink(frame []byte, socket *net.UDPConn, flows *flowTable) {
+func deliverDownlink(frame []byte, sockets []*net.UDPConn, flows *flowTable) {
 	// The SubscriberID names this very subscriber - relay only sends a
 	// frame down the connection it belongs to - so only the FlowID says
-	// anything listen doesn't already know.
-	_, flow, payload, err := proto.DecodeFrame(frame)
+	// anything listen doesn't already know. The port in the header says
+	// nothing either: the flow it belongs to was assigned on one specific
+	// socket, and that binding, not the peer's header, is what decides
+	// where the reply goes back out of.
+	_, flow, _, payload, err := proto.DecodeFrame(frame)
 	if err != nil {
 		return // malformed frame from a misbehaving relay; drop it
 	}
 
-	remoteAddr, ok := flows.lookup(flow)
+	key, ok := flows.lookup(flow)
 	if !ok {
 		return // unknown flow (e.g. already gone); drop it
 	}
 
-	_, _ = socket.WriteToUDPAddrPort(payload, remoteAddr)
+	_, _ = sockets[key.port].WriteToUDPAddrPort(payload, key.addr)
 }

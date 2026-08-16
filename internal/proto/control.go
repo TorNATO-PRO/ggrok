@@ -21,7 +21,9 @@ const (
 
 	// ControlRequestData is relay asking a publisher to open a new
 	// TCP-mode data connection for a specific pending subscriber
-	// request - payload is the RequestID (8 bytes).
+	// request - payload is the RequestID (8 bytes) followed by the
+	// PortIndex the subscriber accepted that connection on (2 bytes),
+	// which is what tells the publisher which of its local ports to dial.
 	ControlRequestData
 
 	// ControlSubscriberID is relay handing a UDP-mode subscriber the
@@ -139,23 +141,32 @@ func ReadControlFrame(r io.Reader) (ControlType, []byte, error) {
 }
 
 // requestDataSize is the width of a ControlRequestData frame's payload: a
-// single big-endian uint64 RequestID.
-const requestDataSize = 8
+// big-endian uint64 RequestID followed by a big-endian PortIndex.
+const (
+	requestDataSize    = 8 + 2
+	requestDataPortOff = 8
+)
 
-// WriteRequestData writes a ControlRequestData frame for id.
-func WriteRequestData(w io.Writer, id uint64) error {
+// WriteRequestData writes a ControlRequestData frame for id, naming the
+// port of the session's range the connection was accepted on.
+func WriteRequestData(w io.Writer, id uint64, port PortIndex) error {
 	var payload [requestDataSize]byte
 	binary.BigEndian.PutUint64(payload[:], id)
+	binary.BigEndian.PutUint16(payload[requestDataPortOff:], uint16(port))
+
 	return WriteControlFrame(w, ControlRequestData, payload[:])
 }
 
 // ReadRequestData decodes a ControlRequestData frame's payload.
-func ReadRequestData(payload []byte) (uint64, error) {
+func ReadRequestData(payload []byte) (uint64, PortIndex, error) {
 	if len(payload) != requestDataSize {
-		return 0, fmt.Errorf("read request data: want %d bytes, got %d", requestDataSize, len(payload))
+		return 0, 0, fmt.Errorf("read request data: want %d bytes, got %d", requestDataSize, len(payload))
 	}
 
-	return binary.BigEndian.Uint64(payload), nil
+	id := binary.BigEndian.Uint64(payload)
+	port := PortIndex(binary.BigEndian.Uint16(payload[requestDataPortOff:]))
+
+	return id, port, nil
 }
 
 // subscriberIDSize is the width of a ControlSubscriberID frame's payload:

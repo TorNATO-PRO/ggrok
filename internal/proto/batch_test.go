@@ -13,9 +13,9 @@ func TestBatchRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	want := [][]byte{
-		proto.EncodeFrame(1, 10, []byte("first")),
-		proto.EncodeFrame(2, 20, []byte("")),
-		proto.EncodeFrame(3, 30, bytes.Repeat([]byte{0xab}, 300)),
+		proto.EncodeFrame(1, 10, 0, []byte("first")),
+		proto.EncodeFrame(2, 20, 0, []byte("")),
+		proto.EncodeFrame(3, 30, 0, bytes.Repeat([]byte{0xab}, 300)),
 	}
 
 	batch := proto.NewBatch()
@@ -53,7 +53,7 @@ func TestBatchFillsToCapacity(t *testing.T) {
 	t.Parallel()
 
 	batch := proto.NewBatch()
-	maximal := proto.EncodeFrame(1, 1, make([]byte, proto.MaxFramePayload))
+	maximal := proto.EncodeFrame(1, 1, 0, make([]byte, proto.MaxFramePayload))
 
 	if !batch.Append(maximal) {
 		t.Fatal("a maximal frame did not fit an empty batch")
@@ -62,7 +62,7 @@ func TestBatchFillsToCapacity(t *testing.T) {
 		t.Errorf("a maximal frame filled %d bytes, want exactly MaxBatchSize (%d)",
 			len(batch.Bytes()), proto.MaxBatchSize)
 	}
-	if batch.Append(proto.EncodeFrame(1, 1, nil)) {
+	if batch.Append(proto.EncodeFrame(1, 1, 0, nil)) {
 		t.Error("Append accepted a frame into an already-full batch")
 	}
 
@@ -72,7 +72,7 @@ func TestBatchFillsToCapacity(t *testing.T) {
 	}
 
 	// Pack small frames until it refuses, then check it stayed in budget.
-	small := proto.EncodeFrame(1, 1, make([]byte, 64))
+	small := proto.EncodeFrame(1, 1, 0, make([]byte, 64))
 	for batch.Append(small) {
 		// Filling it up is the whole point; the loop ends when it refuses.
 	}
@@ -91,8 +91,8 @@ func TestBatchAppendPackedMerges(t *testing.T) {
 
 	first := proto.NewBatch()
 	firstFrames := [][]byte{
-		proto.EncodeFrame(1, 10, []byte("sub one, flow ten")),
-		proto.EncodeFrame(1, 11, []byte("sub one, flow eleven")),
+		proto.EncodeFrame(1, 10, 0, []byte("sub one, flow ten")),
+		proto.EncodeFrame(1, 11, 0, []byte("sub one, flow eleven")),
 	}
 	for _, frame := range firstFrames {
 		if !first.Append(frame) {
@@ -102,8 +102,8 @@ func TestBatchAppendPackedMerges(t *testing.T) {
 
 	second := proto.NewBatch()
 	secondFrames := [][]byte{
-		proto.EncodeFrame(2, 20, []byte("sub two")),
-		proto.EncodeFrame(3, 30, bytes.Repeat([]byte{0xcd}, 200)),
+		proto.EncodeFrame(2, 20, 0, []byte("sub two")),
+		proto.EncodeFrame(3, 30, 0, bytes.Repeat([]byte{0xcd}, 200)),
 	}
 	for _, frame := range secondFrames {
 		if !second.Append(frame) {
@@ -149,7 +149,7 @@ func TestBatchAppendPackedStaysInBudget(t *testing.T) {
 	t.Parallel()
 
 	full := proto.NewBatch()
-	if !full.Append(proto.EncodeFrame(1, 1, make([]byte, proto.MaxFramePayload))) {
+	if !full.Append(proto.EncodeFrame(1, 1, 0, make([]byte, proto.MaxFramePayload))) {
 		t.Fatal("a maximal frame did not fit an empty batch")
 	}
 
@@ -161,7 +161,7 @@ func TestBatchAppendPackedStaysInBudget(t *testing.T) {
 	}
 
 	small := proto.NewBatch()
-	if !small.Append(proto.EncodeFrame(2, 2, []byte("tiny"))) {
+	if !small.Append(proto.EncodeFrame(2, 2, 0, []byte("tiny"))) {
 		t.Fatal("Append rejected a small frame")
 	}
 	if merged.AppendPacked(small.Bytes()) {
@@ -210,7 +210,7 @@ func TestBatchRejectsRunts(t *testing.T) {
 func TestFrameReaderStopsOnMalformed(t *testing.T) {
 	t.Parallel()
 
-	good := proto.EncodeFrame(1, 1, []byte("intact"))
+	good := proto.EncodeFrame(1, 1, 0, []byte("intact"))
 
 	batch := proto.NewBatch()
 	if !batch.Append(good) {
@@ -247,8 +247,8 @@ func TestFrameReaderConsumed(t *testing.T) {
 
 	batch := proto.NewBatch()
 	for _, frame := range [][]byte{
-		proto.EncodeFrame(1, 1, []byte("first")),
-		proto.EncodeFrame(2, 2, []byte("second")),
+		proto.EncodeFrame(1, 1, 0, []byte("first")),
+		proto.EncodeFrame(2, 2, 0, []byte("second")),
 	} {
 		if !batch.Append(frame) {
 			t.Fatal("Append rejected a frame that should fit")

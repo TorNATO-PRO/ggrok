@@ -5,9 +5,11 @@
 // counterparts don't exist - TCP-mode's data plane is plain spliced
 // bytes). For UDP-mode sessions each party holds its own persistent QUIC
 // connection to relay, and relay fans datagrams between them by the
-// SubscriberID/FlowID header inside each one (see udp.go) - the one place
+// SubscriberID in the header of each one (see udp.go) - the one place
 // relay loses "dumb pipe" purity, since it has to read that header to
-// know where a datagram goes.
+// know where a datagram goes. The FlowID and PortIndex beside it mean
+// nothing to relay and pass through untouched; only the two peers know
+// which local client and which port they name.
 package relay
 
 import (
@@ -37,6 +39,8 @@ var (
 	errPublisherExists  = errors.New("token already has an active publisher")
 	errNoSuchSession    = errors.New("no active session for this token")
 	errModeMismatch     = errors.New("mode does not match this session's publisher")
+	errPortsMismatch    = errors.New("port count does not match this session's publisher")
+	errPortOutOfRange   = errors.New("port index is past the end of this session's range")
 	errNotPublisherCert = errors.New("data connection certificate does not match this session's publisher")
 )
 
@@ -108,12 +112,14 @@ func sessionAttr(token proto.Token) slog.Attr {
 }
 
 // Register adds control as token's publisher control connection and
-// writes the corresponding ack to control. On success it returns an
-// unregister func the caller must invoke (e.g. via defer) once control is
-// done, so a later publish under the same token can succeed; the returned
-// error is nil. On failure the returned func is nil and the error
-// describes why - the caller owns closing control in that case.
-func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mode) (func(), error) {
+// writes the corresponding ack to control. ports is how many consecutive
+// ports the publisher forwards, which every subscriber then has to match.
+// On success it returns an unregister func the caller must invoke (e.g.
+// via defer) once control is done, so a later publish under the same token
+// can succeed; the returned error is nil. On failure the returned func is
+// nil and the error describes why - the caller owns closing control in
+// that case.
+func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mode, ports uint16) (func(), error) {
 	publisherCert, err := peerLeafCert(control)
 	if err != nil {
 		_ = proto.WriteAck(control, proto.AckNoSuchSession)
@@ -127,7 +133,7 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 		return nil, errPublisherExists
 	}
 
-	sess := newSession(mode, control, publisherCert)
+	sess := newSession(mode, ports, control, publisherCert)
 	r.sessions[token] = sess
 	r.mu.Unlock()
 
@@ -138,7 +144,8 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 		return nil, fmt.Errorf("ack publisher: %w", err)
 	}
 
-	r.logger.Info("publisher registered", peerAttr(control), sessionAttr(token), slog.Any("mode", mode))
+	r.logger.Info("publisher registered",
+		peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Int("ports", int(ports)))
 
 	return func() {
 		r.mu.Lock()
@@ -156,15 +163,21 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 }
 
 // Subscribe attaches control as a subscriber's control connection to
-// token's session and writes the corresponding ack. On success it returns
-// the assigned SubscriberID and a release func the caller must invoke
-// once control is done; the returned error is nil. On failure the
-// returned func is nil and the error describes why - the caller owns
-// closing control in that case.
+// token's session and writes the corresponding ack. ports is how many
+// consecutive ports the subscriber binds, which must match what the
+// session's publisher registered: the two sides address ports by index
+// into their own ranges, so a subscriber binding more ports than the
+// publisher forwards has ports that lead nowhere, and one binding fewer
+// silently strands the publisher's tail. On success it returns the
+// assigned SubscriberID and a release func the caller must invoke once
+// control is done; the returned error is nil. On failure the returned func
+// is nil and the error describes why - the caller owns closing control in
+// that case.
 func (r *Registry) Subscribe(
 	control *tls.Conn,
 	token proto.Token,
 	mode proto.Mode,
+	ports uint16,
 ) (proto.SubscriberID, func(), error) {
 	r.mu.Lock()
 	sess, ok := r.sessions[token]
@@ -177,6 +190,9 @@ func (r *Registry) Subscribe(
 	case sess.mode != mode:
 		_ = proto.WriteAck(control, proto.AckModeMismatch)
 		return 0, nil, errModeMismatch
+	case sess.ports != ports:
+		_ = proto.WriteAck(control, proto.AckPortsMismatch)
+		return 0, nil, fmt.Errorf("%w: publisher has %d, subscriber has %d", errPortsMismatch, sess.ports, ports)
 	}
 
 	// Take the slot before acking, not after: a publisher unregistering
@@ -223,20 +239,22 @@ func (r *Registry) sessionFor(token proto.Token) (*session, bool) {
 	return sess, ok
 }
 
-// AttachSubscriberData validates token (and that its session is TCP-mode),
-// writes the corresponding ack to subConn, and - on success - registers
-// subConn as pending under a freshly minted RequestID and asks the
-// publisher to fulfill it via a ControlRequestData frame on its control
-// connection. It does not wait for the publisher: AttachPublisherData
-// completes the pairing once the publisher's data connection arrives, and
-// a background timeout closes subConn if it never does.
+// AttachSubscriberData validates token (and that its session is TCP-mode,
+// and that port names one of its ports), writes the corresponding ack to
+// subConn, and - on success - registers subConn as pending under a freshly
+// minted RequestID and asks the publisher to fulfill it via a
+// ControlRequestData frame on its control connection, carrying port along
+// so the publisher knows which of its local ports to dial. It does not
+// wait for the publisher: AttachPublisherData completes the pairing once
+// the publisher's data connection arrives, and a background timeout closes
+// subConn if it never does.
 //
 // Callers must not close subConn after a nil-error return - ownership has
 // passed to the pending entry (and from there, to whichever of
 // AttachPublisherData's Splice or the timeout closes it). On a non-nil
 // error, subConn is still the caller's to close; this func has not taken
 // ownership of it.
-func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token) error {
+func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token, port proto.PortIndex) error {
 	sess, ok := r.sessionFor(token)
 	switch {
 	case !ok:
@@ -245,6 +263,12 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token) err
 	case sess.mode != proto.ModeTCP:
 		_ = proto.WriteAck(subConn, proto.AckModeMismatch)
 		return errModeMismatch
+	case uint16(port) >= sess.ports:
+		// Subscribe already turned away any subscriber whose range is a
+		// different size, so a port past the end here is a peer that made
+		// the index up rather than an honest mismatch.
+		_ = proto.WriteAck(subConn, proto.AckPortsMismatch)
+		return fmt.Errorf("%w: port %d of %d", errPortOutOfRange, port, sess.ports)
 	}
 
 	// As in Subscribe, take the slot before acking, so a publisher
@@ -261,12 +285,13 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token) err
 		return fmt.Errorf("ack subscriber data conn: %w", err)
 	}
 
-	if err := proto.WriteRequestData(sess.publisher, reqID); err != nil {
+	if err := proto.WriteRequestData(sess.publisher, reqID, port); err != nil {
 		sess.removePending(reqID)
 		return fmt.Errorf("request publisher data conn: %w", err)
 	}
 
-	r.logger.Info("stream requested", peerAttr(subConn), sessionAttr(token), slog.Uint64("req", reqID))
+	r.logger.Info("stream requested",
+		peerAttr(subConn), sessionAttr(token), slog.Uint64("req", reqID), slog.Any("port", port))
 
 	return nil
 }
@@ -331,6 +356,13 @@ type session struct {
 	mode      proto.Mode
 	publisher *tls.Conn
 
+	// ports is how many consecutive ports the publisher forwards. relay
+	// knows nothing about which ports either side actually uses - only how
+	// many there are, which is enough to turn away a subscriber whose
+	// range is a different size and to reject a port index that names
+	// nothing.
+	ports uint16
+
 	// publisherCert is the client certificate the publisher's control
 	// connection authenticated with; AttachPublisherData and
 	// AttachPublisherUDP require the publisher's data connection to
@@ -380,9 +412,10 @@ type subscriberConn struct {
 	control *tls.Conn
 }
 
-func newSession(mode proto.Mode, publisher *tls.Conn, publisherCert *x509.Certificate) *session {
+func newSession(mode proto.Mode, ports uint16, publisher *tls.Conn, publisherCert *x509.Certificate) *session {
 	s := &session{
 		mode:          mode,
+		ports:         ports,
 		publisher:     publisher,
 		publisherCert: publisherCert,
 		subscribers:   make(map[proto.SubscriberID]*subscriberConn),

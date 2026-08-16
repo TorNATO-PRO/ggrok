@@ -16,19 +16,20 @@ func TestFrameRoundTrip(t *testing.T) {
 		name    string
 		sub     proto.SubscriberID
 		flow    proto.FlowID
+		port    proto.PortIndex
 		payload []byte
 	}{
-		{"empty payload", 1, 2, []byte{}},
-		{"typical", 7, 9, []byte("hello tunnel")},
-		{"zero ids", 0, 0, []byte{0xff, 0x00, 0xff}},
-		{"max ids", 0xffff, 0xffff, []byte("edges")},
+		{"empty payload", 1, 2, 3, []byte{}},
+		{"typical", 7, 9, 11, []byte("hello tunnel")},
+		{"zero ids", 0, 0, 0, []byte{0xff, 0x00, 0xff}},
+		{"max ids", 0xffff, 0xffff, 0xffff, []byte("edges")},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			sub, flow, payload, err := proto.DecodeFrame(proto.EncodeFrame(c.sub, c.flow, c.payload))
+			sub, flow, port, payload, err := proto.DecodeFrame(proto.EncodeFrame(c.sub, c.flow, c.port, c.payload))
 			if err != nil {
 				t.Fatalf("DecodeFrame: %v", err)
 			}
@@ -37,6 +38,9 @@ func TestFrameRoundTrip(t *testing.T) {
 			}
 			if flow != c.flow {
 				t.Errorf("flow = %d, want %d", flow, c.flow)
+			}
+			if port != c.port {
+				t.Errorf("port = %d, want %d", port, c.port)
 			}
 			if !bytes.Equal(payload, c.payload) {
 				t.Errorf("payload = %q, want %q", payload, c.payload)
@@ -55,6 +59,7 @@ func TestFinishFrameMatchesEncodeFrame(t *testing.T) {
 	const (
 		sub  = proto.SubscriberID(0x1234)
 		flow = proto.FlowID(0x5678)
+		port = proto.PortIndex(0x9abc)
 	)
 	payload := []byte("datagram body")
 
@@ -62,11 +67,11 @@ func TestFinishFrameMatchesEncodeFrame(t *testing.T) {
 	defer proto.ReleaseFrameBuffer(buf)
 
 	n := copy(proto.FramePayloadSpace(buf), payload)
-	if !proto.FinishFrame(buf, sub, flow, n) {
+	if !proto.FinishFrame(buf, sub, flow, port, n) {
 		t.Fatal("FinishFrame rejected a payload well under the limit")
 	}
 
-	if want := proto.EncodeFrame(sub, flow, payload); !bytes.Equal(*buf, want) {
+	if want := proto.EncodeFrame(sub, flow, port, payload); !bytes.Equal(*buf, want) {
 		t.Errorf("FinishFrame produced %v, EncodeFrame produced %v", *buf, want)
 	}
 }
@@ -88,27 +93,31 @@ func TestFinishFrameRejectsOversized(t *testing.T) {
 			len(space), proto.MaxFramePayload)
 	}
 
-	if proto.FinishFrame(buf, 1, 1, proto.MaxFramePayload) != true {
+	if proto.FinishFrame(buf, 1, 1, 1, proto.MaxFramePayload) != true {
 		t.Error("FinishFrame rejected a payload of exactly MaxFramePayload")
 	}
-	if proto.FinishFrame(buf, 1, 1, proto.MaxFramePayload+1) {
+	if proto.FinishFrame(buf, 1, 1, 1, proto.MaxFramePayload+1) {
 		t.Error("FinishFrame accepted a payload past MaxFramePayload")
 	}
 }
 
 // TestSetFrameSubscriber checks relay's in-place restamp: only the
-// SubscriberID changes, and the flow and payload survive untouched.
+// SubscriberID changes, and the flow, port and payload survive untouched.
+// The port matters as much as the payload here - relay restamps a
+// subscriber's frames without knowing what its ports mean, so a restamp
+// that disturbed the port would silently deliver traffic to the wrong
+// service on the publisher's side.
 func TestSetFrameSubscriber(t *testing.T) {
 	t.Parallel()
 
 	payload := []byte("payload must survive")
-	frame := proto.EncodeFrame(1, 42, payload)
+	frame := proto.EncodeFrame(1, 42, 7, payload)
 
 	if err := proto.SetFrameSubscriber(frame, 0xbeef); err != nil {
 		t.Fatalf("SetFrameSubscriber: %v", err)
 	}
 
-	sub, flow, got, err := proto.DecodeFrame(frame)
+	sub, flow, port, got, err := proto.DecodeFrame(frame)
 	if err != nil {
 		t.Fatalf("DecodeFrame: %v", err)
 	}
@@ -117,6 +126,9 @@ func TestSetFrameSubscriber(t *testing.T) {
 	}
 	if flow != 42 {
 		t.Errorf("flow = %d, want 42", flow)
+	}
+	if port != 7 {
+		t.Errorf("port = %d, want 7", port)
 	}
 	if !bytes.Equal(got, payload) {
 		t.Errorf("payload = %q, want %q", got, payload)
@@ -131,7 +143,7 @@ func TestShortFramesRejected(t *testing.T) {
 	for size := range proto.FrameHeaderSize {
 		frame := make([]byte, size)
 
-		if _, _, _, err := proto.DecodeFrame(frame); err == nil {
+		if _, _, _, _, err := proto.DecodeFrame(frame); err == nil {
 			t.Errorf("DecodeFrame accepted a %d-byte frame", size)
 		}
 		if err := proto.SetFrameSubscriber(frame, 1); err == nil {
@@ -150,7 +162,7 @@ func TestReleaseFrameBufferRestoresFullWidth(t *testing.T) {
 	buf := proto.AcquireFrameBuffer()
 	full := len(*buf)
 
-	if !proto.FinishFrame(buf, 1, 1, 1) {
+	if !proto.FinishFrame(buf, 1, 1, 1, 1) {
 		t.Fatal("FinishFrame rejected a one-byte payload")
 	}
 	if len(*buf) == full {

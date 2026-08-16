@@ -1,14 +1,14 @@
 // The listen subcommand creates a control connection to the relay server
-// and subscribes to a share's session by token, then binds a local port:
-// for -tcp, every local connection accepted dials a fresh data connection
-// to relay, attached to the session by token; for -udp, every local
-// client's datagrams are forwarded the same way, framed with a FlowID so
-// relay can route replies back to the right local client of the right
-// listen subscriber.
+// and subscribes to a share's session by token, then binds a local port
+// per port the share forwards: for -tcp, every local connection accepted
+// dials a fresh data connection to relay, attached to the session by token
+// and tagged with the port it arrived on; for -udp, every local client's
+// datagrams are forwarded the same way, framed with a FlowID so relay can
+// route replies back to the right local client of the right listen
+// subscriber.
 //
-// Unlike get, which pulls one file and exits, listen is a persistent local
-// listener - forwarding a TCP/UDP service is inherently repeatable, not a
-// one-shot transfer.
+// listen is a persistent local listener rather than a one-shot transfer -
+// forwarding a TCP/UDP service is inherently repeatable.
 
 package main
 
@@ -34,18 +34,22 @@ type listenConfig struct {
 	mode proto.Mode
 
 	// addr is the local address listen binds - a TCP listener or a UDP
-	// socket, per mode.
-	addr hostport.HostPort
+	// socket, per mode, one per port in the range.
+	addr hostport.Range
 
 	// token identifies which publisher's session to subscribe to.
 	token proto.Token
 }
 
 // listenUsage marks the usage string for the listen subcommand.
-const listenUsage = `ggrok listen - subscribe to a share's session and forward it to a local port
+const listenUsage = `ggrok listen - subscribe to a share's session and forward it to local ports
 
 Usage:
-  ggrok listen [flags] <token>
+  ggrok listen -tcp|-udp <addr> [flags] <token>
+
+An <addr> is host:port, or host:first-last to bind a whole range of ports
+at once. The range must be the same size as the one the share forwards;
+the two are matched port for port from the start of each range.
 
 The token may instead be supplied via the GGROK_TOKEN environment
 variable, which keeps it out of process listings and shell history.
@@ -87,12 +91,12 @@ func parseListenFlags(args []string) (listenConfig, error) {
 				return fmt.Errorf("-tcp and -udp are mutually exclusive")
 			}
 
-			pair, parseErr := hostport.Parse(addr)
+			ports, parseErr := hostport.ParseRange(addr)
 			if parseErr != nil {
 				return parseErr
 			}
 
-			cfg.addr = pair
+			cfg.addr = ports
 			cfg.mode = m
 			addrSet = true
 			return nil
@@ -100,12 +104,14 @@ func parseListenFlags(args []string) (listenConfig, error) {
 	}
 	fs.Func(
 		"tcp",
-		"local address to bind, forwarding each connection through the tunnel (mutually exclusive with -udp)",
+		"local address or range to bind, forwarding each connection through the tunnel "+
+			"(mutually exclusive with -udp)",
 		setMode(proto.ModeTCP),
 	)
 	fs.Func(
 		"udp",
-		"local address to bind, forwarding each client's datagrams through the tunnel (mutually exclusive with -tcp)",
+		"local address or range to bind, forwarding each client's datagrams through the tunnel "+
+			"(mutually exclusive with -tcp)",
 		setMode(proto.ModeUDP),
 	)
 

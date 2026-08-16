@@ -240,7 +240,7 @@ func startFanInTunnel(tb testing.TB, subs int) []*net.UDPAddr {
 				KeyFile:  pki.listenKey,
 				CAFile:   pki.caFile,
 				Mode:     proto.ModeUDP,
-				Addr:     loopbackHostPort(tb, localPort),
+				Addr:     loopbackRange(tb, localPort),
 				Token:    token,
 			})
 		})

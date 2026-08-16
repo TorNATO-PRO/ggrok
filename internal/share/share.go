@@ -47,8 +47,11 @@ type Config struct {
 	Mode proto.Mode
 
 	// Addr is the local service being forwarded - share dials it fresh
-	// for every new stream (TCP) or NAT flow (UDP).
-	Addr hostport.HostPort
+	// for every new stream (TCP) or NAT flow (UDP). A range of more than
+	// one port forwards each of them, and every subscriber has to bind a
+	// range of the same size: what crosses the wire is an index into this
+	// range, not a port number (see proto.PortIndex).
+	Addr hostport.Range
 
 	// Token scopes which listen subscribers may reach this session.
 	Token proto.Token
@@ -58,6 +61,10 @@ type Config struct {
 // traffic to Config.Addr until ctx is canceled or an unrecoverable error
 // occurs.
 func Run(ctx context.Context, cfg Config) error {
+	if cfg.Addr.Len() < 1 {
+		return fmt.Errorf("share: no local address to forward")
+	}
+
 	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, false, nil)
 	if err != nil {
 		return fmt.Errorf("share: %w", err)
@@ -69,7 +76,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = control.Close() }()
 
-	if err := proto.Handshake(control, proto.RolePublish, cfg.Mode, cfg.Token); err != nil {
+	ports := uint16(cfg.Addr.Len()) //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
+
+	if err := proto.Handshake(control, proto.RolePublish, cfg.Mode, ports, cfg.Token); err != nil {
 		return fmt.Errorf("share: %w", err)
 	}
 
@@ -174,7 +183,8 @@ func runTCP(
 	ctx context.Context,
 	control *tls.Conn,
 	tlsConf *tls.Config,
-	server, addr hostport.HostPort,
+	server hostport.HostPort,
+	addr hostport.Range,
 	token proto.Token,
 ) error {
 	// runControlLoop below is the only thing this function blocks on, and
@@ -193,7 +203,16 @@ func runTCP(
 		}
 	}()
 
-	fulfill := func(reqID uint64) {
+	fulfill := func(reqID uint64, port proto.PortIndex) {
+		// relay checks the index against the port count this share
+		// registered, but relay is the one that supplied it - so it's
+		// checked again here against the range this process actually holds,
+		// which is the only authority on what "index 3" means locally.
+		local, ok := addr.At(int(port))
+		if !ok {
+			return
+		}
+
 		dataConn, err := dialData(ctx, server, tlsConf)
 		if err != nil {
 			return
@@ -206,13 +225,13 @@ func runTCP(
 		}
 
 		var dialer net.Dialer
-		local, err := dialer.DialContext(ctx, "tcp", addr.String())
+		localConn, err := dialer.DialContext(ctx, "tcp", local.String())
 		if err != nil {
 			_ = dataConn.Close()
 			return
 		}
 
-		streamio.Splice(dataConn, local)
+		streamio.Splice(dataConn, localConn)
 	}
 
 	return runControlLoop(ctx, control, fulfill)
@@ -224,7 +243,7 @@ func runTCP(
 // ControlRequestData frame is dispatched to fulfill in its own goroutine
 // so a slow local dial doesn't stall the read loop - and with it, every
 // other in-flight request.
-func runControlLoop(ctx context.Context, control *tls.Conn, fulfill func(reqID uint64)) error {
+func runControlLoop(ctx context.Context, control *tls.Conn, fulfill func(reqID uint64, port proto.PortIndex)) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go sendPings(control, stop)
@@ -250,11 +269,11 @@ func runControlLoop(ctx context.Context, control *tls.Conn, fulfill func(reqID u
 		}
 
 		if typ == proto.ControlRequestData {
-			reqID, err := proto.ReadRequestData(payload)
+			reqID, port, err := proto.ReadRequestData(payload)
 			if err != nil {
 				continue // malformed frame from a misbehaving relay; drop it
 			}
-			go fulfill(reqID)
+			go fulfill(reqID, port)
 		}
 	}
 }

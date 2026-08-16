@@ -1,15 +1,17 @@
-// Command ggrok publishes one local file at a public URL for the
-// full lifecycle of the process.
+// Command ggrok forwards one or more local TCP/UDP ports through a relay
+// to any number of subscribers holding the session's token, for the full
+// lifecycle of the process.
 //
-// We maintain the invariant that the file is never uploaded. The relay
-// will only learn that a token maps to a given session, and is the sole
-// authority of the aforesaid. Additionally, all traffic is encrypted up
-// until the TLS termination boundary. At that point, all bets are off.
-// I recommend using Caddy or something along those lines as a reverse proxy
-// and for automated certificate management and such. A relay can only ever
-// ask "send the file for token X" - it can never induce this process to read
-// a path of the relay's choosing. Additionally, the relay must authenticate itself
-// and prove provenance with a certificate issued by our CA.
+// The relay only ever learns that a token maps to a given session, and is
+// the sole authority of the aforesaid. Traffic is encrypted up until the
+// TLS termination boundary. At that point, all bets are off. I recommend
+// using Caddy or something along those lines as a reverse proxy and for
+// automated certificate management and such. A relay can only ever ask
+// "open a connection for token X" - it can never induce this process to
+// reach an address of the relay's choosing, since the local addresses are
+// fixed by the flags this process was started with. Additionally, the
+// relay must authenticate itself and prove provenance with a certificate
+// issued by our CA.
 
 package main
 
@@ -22,18 +24,18 @@ import (
 )
 
 // a usage string to describe how the CLI utility is meant to be used.
-const usage = `ggrok: share and receive one local file at a public URL.
+const usage = `ggrok: forward local TCP/UDP ports through a relay you run yourself.
 
 Usage:
-  ggrok share [flags] <file>
   ggrok share -tcp|-udp <addr> [flags]
   ggrok listen -tcp|-udp <addr> [flags] <token>
   ggrok relay [flags]
   ggrok ca <init|issue|list|revoke> [flags]
 
-The share stays alive until either this process exists, or the TTL elapses.
+An <addr> is host:port, or host:first-last for a range of ports.
+The share stays alive until this process exits.
 
-Flags:
+Run a command with -h for its own flags.
 `
 
 // errUsage marks a failure the flag package has already written to stderr,
@@ -52,10 +54,9 @@ const exitUsageError = 2
 
 // dispatch looks up args[0] in cmds and invokes it with the remaining
 // arguments. When args is empty, or its first element is a help flag,
-// fallback is invoked instead (if non-nil) - this lets a bare `ggrok`
-// default to share, `ggrok -h` fall through to share's own usage, and a
-// bare/`-h`'d `ggrok ca` print its own usage instead of being treated as
-// an unrecognized sub-verb.
+// fallback is invoked instead (if non-nil) - this lets a bare `ggrok` or
+// `ggrok -h` print the top-level usage, and a bare/`-h`'d `ggrok ca` print
+// its own usage instead of being treated as an unrecognized sub-verb.
 func dispatch(cmds map[string]func(args []string) error, args []string, fallback func(args []string) error) error {
 	isHelp := len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "-help")
 	if len(args) > 0 && !isHelp {
@@ -89,8 +90,7 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 }
 
 // commands defines a mapping from verbs to a function that
-// accepts as a list of argument strings as an input. When no command
-// is provided, we default to the share functionality.
+// accepts as a list of argument strings as an input.
 var commands = map[string]func(args []string) error{
 	"share":  runShare,
 	"listen": runListen,
@@ -98,11 +98,19 @@ var commands = map[string]func(args []string) error{
 	"ca":     runCA,
 }
 
-// run runs a command over arguments passed by a user. It will
-// dispatch to the proper command, but default to `share` whenever
-// a command is not provided.
+// runUsage prints the top-level usage and reports it as a help request,
+// which main treats as a clean exit. It's what a bare `ggrok` and `ggrok
+// -h` get: every command needs a verb and an explicit address, so there's
+// nothing sensible to guess at when given neither.
+func runUsage([]string) error {
+	fmt.Fprint(os.Stderr, usage)
+	return flag.ErrHelp
+}
+
+// run runs a command over arguments passed by a user, dispatching to the
+// proper command or printing usage when no command is given.
 func run(args []string) error {
-	return dispatch(commands, args, runShare)
+	return dispatch(commands, args, runUsage)
 }
 
 func main() {

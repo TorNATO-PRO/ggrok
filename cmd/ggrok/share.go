@@ -1,11 +1,12 @@
 // The share subcommand creates a TCP+mTLS connection to the relay server
-// in which a file hosted on your device may be relayed to a downstream
-// consumer.
+// and forwards a local TCP or UDP service through the tunnel to any number
+// of concurrent listen subscribers holding the session's token.
 //
-// With -tcp or -udp, share instead forwards a local TCP or UDP service
-// through the tunnel to any number of concurrent listen subscribers
-// holding the session's token, instead of sharing a file. UDP is
-// forwarded over a dedicated QUIC connection's unreliable datagram
+// Either flag takes a single host:port or a host:first-last range, in
+// which case every port in the range is forwarded and each subscriber
+// binds a range of its own of the same size.
+//
+// UDP is forwarded over a dedicated QUIC connection's unreliable datagram
 // extension (RFC 9221), so it keeps UDP's unordered, unreliable delivery
 // semantics - and gets QUIC's congestion control on that connection for
 // free - rather than being flattened into an ordered, retransmitted
@@ -17,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 
@@ -29,20 +31,32 @@ import (
 type shareConfig struct {
 	nodeConnConfig
 
-	// mode is proto.ModeTCP or proto.ModeUDP when -tcp/-udp switches share
-	// out of its default file-sharing mode into forwarding a local
-	// service through the tunnel; its zero value means file-sharing mode.
+	// mode is proto.ModeTCP or proto.ModeUDP, set by whichever of
+	// -tcp/-udp was given; exactly one is required. Its zero value doubles
+	// as the "no mode flag seen yet" sentinel while parsing.
 	mode proto.Mode
 
 	// addr is the local TCP/UDP service being forwarded, set together
-	// with mode. Meaningless in file-sharing mode.
-	addr hostport.HostPort
+	// with mode - one port, or a whole range of them.
+	addr hostport.Range
 
-	// token scopes which listen subscribers may reach this session. Set
-	// together with mode. nil means -token was omitted, so runShare
-	// generates one and prints it.
+	// token scopes which listen subscribers may reach this session. nil
+	// means -token was omitted, so runShare generates one and prints it.
 	token *proto.Token
 }
+
+// shareUsage marks the usage string for the share subcommand.
+const shareUsage = `ggrok share - forward a local TCP or UDP service through a relay
+
+Usage:
+  ggrok share -tcp|-udp <addr> [flags]
+
+An <addr> is host:port, or host:first-last to forward a whole range of
+ports at once. Subscribers bind a range of the same size, matched port
+for port from the start of each range.
+
+Flags:
+`
 
 // registerModeFlags registers -tcp and -udp on fs, both writing into cfg.
 // cfg.mode's own zero value is the "no mode flag seen yet" sentinel,
@@ -56,24 +70,24 @@ func registerModeFlags(fs *flag.FlagSet, cfg *shareConfig) {
 				return fmt.Errorf("-tcp and -udp are mutually exclusive")
 			}
 
-			pair, err := hostport.Parse(addr)
+			ports, err := hostport.ParseRange(addr)
 			if err != nil {
 				return err
 			}
 
-			cfg.addr = pair
+			cfg.addr = ports
 			cfg.mode = m
 			return nil
 		}
 	}
 	fs.Func(
 		"tcp",
-		"local TCP service to forward, e.g. 127.0.0.1:5432 (mutually exclusive with -udp)",
+		"local TCP service to forward, e.g. 127.0.0.1:5432 or 127.0.0.1:8000-8010 (mutually exclusive with -udp)",
 		setMode(proto.ModeTCP),
 	)
 	fs.Func(
 		"udp",
-		"local UDP service to forward, e.g. 127.0.0.1:53 (mutually exclusive with -tcp)",
+		"local UDP service to forward, e.g. 127.0.0.1:53 or 127.0.0.1:6000-6010 (mutually exclusive with -tcp)",
 		setMode(proto.ModeUDP),
 	)
 }
@@ -101,7 +115,7 @@ func parseShareFlags(args []string) (shareConfig, error) {
 
 	fs := flag.NewFlagSet("share", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, shareUsage)
 		fs.PrintDefaults()
 	}
 
@@ -131,6 +145,11 @@ func parseShareFlags(args []string) (shareConfig, error) {
 		return shareConfig{}, err
 	}
 
+	if cfg.mode == 0 {
+		fs.Usage()
+		return shareConfig{}, fmt.Errorf("exactly one of -tcp or -udp is required")
+	}
+
 	if tokenStr != "" {
 		token, err := proto.ParseToken(tokenStr)
 		if err != nil {
@@ -153,12 +172,6 @@ func runShare(args []string) error {
 		return err
 	}
 
-	if cfg.mode == 0 {
-		// Neither -tcp nor -udp was given: file-sharing mode.
-		// TODO: unimplemented
-		return nil
-	}
-
 	if cfg.token == nil {
 		token, err := proto.NewToken()
 		if err != nil {
@@ -170,8 +183,8 @@ func runShare(args []string) error {
 
 	fmt.Fprintf(
 		os.Stdout,
-		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -%s 127.0.0.1:0 -server %s %s\n\n",
-		*cfg.token, cfg.mode, cfg.server, *cfg.token,
+		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -%s %s -server %s %s\n\n",
+		*cfg.token, cfg.mode, suggestedListenAddr(cfg.addr), cfg.server, *cfg.token,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -186,4 +199,24 @@ func runShare(args []string) error {
 		Addr:     cfg.addr,
 		Token:    *cfg.token,
 	})
+}
+
+// suggestedListenAddr is the local address the printed listen command
+// suggests for addr. A single shared port suggests port 0, since the
+// subscriber has no reason to care which local port it gets and asking the
+// OS never collides with something already running. A range can't do that
+// - its ports have to be contiguous, which port 0 can't promise - so it
+// suggests the publisher's own numbers, which at least line up with what
+// the far side is serving.
+func suggestedListenAddr(addr hostport.Range) string {
+	if addr.Len() <= 1 {
+		return "127.0.0.1:0"
+	}
+
+	_, ports, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+
+	return net.JoinHostPort("127.0.0.1", ports)
 }

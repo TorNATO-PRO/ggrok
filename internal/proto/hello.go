@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,14 +12,16 @@ import (
 // speaking some other protocol on the same port can't be mistaken for a
 // ggrok node.
 //
-// Bumped to ggrok/2 when the UDP-mode datagram header widened to a
-// uniform four bytes on both legs (see FrameHeaderSize). A ggrok/1 peer
-// frames a subscriber's datagrams with a two-byte header, which a ggrok/2
-// peer would parse as a different subscriber and flow entirely - traffic
-// silently delivered to the wrong local client rather than an error. The
-// version is part of the ALPN so that mismatch is refused during the
-// handshake instead of being discovered as misrouted packets.
-const ALPN = "ggrok/2"
+// Bumped to ggrok/3 when port ranges widened the datagram header again,
+// to six bytes, to carry the PortIndex a frame belongs to (see
+// FrameHeaderSize), and widened Hello and Attach to match. Every past bump
+// has had the same character: a peer speaking the older version frames its
+// datagrams differently, so a newer peer parses the header at the wrong
+// offsets and reads a different subscriber, flow and port entirely -
+// traffic silently delivered to the wrong local client rather than an
+// error. The version is part of the ALPN so that mismatch is refused
+// during the handshake instead of being discovered as misrouted packets.
+const ALPN = "ggrok/3"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never
@@ -63,8 +66,13 @@ func (m Mode) String() string {
 }
 
 // helloSize is the fixed wire size of a Hello: 1 byte Role + 1 byte Mode +
-// 16 byte Token. Fixed width means no length prefix is needed.
-const helloSize = 1 + 1 + tokenSize
+// 2 byte Ports + 16 byte Token. Fixed width means no length prefix is
+// needed.
+const helloSize = 1 + 1 + 2 + tokenSize
+
+// helloPortsOffset locates the Ports field, which sits ahead of the token
+// so the two variable-meaning enum bytes and the count stay together.
+const helloPortsOffset = 2
 
 // Hello is the first message a peer sends relay on the first stream it
 // opens against a connection, identifying itself and which session it
@@ -73,6 +81,15 @@ type Hello struct {
 	Role  Role
 	Mode  Mode
 	Token Token
+
+	// Ports is how many consecutive ports this peer forwards (publish) or
+	// binds (subscribe) - see hostport.Range. Both ends of a session must
+	// agree on the count, since everything downstream addresses a port by
+	// its index within the range rather than by number; relay is what
+	// enforces that, rejecting a mismatched subscriber with
+	// AckPortsMismatch instead of letting it discover the problem as
+	// connections that quietly fail on some ports and not others.
+	Ports uint16
 }
 
 // WriteHello writes h's fixed-width wire encoding to w in a single Write.
@@ -83,11 +100,15 @@ func WriteHello(w io.Writer, h Hello) error {
 	if h.Mode != ModeTCP && h.Mode != ModeUDP {
 		return fmt.Errorf("write hello: invalid mode %d", h.Mode)
 	}
+	if h.Ports == 0 {
+		return fmt.Errorf("write hello: port count must be at least 1")
+	}
 
 	var buf [helloSize]byte
 	buf[0] = byte(h.Role)
 	buf[1] = byte(h.Mode)
-	copy(buf[2:], h.Token[:])
+	binary.BigEndian.PutUint16(buf[helloPortsOffset:], h.Ports)
+	copy(buf[helloPortsOffset+2:], h.Token[:])
 
 	if _, err := w.Write(buf[:]); err != nil {
 		return fmt.Errorf("write hello: %w", err)
@@ -103,14 +124,21 @@ func ReadHello(r io.Reader) (Hello, error) {
 		return Hello{}, fmt.Errorf("read hello: %w", err)
 	}
 
-	h := Hello{Role: Role(buf[0]), Mode: Mode(buf[1])}
-	copy(h.Token[:], buf[2:])
+	h := Hello{
+		Role:  Role(buf[0]),
+		Mode:  Mode(buf[1]),
+		Ports: binary.BigEndian.Uint16(buf[helloPortsOffset:]),
+	}
+	copy(h.Token[:], buf[helloPortsOffset+2:])
 
 	if h.Role != RolePublish && h.Role != RoleSubscribe {
 		return Hello{}, fmt.Errorf("read hello: invalid role %d", h.Role)
 	}
 	if h.Mode != ModeTCP && h.Mode != ModeUDP {
 		return Hello{}, fmt.Errorf("read hello: invalid mode %d", h.Mode)
+	}
+	if h.Ports == 0 {
+		return Hello{}, fmt.Errorf("read hello: port count must be at least 1")
 	}
 
 	return h, nil
@@ -137,6 +165,10 @@ const (
 	// AckPublisherExists means a publisher's token already has an
 	// active publisher.
 	AckPublisherExists
+
+	// AckPortsMismatch means a subscriber's port count doesn't match the
+	// session's publisher - see Hello.Ports.
+	AckPortsMismatch
 )
 
 // Err returns nil for AckOK, and a descriptive error for every rejection
@@ -151,6 +183,8 @@ func (s AckStatus) Err() error {
 		return errors.New("mode does not match this session's publisher")
 	case AckPublisherExists:
 		return errors.New("this token already has an active publisher")
+	case AckPortsMismatch:
+		return errors.New("port count does not match this session's publisher")
 	default:
 		return fmt.Errorf("unknown ack status %d", s)
 	}
@@ -177,13 +211,13 @@ func ReadAck(r io.Reader) (AckStatus, error) {
 	return AckStatus(buf[0]), nil
 }
 
-// Handshake writes a Hello for role/mode/token on stream and waits for
-// relay's ack, returning a descriptive error if relay rejected it. Shared
-// by share (RolePublish) and listen (RoleSubscribe): both open a control
-// stream and need the same send-Hello/await-ack handling before doing
-// anything else on the connection.
-func Handshake(stream io.ReadWriter, role Role, mode Mode, token Token) error {
-	if err := WriteHello(stream, Hello{Role: role, Mode: mode, Token: token}); err != nil {
+// Handshake writes a Hello for role/mode/ports/token on stream and waits
+// for relay's ack, returning a descriptive error if relay rejected it.
+// Shared by share (RolePublish) and listen (RoleSubscribe): both open a
+// control stream and need the same send-Hello/await-ack handling before
+// doing anything else on the connection.
+func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, token Token) error {
+	if err := WriteHello(stream, Hello{Role: role, Mode: mode, Ports: ports, Token: token}); err != nil {
 		return err
 	}
 
@@ -204,3 +238,11 @@ type SubscriberID uint16
 // disambiguates every local UDP client of every subscriber sharing one
 // publisher connection.
 type FlowID uint16
+
+// PortIndex names one port by its offset within a session's range rather
+// than by number - index 0 is the first port share forwards and the first
+// port listen binds, index 1 the next, and so on. The two sides need not
+// use the same port numbers (see hostport.Range), and relay is told
+// nothing about either side's numbers, so the index is the only thing
+// that means anything on the wire.
+type PortIndex uint16

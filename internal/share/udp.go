@@ -94,11 +94,18 @@ func dialUDPConn(
 }
 
 // natKey identifies one virtual remote client: a specific local client of
-// a specific subscriber, disambiguated since many subscribers' traffic
-// shares this one publisher connection.
+// a specific subscriber, on a specific port of the shared range,
+// disambiguated since many subscribers' traffic shares this one publisher
+// connection.
+//
+// The port is part of the key rather than merely recorded alongside it
+// because it's part of the destination: the same local client talking to
+// two ports of the range is two conversations with two different services,
+// and they need separate sockets for the same reason two clients do.
 type natKey struct {
 	sub  proto.SubscriberID
 	flow proto.FlowID
+	port proto.PortIndex
 }
 
 // natEntry is one NAT table slot: a local UDP socket dialed to the shared
@@ -143,7 +150,7 @@ type natTable struct {
 // dialed to addr, and forwards that socket's replies back the same way.
 // It runs until ctx is canceled, quicConn errors, or the control
 // connection's heartbeat loop decides relay is dead.
-func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr hostport.HostPort) error {
+func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr hostport.Range) error {
 	table := &natTable{
 		uplink:  dgram.NewSender(ctx, quicConn),
 		entries: make(map[natKey]*natEntry),
@@ -154,7 +161,7 @@ func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr ho
 
 	heartbeatErr := make(chan error, 1)
 	go func() {
-		heartbeatErr <- runControlLoop(ctx, control, func(uint64) {})
+		heartbeatErr <- runControlLoop(ctx, control, func(uint64, proto.PortIndex) {})
 		// The ReceiveDatagram below is the only thing keeping this share
 		// alive, and no peer can hang up a QUIC connection - without this
 		// close, a share whose relay has died sits there forever instead
@@ -189,17 +196,17 @@ func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr ho
 }
 
 // deliver writes one frame's payload to the local socket dedicated to the
-// (subscriber, flow) pair it names, dialing that socket if this is the
-// first datagram seen for the pair.
-func (t *natTable) deliver(ctx context.Context, addr hostport.HostPort, frame []byte) {
-	sub, flow, payload, err := proto.DecodeFrame(frame)
+// (subscriber, flow, port) triple it names, dialing that socket if this is
+// the first datagram seen for the triple.
+func (t *natTable) deliver(ctx context.Context, addr hostport.Range, frame []byte) {
+	sub, flow, port, payload, err := proto.DecodeFrame(frame)
 	if err != nil {
 		return // malformed frame from a misbehaving relay; drop it
 	}
 
-	entry, err := t.get(ctx, addr, sub, flow)
+	entry, err := t.get(ctx, addr, natKey{sub: sub, flow: flow, port: port})
 	if err != nil {
-		return // local dial failed; drop this datagram, the next one retries
+		return // unknown port or a failed local dial; drop this datagram, the next one retries
 	}
 
 	_, _ = entry.conn.Write(payload) // best-effort; a dead local socket just misses this one datagram
@@ -207,15 +214,8 @@ func (t *natTable) deliver(ctx context.Context, addr hostport.HostPort, frame []
 
 // get returns the NAT entry for key, dialing a fresh local socket and
 // starting its reply-pump goroutine if this is the first datagram seen for
-// that (subscriber, flow) pair.
-func (t *natTable) get(
-	ctx context.Context,
-	addr hostport.HostPort,
-	sub proto.SubscriberID,
-	flow proto.FlowID,
-) (*natEntry, error) {
-	key := natKey{sub: sub, flow: flow}
-
+// that (subscriber, flow, port) triple.
+func (t *natTable) get(ctx context.Context, addr hostport.Range, key natKey) (*natEntry, error) {
 	t.mu.Lock()
 	entry, ok := t.entries[key]
 	t.mu.Unlock()
@@ -225,20 +225,29 @@ func (t *natTable) get(
 		return entry, nil
 	}
 
+	// Nothing upstream vouches for the port index: relay forwards a UDP
+	// frame's header without reading past the SubscriberID, so this is the
+	// first and only place a subscriber naming a port past the end of the
+	// range is caught.
+	local, ok := addr.At(int(key.port))
+	if !ok {
+		return nil, fmt.Errorf("port %d is past the end of %s", key.port, addr)
+	}
+
 	var dialer net.Dialer
-	local, err := dialer.DialContext(ctx, "udp", addr.String())
+	conn, err := dialer.DialContext(ctx, "udp", local.String())
 	if err != nil {
-		return nil, fmt.Errorf("dial %s for new flow: %w", addr, err)
+		return nil, fmt.Errorf("dial %s for new flow: %w", local, err)
 	}
 
 	// Best-effort, same rationale as listen/udp.go's SetReadBuffer call -
 	// a clamped-down buffer just means less burst headroom.
-	if udpConn, ok := local.(*net.UDPConn); ok {
+	if udpConn, ok := conn.(*net.UDPConn); ok {
 		_ = udpConn.SetReadBuffer(udpFlowSocketBufferSize)
 		_ = udpConn.SetWriteBuffer(udpFlowSocketBufferSize)
 	}
 
-	entry = &natEntry{conn: local}
+	entry = &natEntry{conn: conn}
 	entry.touch()
 
 	t.mu.Lock()
@@ -279,7 +288,7 @@ func (t *natTable) pump(entry *natEntry, key natKey) {
 			return
 		}
 
-		if !proto.FinishFrame(buf, key.sub, key.flow, n) {
+		if !proto.FinishFrame(buf, key.sub, key.flow, key.port, n) {
 			proto.ReleaseFrameBuffer(buf) // larger than any datagram QUIC could carry
 			continue
 		}

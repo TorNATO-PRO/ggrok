@@ -551,7 +551,7 @@ func startTunnel(tb testing.TB) *net.UDPAddr {
 			// A fixed port rather than 0, so a listen that restarts while
 			// converging comes back at the address the client is already
 			// writing to.
-			Addr:  loopbackHostPort(tb, localPort),
+			Addr:  loopbackRange(tb, localPort),
 			Token: token,
 		})
 	})
@@ -577,7 +577,7 @@ func runUntilCanceled(ctx context.Context, run func(context.Context) error) {
 // socket that writes every datagram straight back where it came from. Its
 // socket buffers are oversized so the service itself never becomes the
 // bottleneck the benchmark ends up measuring.
-func startEchoService(tb testing.TB) hostport.HostPort {
+func startEchoService(tb testing.TB) hostport.Range {
 	tb.Helper()
 
 	socket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(loopbackHost)})
@@ -600,7 +600,7 @@ func startEchoService(tb testing.TB) hostport.HostPort {
 		}
 	}()
 
-	return loopbackHostPort(tb, socket.LocalAddr().(*net.UDPAddr).Port)
+	return loopbackRange(tb, socket.LocalAddr().(*net.UDPAddr).Port)
 }
 
 // tunnelPKI is a throwaway CA and the three certificates a tunnel needs:
@@ -732,4 +732,17 @@ func loopbackHostPort(tb testing.TB, port int) hostport.HostPort {
 	}
 
 	return pair
+}
+
+// loopbackRange is loopbackHostPort in the form share and listen take -
+// a range of exactly one port, which is what these benchmarks measure.
+func loopbackRange(tb testing.TB, port int) hostport.Range {
+	tb.Helper()
+
+	ports, err := hostport.ParseRange(net.JoinHostPort(loopbackHost, strconv.Itoa(port)))
+	if err != nil {
+		tb.Fatalf("parse loopback address: %v", err)
+	}
+
+	return ports
 }

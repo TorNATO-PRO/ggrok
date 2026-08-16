@@ -319,7 +319,7 @@ func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Co
 				break
 			}
 
-			sub, _, _, decodeErr := proto.DecodeFrame(frame)
+			sub, _, _, _, decodeErr := proto.DecodeFrame(frame)
 			if decodeErr != nil {
 				continue
 			}

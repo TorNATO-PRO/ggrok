@@ -7,21 +7,26 @@ import (
 )
 
 // FrameHeaderSize is the width of a UDP-mode datagram header: a
-// SubscriberID naming which subscriber's traffic this is, then a FlowID
-// naming which of that subscriber's local clients.
+// SubscriberID naming which subscriber's traffic this is, a FlowID naming
+// which of that subscriber's local clients, and a PortIndex naming which
+// port of the session's range it belongs to.
 //
 // Both legs of the path - listen<->relay and relay<->share - carry this
 // same header, even though a subscriber's own leg has no use for the
-// SubscriberID field (it has exactly one subscriber: itself). Two bytes
-// per datagram buy relay the ability to route without re-framing: it
-// reads the header to pick a destination and, on the subscriber-to-
-// publisher leg, only overwrites the SubscriberID in place.
-const FrameHeaderSize = 4
+// SubscriberID field (it has exactly one subscriber: itself) and relay has
+// no use for the PortIndex (it forwards a datagram to the far side without
+// knowing what either end's ports are). Six bytes per datagram buy relay
+// the ability to route without re-framing: it reads the header to pick a
+// destination and, on the subscriber-to-publisher leg, only overwrites the
+// SubscriberID in place.
+const FrameHeaderSize = 6
 
-// frameSubscriberOffset and frameFlowOffset locate the two header fields.
+// frameSubscriberOffset, frameFlowOffset and framePortOffset locate the
+// three header fields.
 const (
 	frameSubscriberOffset = 0
 	frameFlowOffset       = 2
+	framePortOffset       = 4
 )
 
 // BatchHeaderSize is the length prefix in front of each frame packed into
@@ -109,27 +114,33 @@ func FramePayloadSpace(buf *[]byte) []byte {
 // costs nothing real, since such a datagram is past what a QUIC datagram
 // could hold anyway - it just happens at the point the size is first known
 // instead of several copies later.
-func FinishFrame(buf *[]byte, sub SubscriberID, flow FlowID, n int) bool {
+func FinishFrame(buf *[]byte, sub SubscriberID, flow FlowID, port PortIndex, n int) bool {
 	if n < 0 || n > MaxFramePayload {
 		return false
 	}
 
 	frame := (*buf)[:FrameHeaderSize+n]
-	binary.BigEndian.PutUint16(frame[frameSubscriberOffset:], uint16(sub))
-	binary.BigEndian.PutUint16(frame[frameFlowOffset:], uint16(flow))
+	putFrameHeader(frame, sub, flow, port)
 	*buf = frame
 
 	return true
+}
+
+// putFrameHeader writes the three header fields into the front of frame,
+// which must already be at least FrameHeaderSize long.
+func putFrameHeader(frame []byte, sub SubscriberID, flow FlowID, port PortIndex) {
+	binary.BigEndian.PutUint16(frame[frameSubscriberOffset:], uint16(sub))
+	binary.BigEndian.PutUint16(frame[frameFlowOffset:], uint16(flow))
+	binary.BigEndian.PutUint16(frame[framePortOffset:], uint16(port))
 }
 
 // EncodeFrame builds a frame in a freshly allocated buffer. The datagram
 // path uses AcquireFrameBuffer/FinishFrame instead, which allocates
 // nothing; this is for callers that have a payload in hand and no buffer
 // to build it in - tests, mostly.
-func EncodeFrame(sub SubscriberID, flow FlowID, payload []byte) []byte {
+func EncodeFrame(sub SubscriberID, flow FlowID, port PortIndex, payload []byte) []byte {
 	frame := make([]byte, FrameHeaderSize+len(payload))
-	binary.BigEndian.PutUint16(frame[frameSubscriberOffset:], uint16(sub))
-	binary.BigEndian.PutUint16(frame[frameFlowOffset:], uint16(flow))
+	putFrameHeader(frame, sub, flow, port)
 	copy(frame[FrameHeaderSize:], payload)
 
 	return frame
@@ -137,15 +148,16 @@ func EncodeFrame(sub SubscriberID, flow FlowID, payload []byte) []byte {
 
 // DecodeFrame reads a frame's header and returns it with the payload,
 // which aliases frame rather than copying it.
-func DecodeFrame(frame []byte) (SubscriberID, FlowID, []byte, error) {
+func DecodeFrame(frame []byte) (SubscriberID, FlowID, PortIndex, []byte, error) {
 	if len(frame) < FrameHeaderSize {
-		return 0, 0, nil, fmt.Errorf("decode frame: short frame (%d bytes)", len(frame))
+		return 0, 0, 0, nil, fmt.Errorf("decode frame: short frame (%d bytes)", len(frame))
 	}
 
 	sub := SubscriberID(binary.BigEndian.Uint16(frame[frameSubscriberOffset:]))
 	flow := FlowID(binary.BigEndian.Uint16(frame[frameFlowOffset:]))
+	port := PortIndex(binary.BigEndian.Uint16(frame[framePortOffset:]))
 
-	return sub, flow, frame[FrameHeaderSize:], nil
+	return sub, flow, port, frame[FrameHeaderSize:], nil
 }
 
 // SetFrameSubscriber overwrites a frame's SubscriberID in place, which is

@@ -4,8 +4,9 @@ Have you ever developed a web service and wanted to share it with someone else, 
 
 GGrok is a TCP/UDP tunneling tool. It operates at OSI level 4.
 
-Using `ggrok share <-tcp|-udp>`, you may share a local TCP or UDP service through
-the tunnel to any number of concurrent `listen` subscribers holding the session's token.
+Using `ggrok share <-tcp|-udp>`, you may share a local TCP or UDP service - or a whole contiguous
+range of ports - through the tunnel to any number of concurrent `listen` subscribers holding the
+session's token.
 `relay` brokers every session over the public internet without ever terminating TLS. Each
 node is mutually authenticated by a private CA you run yourself!
 
@@ -87,6 +88,26 @@ ggrok listen -tcp 127.0.0.1:9090 -server relay.example.com:4443 <token>
 Binds `127.0.0.1:9090` locally; every connection to it is forwarded through relay to whatever `share`
 is serving. Swap in `-udp` to match a UDP-mode share. The token can come from `GGROK_TOKEN` instead of
 the positional argument, keeping it out of shell history.
+
+### Port ranges
+
+Both `-tcp` and `-udp` take `host:first-last` in place of `host:port`, forwarding every port in the
+range over the one session:
+
+```bash
+ggrok share  -tcp 127.0.0.1:8000-8010            # publisher: 11 local ports
+ggrok listen -tcp 127.0.0.1:9000-9010 <token>    # subscriber: 11 local ports
+```
+
+The two ranges are matched **by position, not by number** - `9000` reaches `8000`, `9001` reaches
+`8001`, and so on - so the subscriber is free to bind whatever numbers are available locally. What
+crosses the wire is an index into the range, and the relay is never told either side's actual port
+numbers.
+
+The only requirement is that both ranges are the same size; a subscriber whose range is a different
+length is refused at subscribe time rather than left to discover it as ports that mysteriously don't
+work. A range is capped at 1024 ports, since each one costs a live socket for the life of the
+session.
 
 ### Config file, instead of repeating flags
 

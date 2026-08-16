@@ -46,7 +46,7 @@ func BenchmarkUDPSubscriberLookup(b *testing.B) {
 
 	locked := &lockedSubscribers{senders: senders}
 
-	sess := newSession(proto.ModeUDP, nil, nil)
+	sess := newSession(proto.ModeUDP, 1, nil, nil)
 	cow := maps.Clone(senders)
 	sess.udpSubscribers.Store(&cow)
 

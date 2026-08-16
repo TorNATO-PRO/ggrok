@@ -55,18 +55,22 @@ type Config struct {
 	Mode proto.Mode
 
 	// Addr is the local address listen binds - a TCP listener or a UDP
-	// socket, per Mode.
-	Addr hostport.HostPort
+	// socket per port, per Mode. It must span as many ports as the
+	// session's publisher forwards, though not the same numbers: the two
+	// ranges are matched index for index (see proto.PortIndex), and relay
+	// turns away a subscriber whose range is a different size.
+	Addr hostport.Range
 
 	// Token identifies which publisher's session to subscribe to.
 	Token proto.Token
 
-	// OnListen, if non-nil, is called once with the local socket's actual
-	// bound address right after Addr is bound - Addr itself if a specific
-	// port was requested, or whatever port the OS actually chose if it was
-	// left as 0. Run blocks for the life of the session, so this is the
-	// only way a caller finds out which address ended up live, and the
-	// only way for it to know at all when the port was auto-assigned.
+	// OnListen, if non-nil, is called once per port with that socket's
+	// actual bound address right after it's bound - the requested address
+	// if a specific port was asked for, or whatever port the OS actually
+	// chose if it was left as 0. Run blocks for the life of the session,
+	// so this is the only way a caller finds out which addresses ended up
+	// live, and the only way for it to know at all when a port was
+	// auto-assigned.
 	OnListen func(net.Addr)
 }
 
@@ -74,6 +78,10 @@ type Config struct {
 // Config.Addr's local traffic through the tunnel until ctx is canceled or
 // an unrecoverable error occurs.
 func Run(ctx context.Context, cfg Config) error {
+	if cfg.Addr.Len() < 1 {
+		return fmt.Errorf("listen: no local address to bind")
+	}
+
 	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, false, nil)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
@@ -85,7 +93,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = control.Close() }()
 
-	if err := proto.Handshake(control, proto.RoleSubscribe, cfg.Mode, cfg.Token); err != nil {
+	ports := uint16(cfg.Addr.Len()) //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
+
+	if err := proto.Handshake(control, proto.RoleSubscribe, cfg.Mode, ports, cfg.Token); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 
@@ -185,35 +195,38 @@ func dialTLS(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config)
 	return tlsConn, nil
 }
 
-// runTCP accepts local connections on addr and, for each one, dials a
-// fresh data connection to relay, attaches it to token's session, and -
-// once relay acks it - splices the two together. It runs until ctx is
-// canceled, the local listener errors, or the control connection dies.
+// runTCP binds every port in addr and, for each local connection accepted
+// on any of them, dials a fresh data connection to relay, attaches it to
+// token's session tagged with the port it arrived on, and - once relay acks
+// it - splices the two together. It runs until ctx is canceled, one of the
+// local listeners errors, or the control connection dies.
 func runTCP(
 	ctx context.Context,
 	control *tls.Conn,
 	tlsConf *tls.Config,
-	server, addr hostport.HostPort,
+	server hostport.HostPort,
+	addr hostport.Range,
 	token proto.Token,
 	onListen func(net.Addr),
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var listenConf net.ListenConfig
-	ln, err := listenConf.Listen(ctx, "tcp", addr.String())
+	listeners, err := bindRange(ctx, addr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+		return err
 	}
-	defer func() { _ = ln.Close() }()
+	defer closeAll(listeners)
 
 	if onListen != nil {
-		onListen(ln.Addr())
+		for _, ln := range listeners {
+			onListen(ln.Addr())
+		}
 	}
 
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
+		closeAll(listeners)
 	}()
 
 	controlErr := make(chan error, 1)
@@ -223,36 +236,109 @@ func runTCP(
 		cancel() // relay is gone or hung; stop accepting new local connections
 	}()
 
+	// One accept loop per port, each reporting into a channel deep enough
+	// to take every one of them: canceling ctx closes all the listeners at
+	// once, so they all fail together, and a shallower channel would leave
+	// every loop but the first parked on a send forever.
+	acceptErr := make(chan error, len(listeners))
+	for i, ln := range listeners {
+		port := proto.PortIndex(i)
+		go func() {
+			acceptErr <- acceptLoop(ctx, ln, tlsConf, server, token, port)
+		}()
+	}
+
+	// Whichever port fails first ends the whole listen. They share a
+	// session, and a subscriber serving some of its range but not the rest
+	// is worse than one that stops and says so.
+	return ShutdownErr(ctx, controlErr, <-acceptErr, "accept")
+}
+
+// bindRange binds a TCP listener on every port in addr, unwinding the ones
+// it already bound if any of them fails - a partially bound range is not a
+// listen anyone asked for.
+func bindRange(ctx context.Context, addr hostport.Range) ([]net.Listener, error) {
+	var listenConf net.ListenConfig
+
+	listeners := make([]net.Listener, 0, addr.Len())
+	for i := range addr.Len() {
+		port, _ := addr.At(i) // i is bounded by Len, so this is always ok
+
+		ln, err := listenConf.Listen(ctx, "tcp", port.String())
+		if err != nil {
+			closeAll(listeners)
+			return nil, fmt.Errorf("listen on %s: %w", port, err)
+		}
+
+		listeners = append(listeners, ln)
+	}
+
+	return listeners, nil
+}
+
+// closeAll closes every listener, ignoring errors - it runs on teardown
+// paths where there is nothing left to do about one.
+func closeAll(listeners []net.Listener) {
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
+}
+
+// acceptLoop forwards every connection accepted on ln, which is the port
+// at index port of the session's range. It returns once ln errors, which
+// on an orderly shutdown means it was closed out from under it.
+func acceptLoop(
+	ctx context.Context,
+	ln net.Listener,
+	tlsConf *tls.Config,
+	server hostport.HostPort,
+	token proto.Token,
+	port proto.PortIndex,
+) error {
 	for {
 		local, err := ln.Accept()
 		if err != nil {
-			return ShutdownErr(ctx, controlErr, err, "accept")
+			return err
 		}
 
-		go func() {
-			dataConn, err := dialData(ctx, server, tlsConf)
-			if err != nil {
-				_ = local.Close()
-				return
-			}
-
-			attach := proto.Attach{Kind: proto.AttachSubscriber, Token: token}
-			if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
-				_ = dataConn.Close()
-				_ = local.Close()
-				return
-			}
-
-			status, err := proto.ReadAck(dataConn)
-			if err != nil || status.Err() != nil {
-				_ = dataConn.Close()
-				_ = local.Close()
-				return
-			}
-
-			streamio.Splice(local, dataConn)
-		}()
+		go forward(ctx, local, tlsConf, server, token, port)
 	}
+}
+
+// forward dials relay a data connection for local, attaches it to token's
+// session at port, and splices the two once relay acks the pairing. Every
+// failure before that point closes both ends, since a local client left
+// connected to a tunnel that never formed would wait on a reply that isn't
+// coming.
+func forward(
+	ctx context.Context,
+	local net.Conn,
+	tlsConf *tls.Config,
+	server hostport.HostPort,
+	token proto.Token,
+	port proto.PortIndex,
+) {
+	dataConn, err := dialData(ctx, server, tlsConf)
+	if err != nil {
+		_ = local.Close()
+		return
+	}
+
+	attach := proto.Attach{Kind: proto.AttachSubscriber, Token: token, Port: port}
+	if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
+		_ = dataConn.Close()
+		_ = local.Close()
+		return
+	}
+
+	status, err := proto.ReadAck(dataConn)
+	if err != nil || status.Err() != nil {
+		_ = dataConn.Close()
+		_ = local.Close()
+		return
+	}
+
+	streamio.Splice(local, dataConn)
 }
 
 // runControlLoop sends a ControlPing on control every heartbeatInterval
