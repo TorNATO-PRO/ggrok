@@ -1,7 +1,6 @@
 package proto
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +10,15 @@ import (
 // ggrok negotiate (see internal/mtls.LoadConfig's NextProtos), so a peer
 // speaking some other protocol on the same port can't be mistaken for a
 // ggrok node.
-const ALPN = "ggrok/1"
+//
+// Bumped to ggrok/2 when the UDP-mode datagram header widened to a
+// uniform four bytes on both legs (see FrameHeaderSize). A ggrok/1 peer
+// frames a subscriber's datagrams with a two-byte header, which a ggrok/2
+// peer would parse as a different subscriber and flow entirely - traffic
+// silently delivered to the wrong local client rather than an error. The
+// version is part of the ALPN so that mismatch is refused during the
+// handshake instead of being discovered as misrouted packets.
+const ALPN = "ggrok/2"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never
@@ -197,55 +204,3 @@ type SubscriberID uint16
 // disambiguates every local UDP client of every subscriber sharing one
 // publisher connection.
 type FlowID uint16
-
-// subscriberFrameHeaderSize and publisherFrameHeaderSize are the datagram
-// header widths on the listen<->relay and relay<->share legs respectively.
-const (
-	subscriberFrameHeaderSize = 2
-	publisherFrameHeaderSize  = 4
-)
-
-// EncodeSubscriberFrame frames a UDP-mode datagram for the listen<->relay
-// leg, tagging it with the FlowID of the local client it came from (or is
-// destined for).
-func EncodeSubscriberFrame(flow FlowID, payload []byte) []byte {
-	frame := make([]byte, subscriberFrameHeaderSize+len(payload))
-	binary.BigEndian.PutUint16(frame, uint16(flow))
-	copy(frame[subscriberFrameHeaderSize:], payload)
-	return frame
-}
-
-// DecodeSubscriberFrame reverses EncodeSubscriberFrame. The returned
-// payload aliases frame.
-func DecodeSubscriberFrame(frame []byte) (FlowID, []byte, error) {
-	if len(frame) < subscriberFrameHeaderSize {
-		return 0, nil, fmt.Errorf("decode subscriber frame: short frame (%d bytes)", len(frame))
-	}
-
-	flow := FlowID(binary.BigEndian.Uint16(frame))
-	return flow, frame[subscriberFrameHeaderSize:], nil
-}
-
-// EncodePublisherFrame frames a UDP-mode datagram for the relay<->share
-// leg, tagging it with which subscriber's which local client it came from
-// (or is destined for) - necessary once more than one subscriber's traffic
-// shares the one publisher connection.
-func EncodePublisherFrame(sub SubscriberID, flow FlowID, payload []byte) []byte {
-	frame := make([]byte, publisherFrameHeaderSize+len(payload))
-	binary.BigEndian.PutUint16(frame, uint16(sub))
-	binary.BigEndian.PutUint16(frame[2:], uint16(flow))
-	copy(frame[publisherFrameHeaderSize:], payload)
-	return frame
-}
-
-// DecodePublisherFrame reverses EncodePublisherFrame. The returned payload
-// aliases frame.
-func DecodePublisherFrame(frame []byte) (SubscriberID, FlowID, []byte, error) {
-	if len(frame) < publisherFrameHeaderSize {
-		return 0, 0, nil, fmt.Errorf("decode publisher frame: short frame (%d bytes)", len(frame))
-	}
-
-	sub := SubscriberID(binary.BigEndian.Uint16(frame))
-	flow := FlowID(binary.BigEndian.Uint16(frame[2:]))
-	return sub, flow, frame[publisherFrameHeaderSize:], nil
-}

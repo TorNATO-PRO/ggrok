@@ -60,6 +60,12 @@ type Config struct {
 	// pure bookkeeping, since a revoked cert otherwise keeps authenticating
 	// until it naturally expires.
 	RevokedFile string
+
+	// Logger, if non-nil, receives relay's per-connection attach/detach
+	// records instead of the default stderr handler. Mainly for tests and
+	// benchmarks that run a relay in-process, where the default's output
+	// would interleave with - and bury - their own.
+	Logger *slog.Logger
 }
 
 // Run listens for TCP and QUIC connections on Config.Listen and brokers
@@ -102,7 +108,10 @@ func Run(ctx context.Context, cfg Config) error {
 		_ = quicListener.Close()
 	}()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
 	registry := NewRegistry(logger)
 
 	go runQUICAcceptLoop(ctx, logger, registry, quicListener)

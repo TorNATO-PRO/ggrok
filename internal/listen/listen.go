@@ -101,7 +101,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("listen: %w", err)
 		}
-		return runUDP(ctx, control, quicConn, cfg.Addr, cfg.OnListen)
+		return runUDP(ctx, control, quicConn, cfg.Addr, subID, cfg.OnListen)
 	default:
 		return fmt.Errorf("listen: unsupported mode %v", cfg.Mode)
 	}

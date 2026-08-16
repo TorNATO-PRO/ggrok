@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"tornato.dev/ggrok/v2/internal/dgram"
 	"tornato.dev/ggrok/v2/internal/proto"
 	"tornato.dev/ggrok/v2/internal/streamio"
 )
@@ -358,7 +359,7 @@ type session struct {
 	// udpSubscribers holds each attached subscriber's relay<->listen UDP
 	// data-plane connection, wrapped the same way, keyed by the same
 	// SubscriberID assigned in addSubscriber.
-	udpSubscribers map[proto.SubscriberID]*udpSender
+	udpSubscribers map[proto.SubscriberID]*dgram.Sender
 }
 
 // subscriberConn is what session tracks per attached subscriber: its
@@ -375,7 +376,7 @@ func newSession(mode proto.Mode, publisher *tls.Conn, publisherCert *x509.Certif
 		publisherCert:  publisherCert,
 		subscribers:    make(map[proto.SubscriberID]*subscriberConn),
 		pending:        make(map[uint64]net.Conn),
-		udpSubscribers: make(map[proto.SubscriberID]*udpSender),
+		udpSubscribers: make(map[proto.SubscriberID]*dgram.Sender),
 	}
 }
 
@@ -450,7 +451,7 @@ func (s *session) udpPublisherSender() (*udpSender, bool) {
 }
 
 // setUDPSubscriber records sender as id's UDP data-plane connection.
-func (s *session) setUDPSubscriber(id proto.SubscriberID, sender *udpSender) {
+func (s *session) setUDPSubscriber(id proto.SubscriberID, sender *dgram.Sender) {
 	s.mu.Lock()
 	s.udpSubscribers[id] = sender
 	s.mu.Unlock()
@@ -465,7 +466,7 @@ func (s *session) removeUDPSubscriber(id proto.SubscriberID) {
 
 // udpSubscriber returns id's UDP data-plane connection, if it has
 // attached one.
-func (s *session) udpSubscriber(id proto.SubscriberID) (*udpSender, bool) {
+func (s *session) udpSubscriber(id proto.SubscriberID) (*dgram.Sender, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sender, ok := s.udpSubscribers[id]
@@ -560,7 +561,7 @@ func (s *session) shutdown(reason proto.SessionCloseReason) int {
 	}
 
 	udpPublisher := s.udpPublisher
-	udpSubscribers := make([]*udpSender, 0, len(s.udpSubscribers))
+	udpSubscribers := make([]*dgram.Sender, 0, len(s.udpSubscribers))
 	for _, sender := range s.udpSubscribers {
 		udpSubscribers = append(udpSubscribers, sender)
 	}
@@ -574,7 +575,7 @@ func (s *session) shutdown(reason proto.SessionCloseReason) int {
 		_ = udpPublisher.conn.CloseWithError(0, "")
 	}
 	for _, sender := range udpSubscribers {
-		_ = sender.conn.CloseWithError(0, "")
+		sender.Close()
 	}
 
 	for _, control := range controls {

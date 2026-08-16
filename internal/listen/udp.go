@@ -12,12 +12,9 @@ import (
 	"github.com/quic-go/quic-go"
 
 	hostport "tornato.dev/ggrok/v2/internal"
+	"tornato.dev/ggrok/v2/internal/dgram"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
-
-// udpReadBufferSize is the max size of a single datagram read from the
-// local socket before it's forwarded on.
-const udpReadBufferSize = 64 * 1024
 
 // udpSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size requested
 // for the local bind socket. Unlike quic-go's own UDP socket (which
@@ -26,8 +23,8 @@ const udpReadBufferSize = 64 * 1024
 // socket is the single aggregation point for every local client's
 // traffic on this listen instance, so a burst arriving faster than
 // runUDP's read loop drains it can overflow that default and silently
-// drop packets before udpUplinkQueueDepth's channel-level backpressure
-// ever gets a chance to matter - see that constant's doc comment.
+// drop packets before the uplink sender's own queue-level backpressure
+// ever gets a chance to matter - see [dgram.QueueDepth].
 //
 // 8MiB rather than something more modest because BenchmarkUDPBurstDrop
 // (a burst of 8000x 512B datagrams arriving before any read) measured
@@ -37,16 +34,6 @@ const udpReadBufferSize = 64 * 1024
 // Linux host's net.core.rmem_max) just gets clamped down silently,
 // same as quic-go's own request already does.
 const udpSocketBufferSize = 8 * 1024 * 1024
-
-// udpUplinkQueueDepth bounds how many locally-read datagrams runUDP
-// buffers before quicConn.SendDatagram actually sends them. Without this,
-// SendDatagram's blocking behavior once quic-go's own internal send queue
-// fills (see internal/relay/udp.go's udpSender doc comment for the
-// underlying quic-go behavior this guards against) would stall the loop
-// reading the local socket, letting the OS's UDP receive buffer for that
-// socket overflow and silently drop packets long before they ever reach
-// quicConn.
-const udpUplinkQueueDepth = 256
 
 // udpKeepAlivePeriod and udpMaxIdleTimeout keep listen's UDP-mode
 // data-plane QUIC connection to relay alive through long idle stretches
@@ -210,6 +197,7 @@ func runUDP(
 	control *tls.Conn,
 	quicConn *quic.Conn,
 	addr hostport.HostPort,
+	subID proto.SubscriberID,
 	onListen func(net.Addr),
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -249,8 +237,7 @@ func runUDP(
 	flows := newFlowTable()
 	go pumpDownlink(ctx, quicConn, socket, flows)
 
-	uplink := make(chan []byte, udpUplinkQueueDepth)
-	go pumpUplink(ctx, quicConn, uplink)
+	uplink := dgram.NewSender(ctx, quicConn)
 
 	heartbeatErr := make(chan error, 1)
 	go func() {
@@ -262,45 +249,40 @@ func runUDP(
 		cancel()
 	}()
 
-	buf := make([]byte, udpReadBufferSize)
 	for {
-		n, remoteAddr, err := socket.ReadFromUDPAddrPort(buf)
+		// Read straight into a pooled buffer, past the space its header
+		// will occupy, so framing the datagram below is a header write
+		// rather than an allocation and a copy of the whole payload.
+		// pumpUplink returns the buffer once it's been sent.
+		buf := proto.AcquireFrameBuffer()
+
+		n, remoteAddr, err := socket.ReadFromUDPAddrPort(proto.FramePayloadSpace(buf))
 		if err != nil {
+			proto.ReleaseFrameBuffer(buf)
 			return ShutdownErr(ctx, heartbeatErr, err, "read")
 		}
 
 		flow, ok := flows.getOrCreate(remoteAddr)
 		if !ok {
-			continue // flow table full; drop rather than misroute
+			proto.ReleaseFrameBuffer(buf) // flow table full; drop rather than misroute
+			continue
 		}
 
-		frame := proto.EncodeSubscriberFrame(flow, buf[:n])
-		select {
-		case uplink <- frame:
-		default: // uplink congested; drop rather than stall this read loop
+		// subID is what listen believes it is; relay overwrites it with
+		// the identity it authenticated this connection as, so this is for
+		// whoever reads a packet capture, not for routing.
+		if !proto.FinishFrame(buf, subID, flow, n) {
+			proto.ReleaseFrameBuffer(buf) // larger than any datagram QUIC could carry
+			continue
 		}
+
+		uplink.EnqueuePooled(buf)
 	}
 }
 
-// pumpUplink drains uplink and sends each frame on quicConn, in its own
-// goroutine so a SendDatagram call that blocks on quic-go's internal send
-// queue never stalls runUDP's local-socket read loop - see
-// udpUplinkQueueDepth's doc comment for why that matters. It exits when
-// ctx is canceled.
-func pumpUplink(ctx context.Context, quicConn *quic.Conn, uplink <-chan []byte) {
-	for {
-		select {
-		case data := <-uplink:
-			_ = quicConn.SendDatagram(data)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pumpDownlink reads datagrams off quicConn, decodes the FlowID, and
-// writes each payload back to the local remote address that flow was
-// assigned to. It exits when quicConn errors.
+// pumpDownlink reads datagrams off quicConn and writes each frame packed
+// inside back to the local client its FlowID names. It exits when quicConn
+// errors.
 func pumpDownlink(ctx context.Context, quicConn *quic.Conn, socket *net.UDPConn, flows *flowTable) {
 	for {
 		data, err := quicConn.ReceiveDatagram(ctx)
@@ -308,16 +290,36 @@ func pumpDownlink(ctx context.Context, quicConn *quic.Conn, socket *net.UDPConn,
 			return
 		}
 
-		flow, payload, err := proto.DecodeSubscriberFrame(data)
-		if err != nil {
-			continue // malformed frame from a misbehaving relay; drop it
+		// One datagram carries however many frames relay had waiting for
+		// this subscriber, so every receive is a walk rather than a single
+		// decode - see [proto.Batch].
+		frames := proto.NewFrameReader(data)
+		for {
+			frame, ok := frames.Next()
+			if !ok {
+				break
+			}
+			deliverDownlink(frame, socket, flows)
 		}
-
-		remoteAddr, ok := flows.lookup(flow)
-		if !ok {
-			continue // unknown flow (e.g. already gone); drop it
-		}
-
-		_, _ = socket.WriteToUDPAddrPort(payload, remoteAddr)
 	}
+}
+
+// deliverDownlink writes one frame's payload back to the local client its
+// FlowID was assigned to, dropping it if the frame is malformed or names a
+// flow that has since gone.
+func deliverDownlink(frame []byte, socket *net.UDPConn, flows *flowTable) {
+	// The SubscriberID names this very subscriber - relay only sends a
+	// frame down the connection it belongs to - so only the FlowID says
+	// anything listen doesn't already know.
+	_, flow, payload, err := proto.DecodeFrame(frame)
+	if err != nil {
+		return // malformed frame from a misbehaving relay; drop it
+	}
+
+	remoteAddr, ok := flows.lookup(flow)
+	if !ok {
+		return // unknown flow (e.g. already gone); drop it
+	}
+
+	_, _ = socket.WriteToUDPAddrPort(payload, remoteAddr)
 }

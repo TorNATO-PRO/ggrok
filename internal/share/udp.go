@@ -11,6 +11,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	hostport "tornato.dev/ggrok/v2/internal"
+	"tornato.dev/ggrok/v2/internal/dgram"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
 
@@ -22,10 +23,6 @@ const (
 	udpIdleTimeout   = 2 * time.Minute
 	udpSweepInterval = 30 * time.Second
 
-	// udpReadBufferSize is the max size of a single reply read from a
-	// NAT entry's local socket before it's forwarded as a datagram.
-	udpReadBufferSize = 64 * 1024
-
 	// udpFlowSocketBufferSize is the OS-level SO_RCVBUF/SO_SNDBUF size
 	// requested for each NAT entry's local socket - see listen/udp.go's
 	// udpSocketBufferSize for why a plain [net.Dial] socket needs this at
@@ -35,16 +32,6 @@ const (
 	// aggregation point the way listen's one socket is would multiply
 	// into real memory pressure.
 	udpFlowSocketBufferSize = 1024 * 1024
-
-	// udpUplinkQueueDepth bounds how many locally-read replies natTable's
-	// per-flow pump goroutine buffers before quicConn.SendDatagram
-	// actually sends them. Without this, SendDatagram's blocking behavior
-	// once quic-go's own internal send queue fills (see
-	// internal/relay/udp.go's udpSender doc comment for the underlying
-	// quic-go behavior this guards against) would stall the loop reading
-	// that flow's local socket, letting its OS receive buffer overflow
-	// and silently drop replies long before they ever reach quicConn.
-	udpUplinkQueueDepth = 256
 
 	// udpKeepAlivePeriod and udpMaxIdleTimeout keep share's UDP-mode
 	// data-plane QUIC connection to relay alive through long idle
@@ -116,22 +103,21 @@ type natKey struct {
 // natEntry is one NAT table slot: a local UDP socket dialed to the shared
 // service, dedicated to a single (subscriber, flow) pair so the service
 // sees it as a distinct remote peer.
+// An entry owns no goroutine of its own beyond the pump reading its
+// socket, which stops when that socket closes - so evicting one is just
+// closing its conn.
 type natEntry struct {
-	conn   net.Conn
-	uplink chan []byte
-	// cancel stops this entry's pumpUplink goroutine. Without it, that
-	// goroutine would outlive the entry itself - runUDP's ctx only ends
-	// when the whole publisher connection does, but individual entries
-	// come and go throughout its life (idle sweep, a dead local socket),
-	// so each eviction needs its own way to stop the goroutine feeding it.
-	cancel     context.CancelFunc
+	conn       net.Conn
 	lastActive time.Time
 }
 
 // natTable is share's UDP-mode NAT: it demultiplexes datagrams arriving
 // from potentially many subscribers' many local clients, each getting its
-// own local socket dialed to the shared service.
+// own local socket dialed to the shared service. Their replies all go back
+// through one uplink, so they coalesce with each other.
 type natTable struct {
+	uplink *dgram.Sender
+
 	mu      sync.Mutex
 	entries map[natKey]*natEntry
 }
@@ -142,7 +128,10 @@ type natTable struct {
 // It runs until ctx is canceled, quicConn errors, or the control
 // connection's heartbeat loop decides relay is dead.
 func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr hostport.HostPort) error {
-	table := &natTable{entries: make(map[natKey]*natEntry)}
+	table := &natTable{
+		uplink:  dgram.NewSender(ctx, quicConn),
+		entries: make(map[natKey]*natEntry),
+	}
 	defer table.closeAll()
 
 	go table.sweep(ctx)
@@ -168,18 +157,36 @@ func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr ho
 			}
 		}
 
-		sub, flow, payload, err := proto.DecodePublisherFrame(data)
-		if err != nil {
-			continue // malformed frame from a misbehaving relay; drop it
+		// One datagram carries however many frames relay had waiting for
+		// this publisher, across any number of subscribers and flows, so
+		// every receive is a walk rather than a single decode - see
+		// [proto.Batch].
+		frames := proto.NewFrameReader(data)
+		for {
+			frame, ok := frames.Next()
+			if !ok {
+				break
+			}
+			table.deliver(ctx, addr, frame)
 		}
-
-		entry, err := table.get(ctx, quicConn, addr, sub, flow)
-		if err != nil {
-			continue // local dial failed; drop this datagram, the next one retries
-		}
-
-		_, _ = entry.conn.Write(payload) // best-effort; a dead local socket just misses this one datagram
 	}
+}
+
+// deliver writes one frame's payload to the local socket dedicated to the
+// (subscriber, flow) pair it names, dialing that socket if this is the
+// first datagram seen for the pair.
+func (t *natTable) deliver(ctx context.Context, addr hostport.HostPort, frame []byte) {
+	sub, flow, payload, err := proto.DecodeFrame(frame)
+	if err != nil {
+		return // malformed frame from a misbehaving relay; drop it
+	}
+
+	entry, err := t.get(ctx, addr, sub, flow)
+	if err != nil {
+		return // local dial failed; drop this datagram, the next one retries
+	}
+
+	_, _ = entry.conn.Write(payload) // best-effort; a dead local socket just misses this one datagram
 }
 
 // get returns the NAT entry for key, dialing a fresh local socket and
@@ -187,7 +194,6 @@ func runUDP(ctx context.Context, control *tls.Conn, quicConn *quic.Conn, addr ho
 // that (subscriber, flow) pair.
 func (t *natTable) get(
 	ctx context.Context,
-	quicConn *quic.Conn,
 	addr hostport.HostPort,
 	sub proto.SubscriberID,
 	flow proto.FlowID,
@@ -218,61 +224,49 @@ func (t *natTable) get(
 		_ = udpConn.SetWriteBuffer(udpFlowSocketBufferSize)
 	}
 
-	entryCtx, cancel := context.WithCancel(ctx)
-	entry = &natEntry{
-		conn:       local,
-		uplink:     make(chan []byte, udpUplinkQueueDepth),
-		cancel:     cancel,
-		lastActive: time.Now(),
-	}
+	entry = &natEntry{conn: local, lastActive: time.Now()}
 
 	t.mu.Lock()
 	t.entries[key] = entry
 	t.mu.Unlock()
 
-	go pumpUplink(entryCtx, quicConn, entry.uplink)
-	go t.pump(local, entry.uplink, key)
+	go t.pump(local, key)
 
 	return entry, nil
 }
 
 // pump reads replies from a NAT entry's local socket and hands each,
 // tagged with the header that routes it to the right subscriber's right
-// local client, to uplink for a separate goroutine to actually send - see
-// udpUplinkQueueDepth's doc comment for why reading and sending are kept
-// apart. It runs until the local socket errors or closes, then evicts its
-// own entry.
-func (t *natTable) pump(local net.Conn, uplink chan<- []byte, key natKey) {
-	buf := make([]byte, udpReadBufferSize)
+// local client, to the shared uplink sender - see [dgram.QueueDepth] for
+// why reading and sending are kept apart. It runs until the local socket
+// errors or closes, then evicts its own entry.
+//
+// Every NAT entry feeds the one sender rather than owning its own, so
+// replies bound for different subscribers and different flows all pack
+// into the same datagram. A share fronting a busy service has many entries
+// live at once, which is exactly the case coalescing pays off in.
+func (t *natTable) pump(local net.Conn, key natKey) {
 	for {
-		n, err := local.Read(buf)
+		// Read straight into a pooled buffer, past the space its header
+		// will occupy, so framing the reply below is a header write rather
+		// than an allocation and a copy of the whole payload. The sender
+		// returns the buffer once the frame has been packed.
+		buf := proto.AcquireFrameBuffer()
+
+		n, err := local.Read(proto.FramePayloadSpace(buf))
 		if err != nil {
+			proto.ReleaseFrameBuffer(buf)
 			t.evict(key)
 			return
 		}
 
-		frame := proto.EncodePublisherFrame(key.sub, key.flow, buf[:n])
-		select {
-		case uplink <- frame:
-		default: // uplink congested; drop rather than stall this read loop
+		if !proto.FinishFrame(buf, key.sub, key.flow, n) {
+			proto.ReleaseFrameBuffer(buf) // larger than any datagram QUIC could carry
+			continue
 		}
 
+		t.uplink.EnqueuePooled(buf)
 		t.touch(key)
-	}
-}
-
-// pumpUplink drains uplink and sends each frame on quicConn, in its own
-// goroutine so a SendDatagram call that blocks on quic-go's internal send
-// queue never stalls the local-socket read loop feeding uplink. It exits
-// when ctx is canceled.
-func pumpUplink(ctx context.Context, quicConn *quic.Conn, uplink <-chan []byte) {
-	for {
-		select {
-		case data := <-uplink:
-			_ = quicConn.SendDatagram(data)
-		case <-ctx.Done():
-			return
-		}
 	}
 }
 
@@ -297,7 +291,6 @@ func (t *natTable) evict(key natKey) {
 	t.mu.Unlock()
 
 	if ok {
-		entry.cancel()
 		_ = entry.conn.Close()
 	}
 }
@@ -333,7 +326,6 @@ func (t *natTable) sweepOnce() {
 	t.mu.Unlock()
 
 	for _, entry := range stale {
-		entry.cancel()
 		_ = entry.conn.Close()
 	}
 }

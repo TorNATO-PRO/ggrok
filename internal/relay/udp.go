@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"tornato.dev/ggrok/v2/internal/dgram"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
 
@@ -45,6 +46,12 @@ const udpSenderQueueDepth = 256
 // destination only ever costs itself datagrams (dropped once its queue
 // is full) instead of stalling whichever pump loop is trying to hand it
 // work.
+//
+// It forwards whole datagrams as handed to it, which is what the
+// subscriber-to-publisher direction needs: those arrive already packed
+// for the one destination they're bound for. The opposite direction fans
+// out to many subscribers and has to repack per destination, so it uses a
+// [dgram.Sender] instead.
 type udpSender struct {
 	conn  *quic.Conn
 	queue chan []byte
@@ -182,7 +189,7 @@ func (r *Registry) AttachSubscriberUDP(
 	senderCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sess.setUDPSubscriber(id, newUDPSender(senderCtx, quicConn))
+	sess.setUDPSubscriber(id, dgram.NewSender(senderCtx, quicConn))
 	defer sess.removeUDPSubscriber(id)
 
 	r.logger.InfoContext(ctx, "subscriber udp attached",
@@ -202,6 +209,12 @@ func (r *Registry) AttachSubscriberUDP(
 // malformed or stale frame. Forwarding goes through that subscriber's
 // udpSender rather than a direct SendDatagram call - see udpSender's doc
 // comment for why this loop must never block on a slow destination.
+//
+// The datagram is forwarded exactly as it arrived. Both legs of the path
+// carry the same header (see proto.FrameHeaderSize), so the frame the
+// subscriber needs is already the frame the publisher sent - relay reads
+// the header to route it and passes the buffer straight along, without
+// allocating or copying the payload.
 func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Conn) error {
 	for {
 		data, err := pubConn.ReceiveDatagram(ctx)
@@ -209,28 +222,57 @@ func pumpPublisherDatagrams(ctx context.Context, sess *session, pubConn *quic.Co
 			return err
 		}
 
-		sub, flow, payload, err := proto.DecodePublisherFrame(data)
-		if err != nil {
-			continue
-		}
+		// One datagram from the publisher can hold frames for any number
+		// of different subscribers, so this direction has to take the
+		// batch apart and hand each frame to the sender for the subscriber
+		// it names. Each of those senders repacks whatever it's given, so
+		// traffic arrives coalesced and leaves coalesced - just regrouped
+		// by destination along the way.
+		frames := proto.NewFrameReader(data)
+		for {
+			frame, ok := frames.Next()
+			if !ok {
+				break
+			}
 
-		sender, ok := sess.udpSubscriber(sub)
-		if !ok {
-			continue
-		}
+			sub, _, _, decodeErr := proto.DecodeFrame(frame)
+			if decodeErr != nil {
+				continue
+			}
 
-		sender.enqueue(proto.EncodeSubscriberFrame(flow, payload))
+			sender, live := sess.udpSubscriber(sub)
+			if !live {
+				continue
+			}
+
+			// The frame aliases data rather than being copied out of it.
+			// That's safe to hand to another goroutine: quic-go allocates
+			// a fresh slice per received datagram and never reuses it, so
+			// data stays valid for as long as the sender holds a frame
+			// pointing into it.
+			sender.Enqueue(frame)
+		}
 	}
 }
 
-// pumpSubscriberDatagrams reads datagrams off subConn, tags them with id,
-// and forwards each to the session's publisher - the subscriber-to-
+// pumpSubscriberDatagrams reads datagrams off subConn, stamps them with
+// id, and forwards each to the session's publisher - the subscriber-to-
 // publisher direction of UDP fan-out. A datagram arriving before the
 // publisher has attached its own UDP connection is dropped rather than
 // buffered, same as any other UDP packet with nowhere to go yet.
 // Forwarding goes through the publisher's udpSender rather than a direct
 // SendDatagram call - see udpSender's doc comment for why this loop must
 // never block on a slow destination.
+//
+// id is written over whatever the subscriber put in each header rather
+// than trusted from it: a peer that stamped another subscriber's id would
+// otherwise have its traffic delivered to that subscriber's local clients.
+//
+// Unlike the publisher-to-subscribers direction, this one needs no
+// regrouping - every frame in the datagram is bound for the same place,
+// the session's one publisher - so relay restamps each frame where it lies
+// and forwards the datagram whole. It crosses relay already coalesced,
+// with no allocation and no copy of any payload.
 func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.SubscriberID, subConn *quic.Conn) error {
 	for {
 		data, err := subConn.ReceiveDatagram(ctx)
@@ -238,9 +280,13 @@ func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.Subscr
 			return err
 		}
 
-		flow, payload, err := proto.DecodeSubscriberFrame(data)
-		if err != nil {
-			continue
+		frames := proto.NewFrameReader(data)
+		for {
+			frame, ok := frames.Next()
+			if !ok {
+				break
+			}
+			_ = proto.SetFrameSubscriber(frame, id) // length already checked by the reader
 		}
 
 		sender, ok := sess.udpPublisherSender()
@@ -248,7 +294,7 @@ func pumpSubscriberDatagrams(ctx context.Context, sess *session, id proto.Subscr
 			continue
 		}
 
-		sender.enqueue(proto.EncodePublisherFrame(id, flow, payload))
+		sender.enqueue(data)
 	}
 }
 
