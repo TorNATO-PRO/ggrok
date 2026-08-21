@@ -20,13 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"tornato.dev/ggrok/v2/internal/dgram"
 	"tornato.dev/ggrok/v2/internal/proto"
 	"tornato.dev/ggrok/v2/internal/streamio"
 )
@@ -210,17 +207,6 @@ func (r *Registry) Subscribe(
 		return 0, nil, fmt.Errorf("ack subscriber: %w", err)
 	}
 
-	if mode == proto.ModeUDP {
-		// listen presents this same id back in its UDPAttach handshake
-		// when it dials relay's QUIC data connection, so relay can tell
-		// which already-registered subscriber that datagram-only
-		// connection belongs to - see AttachSubscriberUDP.
-		if err := proto.WriteSubscriberID(control, id); err != nil {
-			release()
-			return 0, nil, fmt.Errorf("send subscriber id: %w", err)
-		}
-	}
-
 	r.logger.Info("subscriber attached",
 		peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Any("sub", id))
 
@@ -382,27 +368,6 @@ type session struct {
 
 	nextReqID uint64
 	pending   map[uint64]net.Conn
-
-	// udpPublisher wraps the publisher's relay<->share UDP data-plane QUIC
-	// connection - nil for a TCP-mode session, or a UDP-mode session
-	// before AttachPublisherUDP completes. Sends to it go through the
-	// udpSender rather than a direct SendDatagram call - see udpSender's
-	// doc comment in udp.go for why.
-	udpPublisher *udpSender
-
-	// udpSubscribers holds each attached subscriber's relay<->listen UDP
-	// data-plane connection, wrapped the same way, keyed by the same
-	// SubscriberID assigned in addSubscriber.
-	//
-	// It's an atomic pointer to an immutable map rather than a plain map
-	// under s.mu because the fan-out loop looks a subscriber up once per
-	// *frame* (see pumpPublisherDatagrams), while entries are added and
-	// removed only when a subscriber attaches or detaches. Readers get a
-	// lock-free load and never contend with each other or with the
-	// control-plane work s.mu also covers; writers still hold s.mu while
-	// they clone, mutate and swap, so two of them can't lose each other's
-	// change.
-	udpSubscribers atomic.Pointer[map[proto.SubscriberID]*dgram.Sender]
 }
 
 // subscriberConn is what session tracks per attached subscriber: its
@@ -421,7 +386,6 @@ func newSession(mode proto.Mode, ports uint16, publisher *tls.Conn, publisherCer
 		subscribers:   make(map[proto.SubscriberID]*subscriberConn),
 		pending:       make(map[uint64]net.Conn),
 	}
-	s.udpSubscribers.Store(&map[proto.SubscriberID]*dgram.Sender{})
 
 	return s
 }
@@ -464,64 +428,6 @@ func (s *session) removeSubscriber(id proto.SubscriberID) {
 	s.mu.Lock()
 	delete(s.subscribers, id)
 	s.mu.Unlock()
-}
-
-// subscriberCert returns the certificate id's control connection
-// authenticated with, if id is still a live subscriber.
-func (s *session) subscriberCert(id proto.SubscriberID) (*x509.Certificate, error) {
-	s.mu.Lock()
-	sc, ok := s.subscribers[id]
-	s.mu.Unlock()
-
-	if !ok {
-		return nil, fmt.Errorf("unknown subscriber %d", id)
-	}
-
-	return peerLeafCert(sc.control)
-}
-
-// setUDPPublisher records sender as the session's publisher UDP
-// data-plane connection; a nil sender clears it.
-func (s *session) setUDPPublisher(sender *udpSender) {
-	s.mu.Lock()
-	s.udpPublisher = sender
-	s.mu.Unlock()
-}
-
-// udpPublisherSender returns the session's publisher UDP data-plane
-// connection, if one has attached.
-func (s *session) udpPublisherSender() (*udpSender, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.udpPublisher, s.udpPublisher != nil
-}
-
-// setUDPSubscriber records sender as id's UDP data-plane connection.
-func (s *session) setUDPSubscriber(id proto.SubscriberID, sender *dgram.Sender) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	next := maps.Clone(*s.udpSubscribers.Load())
-	next[id] = sender
-	s.udpSubscribers.Store(&next)
-}
-
-// removeUDPSubscriber forgets id's UDP data-plane connection.
-func (s *session) removeUDPSubscriber(id proto.SubscriberID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	next := maps.Clone(*s.udpSubscribers.Load())
-	delete(next, id)
-	s.udpSubscribers.Store(&next)
-}
-
-// udpSubscriber returns id's UDP data-plane connection, if it has
-// attached one. This is the per-frame lookup on relay's fan-out path, so
-// it takes no lock - see the udpSubscribers field.
-func (s *session) udpSubscriber(id proto.SubscriberID) (*dgram.Sender, bool) {
-	sender, ok := (*s.udpSubscribers.Load())[id]
-	return sender, ok
 }
 
 // addPending stashes conn under a freshly allocated RequestID and arms a
@@ -611,21 +517,10 @@ func (s *session) shutdown(reason proto.SessionCloseReason) int {
 		controls = append(controls, sub.control)
 	}
 
-	udpPublisher := s.udpPublisher
-	// The map is immutable once stored, so this snapshot stays safe to
-	// walk after the lock is dropped.
-	udpSubscribers := *s.udpSubscribers.Load()
 	s.mu.Unlock()
 
 	for _, conn := range pending {
 		_ = conn.Close()
-	}
-
-	if udpPublisher != nil {
-		_ = udpPublisher.conn.CloseWithError(0, "")
-	}
-	for _, sender := range udpSubscribers {
-		sender.Close()
 	}
 
 	for _, control := range controls {

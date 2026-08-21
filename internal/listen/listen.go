@@ -102,16 +102,6 @@ func Run(ctx context.Context, cfg Config) error {
 	switch cfg.Mode {
 	case proto.ModeTCP:
 		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token, cfg.OnListen)
-	case proto.ModeUDP:
-		subID, err := readSubscriberID(control)
-		if err != nil {
-			return fmt.Errorf("listen: %w", err)
-		}
-		quicConn, err := dialUDPConn(ctx, tlsConf, cfg.Server, cfg.Token, subID)
-		if err != nil {
-			return fmt.Errorf("listen: %w", err)
-		}
-		return runUDP(ctx, control, quicConn, cfg.Addr, subID, cfg.OnListen)
 	default:
 		return fmt.Errorf("listen: unsupported mode %v", cfg.Mode)
 	}

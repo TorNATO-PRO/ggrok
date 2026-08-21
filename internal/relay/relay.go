@@ -8,8 +8,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/quic-go/quic-go"
-
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/mtls"
@@ -17,30 +15,15 @@ import (
 )
 
 // helloTimeout bounds how long relay waits for a freshly accepted TCP
-// connection to send its ConnKind and then a Hello (control) or Attach
-// (data) - a peer that connects and never sends anything would otherwise
-// sit open forever. udpAttachTimeout is its QUIC-listener counterpart.
-const (
-	helloTimeout     = 10 * time.Second
-	udpAttachTimeout = 10 * time.Second
-)
+// connection to send its ConnKind and then a Hello (control) or Attach (data).
+// A peer that connects and never sends anything would otherwise sit open forever.
+const helloTimeout = 10 * time.Second
 
 // heartbeatSilenceTimeout is how long relay waits without receiving
 // anything on a control connection before treating the peer as dead.
 // share/listen send a ControlPing well inside this window, so exceeding
 // it means the peer is gone or hung - see runHeartbeatLoop.
 const heartbeatSilenceTimeout = 30 * time.Second
-
-// udpKeepAlivePeriod and udpMaxIdleTimeout keep a UDP-mode data-plane QUIC
-// connection alive through long idle stretches between datagrams, and let
-// relay notice one that's gone dark. There's no application-level
-// heartbeat on this connection (unlike the TCP control connection) - its
-// liveness is entirely quic-go's own PING-frame keepalive, which these
-// enable (quic-go disables keep-alives by default).
-const (
-	udpKeepAlivePeriod = 15 * time.Second
-	udpMaxIdleTimeout  = 30 * time.Second
-)
 
 // Config is the input to Run.
 type Config struct {
@@ -91,21 +74,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = listener.Close() }()
 
-	quicConf := &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: udpKeepAlivePeriod,
-		MaxIdleTimeout:  udpMaxIdleTimeout,
-	}
-	quicListener, err := quic.ListenAddr(cfg.Listen.String(), tlsConf, quicConf)
-	if err != nil {
-		return fmt.Errorf("relay: listen quic on %s: %w", cfg.Listen, err)
-	}
-	defer func() { _ = quicListener.Close() }()
-
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
-		_ = quicListener.Close()
 	}()
 
 	logger := cfg.Logger
@@ -113,8 +84,6 @@ func Run(ctx context.Context, cfg Config) error {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	registry := NewRegistry(logger)
-
-	go runQUICAcceptLoop(ctx, logger, registry, quicListener)
 
 	for {
 		conn, err := listener.Accept()
@@ -278,58 +247,5 @@ func handleDataConn(ctx context.Context, logger *slog.Logger, registry *Registry
 
 	default:
 		_ = conn.Close()
-	}
-}
-
-// runQUICAcceptLoop accepts every UDP-mode data-plane connection relay's
-// QUIC listener receives and dispatches each to its own handleQUICConn
-// goroutine, until ctx is canceled.
-func runQUICAcceptLoop(ctx context.Context, logger *slog.Logger, registry *Registry, quicListener *quic.Listener) {
-	for {
-		conn, err := quicListener.Accept(ctx)
-		if err != nil {
-			return
-		}
-
-		go handleQUICConn(ctx, logger, registry, conn)
-	}
-}
-
-// handleQUICConn reads the UDPAttach a peer sends on the first stream of
-// a fresh UDP-mode data connection and dispatches to Registry.
-// AttachPublisherUDP or AttachSubscriberUDP, which write the ack
-// themselves (mirroring AttachSubscriberData's pattern) and, on success,
-// block for the connection's whole life pumping its datagrams. It always
-// closes conn before returning, since (unlike TCP-mode's data
-// connections) nothing else ever takes over that responsibility - a QUIC
-// connection isn't spliced into anything, it's read and written directly
-// by the pump functions.
-func handleQUICConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *quic.Conn) {
-	defer func() { _ = conn.CloseWithError(0, "") }()
-
-	streamCtx, cancel := context.WithTimeout(ctx, udpAttachTimeout)
-	stream, err := conn.AcceptStream(streamCtx)
-	cancel()
-	if err != nil {
-		logger.WarnContext(ctx, "accept udp attach stream", "peer", conn.RemoteAddr(), "err", err)
-		return
-	}
-
-	attach, err := proto.ReadUDPAttach(stream)
-	if err != nil {
-		logger.WarnContext(ctx, "read udp attach", "peer", conn.RemoteAddr(), "err", err)
-		return
-	}
-
-	switch attach.Role {
-	case proto.RolePublish:
-		if err := registry.AttachPublisherUDP(ctx, stream, conn, attach.Token); err != nil {
-			logger.WarnContext(ctx, "attach publisher udp", "peer", conn.RemoteAddr(), "err", err)
-		}
-
-	case proto.RoleSubscribe:
-		if err := registry.AttachSubscriberUDP(ctx, stream, conn, attach.Token, attach.SubscriberID); err != nil {
-			logger.WarnContext(ctx, "attach subscriber udp", "peer", conn.RemoteAddr(), "err", err)
-		}
 	}
 }

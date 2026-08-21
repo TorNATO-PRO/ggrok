@@ -38,18 +38,14 @@ const (
 	RoleSubscribe
 )
 
-// Mode says whether a session forwards a TCP or a UDP service. The zero
-// value is deliberately unused by either constant, so a zeroed Hello is
-// never mistaken for a valid one.
+// Mode says whether a session forwards a TCP service.
+// The zero value is deliberately unused, so a zeroed Hello is never mistaken
+// for a valid one.
 type Mode uint8
 
 const (
-	// ModeTCP forwards a local TCP service, one QUIC stream per
-	// connection.
+	// ModeTCP forwards a local TCP service, one QUIC stream per connection.
 	ModeTCP Mode = iota + 1
-
-	// ModeUDP forwards a local UDP service, framed over QUIC datagrams.
-	ModeUDP
 )
 
 // String names a mode for logs and error messages, where the raw number
@@ -58,20 +54,16 @@ func (m Mode) String() string {
 	switch m {
 	case ModeTCP:
 		return "tcp"
-	case ModeUDP:
-		return "udp"
 	default:
 		return fmt.Sprintf("invalid mode (%d)", uint8(m))
 	}
 }
 
 // helloSize is the fixed wire size of a Hello: 1 byte Role + 1 byte Mode +
-// 2 byte Ports + 16 byte Token. Fixed width means no length prefix is
-// needed.
+// 2 byte Ports + 16 byte Token. Fixed width means no length prefix is needed.
 const helloSize = 1 + 1 + 2 + tokenSize
 
-// helloPortsOffset locates the Ports field, which sits ahead of the token
-// so the two variable-meaning enum bytes and the count stay together.
+// helloPortsOffset locates the Ports field, which comes after the mode.
 const helloPortsOffset = 2
 
 // Hello is the first message a peer sends relay on the first stream it
@@ -97,7 +89,7 @@ func WriteHello(w io.Writer, h Hello) error {
 	if h.Role != RolePublish && h.Role != RoleSubscribe {
 		return fmt.Errorf("write hello: invalid role %d", h.Role)
 	}
-	if h.Mode != ModeTCP && h.Mode != ModeUDP {
+	if h.Mode != ModeTCP {
 		return fmt.Errorf("write hello: invalid mode %d", h.Mode)
 	}
 	if h.Ports == 0 {
@@ -134,7 +126,7 @@ func ReadHello(r io.Reader) (Hello, error) {
 	if h.Role != RolePublish && h.Role != RoleSubscribe {
 		return Hello{}, fmt.Errorf("read hello: invalid role %d", h.Role)
 	}
-	if h.Mode != ModeTCP && h.Mode != ModeUDP {
+	if h.Mode != ModeTCP {
 		return Hello{}, fmt.Errorf("read hello: invalid mode %d", h.Mode)
 	}
 	if h.Ports == 0 {

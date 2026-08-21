@@ -85,12 +85,6 @@ func Run(ctx context.Context, cfg Config) error {
 	switch cfg.Mode {
 	case proto.ModeTCP:
 		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token)
-	case proto.ModeUDP:
-		quicConn, err := dialUDPConn(ctx, tlsConf, cfg.Server, cfg.Token)
-		if err != nil {
-			return fmt.Errorf("share: %w", err)
-		}
-		return runUDP(ctx, control, quicConn, cfg.Addr)
 	default:
 		return fmt.Errorf("share: unsupported mode %v", cfg.Mode)
 	}

@@ -189,7 +189,7 @@ func TestHelloRoundTrip(t *testing.T) {
 
 	cases := []proto.Hello{
 		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, Token: token},
-		{Role: proto.RoleSubscribe, Mode: proto.ModeUDP, Ports: 1024, Token: token},
+		{Role: proto.RoleSubscribe, Mode: proto.ModeTCP, Ports: 1024, Token: token},
 	}
 
 	for _, want := range cases {
@@ -313,49 +313,5 @@ func TestSessionCloseReasonStringsUnknownValue(t *testing.T) {
 
 	if got := proto.SessionCloseReason(200).String(); got == "" {
 		t.Error("unknown reason rendered as empty string")
-	}
-}
-
-func TestUDPAttachRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	token, err := proto.NewToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cases := []proto.UDPAttach{
-		{Role: proto.RolePublish, Token: token},
-		{Role: proto.RoleSubscribe, Token: token, SubscriberID: 0x2a2a},
-	}
-
-	for _, want := range cases {
-		var buf bytes.Buffer
-		if err := proto.WriteUDPAttach(&buf, want); err != nil {
-			t.Fatalf("WriteUDPAttach(%+v): %v", want, err)
-		}
-
-		got, err := proto.ReadUDPAttach(&buf)
-		if err != nil {
-			t.Fatalf("ReadUDPAttach: %v", err)
-		}
-		if got != want {
-			t.Errorf("got %+v, want %+v", got, want)
-		}
-	}
-}
-
-func TestReadUDPAttachRejectsInvalidRole(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	if err := proto.WriteUDPAttach(&buf, proto.UDPAttach{Role: proto.RolePublish}); err != nil {
-		t.Fatal(err)
-	}
-
-	raw := buf.Bytes()
-	raw[0] = 0 // corrupt the Role byte
-	if _, err := proto.ReadUDPAttach(bytes.NewReader(raw)); err == nil {
-		t.Error("expected error for invalid role, got nil")
 	}
 }

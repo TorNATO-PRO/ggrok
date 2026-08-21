@@ -2,8 +2,7 @@ package ca
 
 import (
 	"bufio"
-	"crypto/ecdsa"
-	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -32,8 +31,8 @@ const (
 	// pemTypeCertificate defines a constant for the PEM type.
 	pemTypeCertificate = "CERTIFICATE"
 
-	// pemTypeECKey defines a constant for the EC Key.
-	pemTypeECKey = "EC PRIVATE KEY"
+	// pemTypeMLDSAKey defines a constant for ML-DSA keys (serialized as PKCS#8).
+	pemTypeMLDSAKey = "PRIVATE KEY"
 
 	// SerialTextBase is the base certificate serials are rendered in, both
 	// for their PEM filename under the issued/revoked subdirectories and for
@@ -74,7 +73,7 @@ type CA struct {
 	// key is the private key - remember not to upload this
 	// to a relay server. This should live on a node that is
 	// acting as the host for the CA.
-	key *ecdsa.PrivateKey
+	key any // *mldsa.SigningKey65
 }
 
 // IssueRequest describes a certificate to be signed.
@@ -111,7 +110,7 @@ func Init(commonName string, validity time.Duration) (*Bundle, error) {
 		validity = DefaultCAValidity
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := mldsa.GenerateKey(mldsa.MLDSA65())
 	if err != nil {
 		return nil, fmt.Errorf("generate ca key: %w", err)
 	}
@@ -150,12 +149,14 @@ func Load(certPEM, keyPEM []byte) (*CA, error) {
 		return nil, fmt.Errorf("no PEM block found in CA key")
 	}
 
-	key, err := parseECKey(block)
+	key, err := parsePrivateKey(block)
 	if err != nil {
 		return nil, err
 	}
 
-	if !key.PublicKey.Equal(cert.PublicKey) {
+	// Verify that the key matches the certificate's public key
+	keyPublicKey := key.(*mldsa.PrivateKey).PublicKey() //nolint:errcheck // PublicKey() does not return an error
+	if !keyPublicKey.Equal(cert.PublicKey) {
 		return nil, fmt.Errorf("CA Key does not match CA certificate")
 	}
 
@@ -180,7 +181,7 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		)
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := mldsa.GenerateKey(mldsa.MLDSA65())
 	if err != nil {
 		return nil, fmt.Errorf("generate device key: %w", err)
 	}
@@ -203,9 +204,7 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		Subject:      pkix.Name{CommonName: request.CommonName},
 		NotBefore:    now.Add(-5 * time.Minute),
 		NotAfter:     now.Add(request.Validity),
-		// Digital signature only: keyEncipherment is an RSA key-transport
-		// concept and is prohibited for EC public keys (RFC 8813), which
-		// is all this CA ever issues.
+		// Digital signature only: keyEncipherment is not valid for ML-DSA.
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: usages,
 		DNSNames:    request.DNSNames,
@@ -215,7 +214,7 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		IsCA:                  false,
 	}
 
-	derEncodedSignedCert, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
+	derEncodedSignedCert, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, key.PublicKey(), c.key)
 	if err != nil {
 		return nil, fmt.Errorf("sign certificate: %w", err)
 	}
@@ -439,8 +438,8 @@ func defineCertificate(commonName string, validity time.Duration) (*x509.Certifi
 }
 
 // signCertificate is responsible for signing a certificate.
-func signCertificate(certTemplate *x509.Certificate, key *ecdsa.PrivateKey) ([]byte, error) {
-	derEncodedCertificate, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &key.PublicKey, key)
+func signCertificate(certTemplate *x509.Certificate, key *mldsa.PrivateKey) ([]byte, error) {
+	derEncodedCertificate, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, key.PublicKey(), key)
 	if err != nil {
 		return nil, fmt.Errorf("self-sign ca certificate: %w", err)
 	}
@@ -450,15 +449,15 @@ func signCertificate(certTemplate *x509.Certificate, key *ecdsa.PrivateKey) ([]b
 
 // buildBundle creates the bundle from the signed
 // certificate and the private key.
-func buildBundle(derEncodedCertificate []byte, key *ecdsa.PrivateKey) (*Bundle, error) {
+func buildBundle(derEncodedCertificate []byte, key *mldsa.PrivateKey) (*Bundle, error) {
 	// recreate the certificate from the derEncodedCertificate
 	cert, err := x509.ParseCertificate(derEncodedCertificate)
 	if err != nil {
 		return nil, fmt.Errorf("parse generated certificate: %w", err)
 	}
 
-	// convert the key into DER
-	keyDER, err := x509.MarshalECPrivateKey(key)
+	// convert the ML-DSA key into PKCS#8 DER format
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		return nil, fmt.Errorf("marshal private key: %w", err)
 	}
@@ -466,29 +465,27 @@ func buildBundle(derEncodedCertificate []byte, key *ecdsa.PrivateKey) (*Bundle, 
 	return &Bundle{
 		Cert:    cert,
 		CertPEM: pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: derEncodedCertificate}),
-		KeyPEM:  pem.EncodeToMemory(&pem.Block{Type: pemTypeECKey, Bytes: keyDER}),
+		KeyPEM:  pem.EncodeToMemory(&pem.Block{Type: pemTypeMLDSAKey, Bytes: keyDER}),
 	}, nil
 }
 
-// parseECKey takes a PEM block and returns the private key
-// that is located within that block.
-func parseECKey(block *pem.Block) (*ecdsa.PrivateKey, error) {
-	switch block.Type {
-	case pemTypeECKey:
-		return x509.ParseECPrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		ecKey, ok := key.(*ecdsa.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("expected an ECDSA key, got %T", key)
-		}
-		return ecKey, nil
-	default:
-		return nil, fmt.Errorf("unexpected PEM block type %q", block.Type)
+// parsePrivateKey takes a PEM block and returns the ML-DSA private key.
+func parsePrivateKey(block *pem.Block) (any, error) {
+	if block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("expected PKCS#8 private key, got %q", block.Type)
 	}
+
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKCS#8 key: %w", err)
+	}
+
+	mldsaKey, ok := key.(*mldsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("expected an ML-DSA key, got %T", key)
+	}
+
+	return mldsaKey, nil
 }
 
 // newSerial draws a random 128-bit serial. Random rather than sequential so

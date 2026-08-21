@@ -29,12 +29,7 @@ import (
 type listenConfig struct {
 	nodeConnConfig
 
-	// mode is proto.ModeTCP or proto.ModeUDP, set by whichever of -tcp/-udp
-	// was given; exactly one is required.
-	mode proto.Mode
-
-	// addr is the local address listen binds - a TCP listener or a UDP
-	// socket, per mode, one per port in the range.
+	// addr is the local address listen binds - a TCP listener, one per port in the range.
 	addr hostport.Range
 
 	// token identifies which publisher's session to subscribe to.
@@ -45,7 +40,7 @@ type listenConfig struct {
 const listenUsage = `ggrok listen - subscribe to a share's session and forward it to local ports
 
 Usage:
-  ggrok listen -tcp|-udp <addr> [flags] <token>
+  ggrok listen -tcp <addr> [flags] <token>
 
 An <addr> is host:port, or host:first-last to bind a whole range of ports
 at once. The range must be the same size as the one the share forwards;
@@ -84,35 +79,17 @@ func parseListenFlags(args []string) (listenConfig, error) {
 	var cfg listenConfig
 	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg.nodeConnConfig)
 
-	var addrSet bool
-	setMode := func(m proto.Mode) func(string) error {
-		return func(addr string) error {
-			if addrSet {
-				return fmt.Errorf("-tcp and -udp are mutually exclusive")
-			}
-
+	fs.Func(
+		"tcp",
+		"local address or range to bind, forwarding each connection through the tunnel",
+		func(addr string) error {
 			ports, parseErr := hostport.ParseRange(addr)
 			if parseErr != nil {
 				return parseErr
 			}
-
 			cfg.addr = ports
-			cfg.mode = m
-			addrSet = true
 			return nil
-		}
-	}
-	fs.Func(
-		"tcp",
-		"local address or range to bind, forwarding each connection through the tunnel "+
-			"(mutually exclusive with -udp)",
-		setMode(proto.ModeTCP),
-	)
-	fs.Func(
-		"udp",
-		"local address or range to bind, forwarding each client's datagrams through the tunnel "+
-			"(mutually exclusive with -tcp)",
-		setMode(proto.ModeUDP),
+		},
 	)
 
 	if err = parseFlags(fs, args); err != nil {
@@ -123,9 +100,9 @@ func parseListenFlags(args []string) (listenConfig, error) {
 		return listenConfig{}, err
 	}
 
-	if !addrSet {
+	if cfg.addr.Len() == 0 {
 		fs.Usage()
-		return listenConfig{}, fmt.Errorf("exactly one of -tcp or -udp is required")
+		return listenConfig{}, fmt.Errorf("-tcp <addr> is required")
 	}
 
 	tokenStr := os.Getenv("GGROK_TOKEN")
@@ -163,7 +140,7 @@ func runListen(args []string) error {
 		CertFile: cfg.certFile,
 		KeyFile:  cfg.keyFile,
 		CAFile:   cfg.caFile,
-		Mode:     cfg.mode,
+		Mode:     proto.ModeTCP,
 		Addr:     cfg.addr,
 		Token:    cfg.token,
 		OnListen: func(addr net.Addr) {

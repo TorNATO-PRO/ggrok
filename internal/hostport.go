@@ -25,8 +25,6 @@ const (
 )
 
 // HostPort is host:port where host is either a resolved IP or a DNS name.
-//
-//nolint:recvcheck // UnmarshalText needs a pointer receiver to satisfy encoding.TextUnmarshaler; every other method uses a value receiver since HostPort is a small, cheaply-copied value type.
 type HostPort struct {
 	// kind is the kind of the HostPort
 	kind Kind
@@ -148,8 +146,6 @@ var ErrInvalidRange = errors.New("hostport: invalid port range")
 // themselves: what crosses the wire is an index into the range (see
 // proto.PortIndex), so a share on 8000-8010 can be reached by a listen
 // bound to 9000-9010, index for index.
-//
-//nolint:recvcheck // same split as HostPort: UnmarshalText needs a pointer receiver to satisfy encoding.TextUnmarshaler, everything else is a value receiver on a small value type.
 type Range struct {
 	// base is the first port of the range, paired with the host every
 	// port in it shares.
