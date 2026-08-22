@@ -46,11 +46,12 @@ func TestAttachRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sid := proto.DeriveSessionID(token)
 
 	cases := []proto.Attach{
-		{Kind: proto.AttachSubscriber, Token: token},
-		{Kind: proto.AttachSubscriber, Token: token, Port: 0xfffe},
-		{Kind: proto.AttachPublisher, Token: token, RequestID: 0xdeadbeef},
+		{Kind: proto.AttachSubscriber, SessionID: sid},
+		{Kind: proto.AttachSubscriber, SessionID: sid, Port: 0xfffe},
+		{Kind: proto.AttachPublisher, SessionID: sid, RequestID: 0xdeadbeef},
 	}
 
 	for _, want := range cases {
@@ -187,9 +188,11 @@ func TestHelloRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sid := proto.DeriveSessionID(token)
+
 	cases := []proto.Hello{
-		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, Token: token},
-		{Role: proto.RoleSubscribe, Mode: proto.ModeTCP, Ports: 1024, Token: token},
+		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, SessionID: sid},
+		{Role: proto.RoleSubscribe, Mode: proto.ModeTCP, Ports: 1024, SessionID: sid},
 	}
 
 	for _, want := range cases {

@@ -1,22 +1,20 @@
 // Package relay is the rendezvous point between share (publisher) and
-// listen (subscriber) connections: it pairs them by token. For TCP-mode
-// sessions it splices their forwarded connections together (see
-// registry.go's AttachSubscriberData/AttachPublisherData and udp.go's TCP
-// counterparts don't exist - TCP-mode's data plane is plain spliced
-// bytes). For UDP-mode sessions each party holds its own persistent QUIC
-// connection to relay, and relay fans datagrams between them by the
-// SubscriberID in the header of each one (see udp.go) - the one place
-// relay loses "dumb pipe" purity, since it has to read that header to
-// know where a datagram goes. The FlowID and PortIndex beside it mean
-// nothing to relay and pass through untouched; only the two peers know
-// which local client and which port they name.
+// listen (subscriber) connections: it pairs them by SessionID and splices
+// their forwarded connections together (see AttachSubscriberData and
+// AttachPublisherData).
+//
+// relay is a dumb pipe by construction. A session's SessionID is derived
+// from its token, and the keys protecting the forwarded bytes are derived
+// separately from that same token - so relay holds enough to route a
+// session and not enough to read one. What it splices is ciphertext
+// (see proto.EncryptedConn), and the only things it interprets are the
+// Hello and Attach that name the session and the control frames that keep
+// it alive.
 package relay
 
 import (
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,8 +31,8 @@ import (
 // deliberately reject a peer. The first three map 1:1 to proto.AckStatus
 // values.
 var (
-	errPublisherExists  = errors.New("token already has an active publisher")
-	errNoSuchSession    = errors.New("no active session for this token")
+	errPublisherExists  = errors.New("session already has an active publisher")
+	errNoSuchSession    = errors.New("no active session for this identifier")
 	errModeMismatch     = errors.New("mode does not match this session's publisher")
 	errPortsMismatch    = errors.New("port count does not match this session's publisher")
 	errPortOutOfRange   = errors.New("port index is past the end of this session's range")
@@ -51,17 +49,23 @@ const pendingRequestTimeout = 10 * time.Second
 // session.shutdown.
 const notifyWriteTimeout = 5 * time.Second
 
-// sessionTagBytes is how much of a token's hash sessionAttr logs. Six
-// bytes is far too little to attack the token behind it and far more than
-// enough to keep concurrent sessions distinguishable in a log.
-const sessionTagBytes = 6
+// sessionAttr identifies a session in the logs without writing the whole
+// SessionID there. The SessionID is what a peer presents to attach to a
+// session, so anyone reading one out of a log file could take a subscriber
+// slot on a live tunnel - they could not decrypt any of it, but that is a
+// property of the data keys, not a reason to publish the identifier. A
+// truncated form ties a publisher, its subscribers and their streams
+// together across log lines and does nothing else.
+func sessionAttr(id proto.SessionID) slog.Attr {
+	return slog.String("session", id.LogTag())
+}
 
-// Registry holds every currently-active session, keyed by token.
+// Registry holds every currently-active session, keyed by SessionID.
 type Registry struct {
 	logger *slog.Logger
 
 	mu       sync.Mutex
-	sessions map[proto.Token]*session
+	sessions map[proto.SessionID]*session
 }
 
 // NewRegistry returns an empty Registry. logger records session lifecycle
@@ -72,7 +76,7 @@ func NewRegistry(logger *slog.Logger) *Registry {
 		logger = slog.Default()
 	}
 
-	return &Registry{logger: logger, sessions: make(map[proto.Token]*session)}
+	return &Registry{logger: logger, sessions: make(map[proto.SessionID]*session)}
 }
 
 // peerAttr describes who is on the other end of conn for a log line: its
@@ -97,26 +101,20 @@ func peerAttr(conn net.Conn) slog.Attr {
 	return slog.Group("peer", addr, slog.String("cn", cert.Subject.CommonName))
 }
 
-// sessionAttr identifies a session in the logs without ever writing its
-// token there. The token is a bearer secret - anyone reading it out of a
-// log file could subscribe to the session - so what gets logged is a
-// truncated hash of it, which is enough to tie a publisher, its
-// subscribers, and their streams together across log lines and nothing
-// more.
-func sessionAttr(token proto.Token) slog.Attr {
-	sum := sha256.Sum256(token[:])
-	return slog.String("session", hex.EncodeToString(sum[:sessionTagBytes]))
-}
-
-// Register adds control as token's publisher control connection and
+// Register adds control as sessionID's publisher control connection and
 // writes the corresponding ack to control. ports is how many consecutive
 // ports the publisher forwards, which every subscriber then has to match.
 // On success it returns an unregister func the caller must invoke (e.g.
-// via defer) once control is done, so a later publish under the same token
+// via defer) once control is done, so a later publish under the same sessionID
 // can succeed; the returned error is nil. On failure the returned func is
 // nil and the error describes why - the caller owns closing control in
 // that case.
-func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mode, ports uint16) (func(), error) {
+func (r *Registry) Register(
+	control *tls.Conn,
+	sessionID proto.SessionID,
+	mode proto.Mode,
+	ports uint16,
+) (func(), error) {
 	publisherCert, err := peerLeafCert(control)
 	if err != nil {
 		_ = proto.WriteAck(control, proto.AckNoSuchSession)
@@ -124,29 +122,29 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 	}
 
 	r.mu.Lock()
-	if _, exists := r.sessions[token]; exists {
+	if _, exists := r.sessions[sessionID]; exists {
 		r.mu.Unlock()
 		_ = proto.WriteAck(control, proto.AckPublisherExists)
 		return nil, errPublisherExists
 	}
 
 	sess := newSession(mode, ports, control, publisherCert)
-	r.sessions[token] = sess
+	r.sessions[sessionID] = sess
 	r.mu.Unlock()
 
 	if err := proto.WriteAck(control, proto.AckOK); err != nil {
 		r.mu.Lock()
-		delete(r.sessions, token)
+		delete(r.sessions, sessionID)
 		r.mu.Unlock()
 		return nil, fmt.Errorf("ack publisher: %w", err)
 	}
 
 	r.logger.Info("publisher registered",
-		peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Int("ports", int(ports)))
+		peerAttr(control), sessionAttr(sessionID), slog.Any("mode", mode), slog.Int("ports", int(ports)))
 
 	return func() {
 		r.mu.Lock()
-		delete(r.sessions, token)
+		delete(r.sessions, sessionID)
 		r.mu.Unlock()
 
 		// Deleting the session above only stops peers that haven't looked
@@ -154,13 +152,20 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 		// waits on a publisher that is never coming back.
 		notified := sess.shutdown(proto.ReasonPublisherGone)
 
-		r.logger.Info("publisher disconnected",
-			peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Int("subscribers_notified", notified))
+		r.logger.Info(
+			"publisher disconnected",
+			peerAttr(
+				control,
+			),
+			sessionAttr(sessionID),
+			slog.Any("mode", mode),
+			slog.Int("subscribers_notified", notified),
+		)
 	}, nil
 }
 
 // Subscribe attaches control as a subscriber's control connection to
-// token's session and writes the corresponding ack. ports is how many
+// sessionID's session and writes the corresponding ack. ports is how many
 // consecutive ports the subscriber binds, which must match what the
 // session's publisher registered: the two sides address ports by index
 // into their own ranges, so a subscriber binding more ports than the
@@ -172,12 +177,12 @@ func (r *Registry) Register(control *tls.Conn, token proto.Token, mode proto.Mod
 // that case.
 func (r *Registry) Subscribe(
 	control *tls.Conn,
-	token proto.Token,
+	sessionID proto.SessionID,
 	mode proto.Mode,
 	ports uint16,
 ) (proto.SubscriberID, func(), error) {
 	r.mu.Lock()
-	sess, ok := r.sessions[token]
+	sess, ok := r.sessions[sessionID]
 	r.mu.Unlock()
 
 	switch {
@@ -208,24 +213,24 @@ func (r *Registry) Subscribe(
 	}
 
 	r.logger.Info("subscriber attached",
-		peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Any("sub", id))
+		peerAttr(control), sessionAttr(sessionID), slog.Any("mode", mode), slog.Any("sub", id))
 
 	return id, func() {
 		release()
 		r.logger.Info("subscriber detached",
-			peerAttr(control), sessionAttr(token), slog.Any("mode", mode), slog.Any("sub", id))
+			peerAttr(control), sessionAttr(sessionID), slog.Any("mode", mode), slog.Any("sub", id))
 	}, nil
 }
 
-// sessionFor looks up token's session, if any.
-func (r *Registry) sessionFor(token proto.Token) (*session, bool) {
+// sessionFor looks up sessionID's session, if any.
+func (r *Registry) sessionFor(sessionID proto.SessionID) (*session, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	sess, ok := r.sessions[token]
+	sess, ok := r.sessions[sessionID]
 	return sess, ok
 }
 
-// AttachSubscriberData validates token (and that its session is TCP-mode,
+// AttachSubscriberData validates sessionID (and that its session is TCP-mode,
 // and that port names one of its ports), writes the corresponding ack to
 // subConn, and - on success - registers subConn as pending under a freshly
 // minted RequestID and asks the publisher to fulfill it via a
@@ -240,8 +245,8 @@ func (r *Registry) sessionFor(token proto.Token) (*session, bool) {
 // AttachPublisherData's Splice or the timeout closes it). On a non-nil
 // error, subConn is still the caller's to close; this func has not taken
 // ownership of it.
-func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token, port proto.PortIndex) error {
-	sess, ok := r.sessionFor(token)
+func (r *Registry) AttachSubscriberData(subConn net.Conn, sessionID proto.SessionID, port proto.PortIndex) error {
+	sess, ok := r.sessionFor(sessionID)
 	switch {
 	case !ok:
 		_ = proto.WriteAck(subConn, proto.AckNoSuchSession)
@@ -277,7 +282,7 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token, por
 	}
 
 	r.logger.Info("stream requested",
-		peerAttr(subConn), sessionAttr(token), slog.Uint64("req", reqID), slog.Any("port", port))
+		peerAttr(subConn), sessionAttr(sessionID), slog.Uint64("req", reqID), slog.Any("port", port))
 
 	return nil
 }
@@ -290,13 +295,13 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, token proto.Token, por
 // forged; the caller owns closing pubConn in that case.
 //
 // pubConn must present the same client certificate the session's
-// publisher registered with. The token alone can't gate this: every
-// subscriber holds it too, and request IDs are guessable (sequential),
+// publisher registered with. The sessionID alone can't gate this: every
+// subscriber knows it too, and request IDs are guessable (sequential),
 // so without the cert check a malicious subscriber could race the real
 // publisher to claim another subscriber's pending connection and
 // impersonate the shared service.
-func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn *tls.Conn) error {
-	sess, ok := r.sessionFor(token)
+func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, pubConn *tls.Conn) error {
+	sess, ok := r.sessionFor(sessionID)
 	if !ok {
 		return errNoSuchSession
 	}
@@ -317,7 +322,7 @@ func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn 
 	started := time.Now()
 	r.logger.Info(
 		"stream paired",
-		sessionAttr(token), slog.Uint64("req", reqID),
+		sessionAttr(sessionID), slog.Uint64("req", reqID),
 		slog.Group("subscriber", "addr", subConn.RemoteAddr()),
 		slog.Group("publisher", "addr", pubConn.RemoteAddr()),
 	)
@@ -329,7 +334,7 @@ func (r *Registry) AttachPublisherData(token proto.Token, reqID uint64, pubConn 
 
 	r.logger.Info(
 		"stream closed",
-		sessionAttr(token), slog.Uint64("req", reqID),
+		sessionAttr(sessionID), slog.Uint64("req", reqID),
 		slog.Int64("bytes_to_subscriber", toSub), slog.Int64("bytes_to_publisher", toPub),
 		slog.Duration("duration", time.Since(started).Round(time.Millisecond)),
 	)

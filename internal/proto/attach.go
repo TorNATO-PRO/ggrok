@@ -24,11 +24,11 @@ const (
 )
 
 // attachSize is the fixed wire size of an Attach: 1 byte Kind + 16 byte
-// Token + 8 byte RequestID + 2 byte Port. attachRequestOffset and
-// attachPortOffset locate the two numeric fields behind the token.
+// SessionID + 8 byte RequestID + 2 byte Port. attachRequestOffset and
+// attachPortOffset locate the two numeric fields behind the SessionID.
 const (
-	attachSize          = 1 + tokenSize + 8 + 2
-	attachRequestOffset = 1 + tokenSize
+	attachSize          = 1 + SessionIDSize + 8 + 2
+	attachRequestOffset = 1 + SessionIDSize
 	attachPortOffset    = attachRequestOffset + 8
 )
 
@@ -38,7 +38,7 @@ const (
 // with its counterpart and starts splicing.
 type Attach struct {
 	Kind      AttachKind
-	Token     Token
+	SessionID SessionID
 	RequestID uint64
 
 	// Port is which port of the session's range the subscriber accepted
@@ -58,7 +58,7 @@ func WriteAttach(w io.Writer, a Attach) error {
 
 	var buf [attachSize]byte
 	buf[0] = byte(a.Kind)
-	copy(buf[1:], a.Token[:])
+	copy(buf[1:], a.SessionID[:])
 	binary.BigEndian.PutUint64(buf[attachRequestOffset:], a.RequestID)
 	binary.BigEndian.PutUint16(buf[attachPortOffset:], uint16(a.Port))
 
@@ -78,7 +78,7 @@ func ReadAttach(r io.Reader) (Attach, error) {
 	}
 
 	a := Attach{Kind: AttachKind(buf[0])}
-	copy(a.Token[:], buf[1:1+tokenSize])
+	copy(a.SessionID[:], buf[1:attachRequestOffset])
 	a.RequestID = binary.BigEndian.Uint64(buf[attachRequestOffset:])
 	a.Port = PortIndex(binary.BigEndian.Uint16(buf[attachPortOffset:]))
 

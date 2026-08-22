@@ -197,6 +197,10 @@ func runTCP(
 		}
 	}()
 
+	// Derived once rather than per data connection: it is a fixed function of
+	// the token, and every connection this share opens names the same session.
+	sessionID := proto.DeriveSessionID(token)
+
 	fulfill := func(reqID uint64, port proto.PortIndex) {
 		// relay checks the index against the port count this share
 		// registered, but relay is the one that supplied it - so it's
@@ -212,8 +216,17 @@ func runTCP(
 			return
 		}
 
-		attach := proto.Attach{Kind: proto.AttachPublisher, Token: token, RequestID: reqID}
+		attach := proto.Attach{Kind: proto.AttachPublisher, SessionID: sessionID, RequestID: reqID}
 		if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
+			_ = dataConn.Close()
+			return
+		}
+
+		// Everything past the Attach is sealed end-to-end, so relay splices
+		// ciphertext: it pairs this connection with a subscriber's by
+		// SessionID without holding the token those keys come from.
+		tunnel, err := proto.NewEncryptedConn(dataConn, token, proto.RolePublish)
+		if err != nil {
 			_ = dataConn.Close()
 			return
 		}
@@ -225,7 +238,7 @@ func runTCP(
 			return
 		}
 
-		streamio.Splice(dataConn, localConn)
+		streamio.Splice(tunnel, localConn)
 	}
 
 	return runControlLoop(ctx, control, fulfill)

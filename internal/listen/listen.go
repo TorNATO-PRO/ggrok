@@ -308,13 +308,15 @@ func forward(
 	token proto.Token,
 	port proto.PortIndex,
 ) {
+	sessionID := proto.DeriveSessionID(token)
+
 	dataConn, err := dialData(ctx, server, tlsConf)
 	if err != nil {
 		_ = local.Close()
 		return
 	}
 
-	attach := proto.Attach{Kind: proto.AttachSubscriber, Token: token, Port: port}
+	attach := proto.Attach{Kind: proto.AttachSubscriber, SessionID: sessionID, Port: port}
 	if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
 		_ = dataConn.Close()
 		_ = local.Close()
@@ -328,7 +330,17 @@ func forward(
 		return
 	}
 
-	streamio.Splice(local, dataConn)
+	// Everything past relay's ack is sealed end-to-end, so what relay splices
+	// is ciphertext: it pairs this connection with the publisher's by
+	// SessionID without holding the token those keys come from.
+	tunnel, err := proto.NewEncryptedConn(dataConn, token, proto.RoleSubscribe)
+	if err != nil {
+		_ = dataConn.Close()
+		_ = local.Close()
+		return
+	}
+
+	streamio.Splice(local, tunnel)
 }
 
 // runControlLoop sends a ControlPing on control every heartbeatInterval

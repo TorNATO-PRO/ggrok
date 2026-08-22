@@ -172,7 +172,7 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 
 	switch hello.Role {
 	case proto.RolePublish:
-		unregister, err := registry.Register(conn, hello.Token, hello.Mode, hello.Ports)
+		unregister, err := registry.Register(conn, hello.SessionID, hello.Mode, hello.Ports)
 		if err != nil {
 			logger.WarnContext(ctx, "register publisher", "peer", conn.RemoteAddr(), "err", err)
 			return
@@ -182,7 +182,7 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 		runHeartbeatLoop(ctx, conn)
 
 	case proto.RoleSubscribe:
-		_, release, err := registry.Subscribe(conn, hello.Token, hello.Mode, hello.Ports)
+		_, release, err := registry.Subscribe(conn, hello.SessionID, hello.Mode, hello.Ports)
 		if err != nil {
 			logger.WarnContext(ctx, "subscribe", "peer", conn.RemoteAddr(), "err", err)
 			return
@@ -234,13 +234,13 @@ func handleDataConn(ctx context.Context, logger *slog.Logger, registry *Registry
 
 	switch attach.Kind {
 	case proto.AttachSubscriber:
-		if err := registry.AttachSubscriberData(conn, attach.Token, attach.Port); err != nil {
+		if err := registry.AttachSubscriberData(conn, attach.SessionID, attach.Port); err != nil {
 			logger.WarnContext(ctx, "attach subscriber data", "peer", conn.RemoteAddr(), "err", err)
 			_ = conn.Close()
 		}
 
 	case proto.AttachPublisher:
-		if err := registry.AttachPublisherData(attach.Token, attach.RequestID, conn); err != nil {
+		if err := registry.AttachPublisherData(attach.SessionID, attach.RequestID, conn); err != nil {
 			logger.WarnContext(ctx, "attach publisher data", "peer", conn.RemoteAddr(), "err", err)
 			_ = conn.Close()
 		}
