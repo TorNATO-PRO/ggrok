@@ -1,9 +1,8 @@
-// Package listen is the subscriber side of a TCP/UDP tunnel: it dials
-// relay, presents a token under proto.RoleSubscribe, and binds a local
-// port. For TCP, every local connection accepted dials a fresh data
-// connection to relay, attached to the session by token, and gets
-// spliced to whatever share pairs it with; for UDP, every local client's
-// datagrams are framed with a FlowID and forwarded the same way.
+// Package listen is the subscriber side of a tunnel: it dials relay, presents
+// a session under proto.RoleSubscribe, and binds one local port per port the
+// publisher forwards. Every local connection accepted dials a fresh data
+// connection to relay, attaches it to the session, and gets spliced to
+// whatever share pairs it with - over an encrypted tunnel relay cannot read.
 package listen
 
 import (
@@ -54,11 +53,11 @@ type Config struct {
 	// Mode is which kind of local service Addr binds.
 	Mode proto.Mode
 
-	// Addr is the local address listen binds - a TCP listener or a UDP
-	// socket per port, per Mode. It must span as many ports as the
-	// session's publisher forwards, though not the same numbers: the two
-	// ranges are matched index for index (see proto.PortIndex), and relay
-	// turns away a subscriber whose range is a different size.
+	// Addr is the local address listen binds - one TCP listener per port. It
+	// must span as many ports as the session's publisher forwards, though not
+	// the same numbers: the two ranges are matched index for index (see
+	// proto.PortIndex), and relay turns away a subscriber whose range is a
+	// different size.
 	Addr hostport.Range
 
 	// Token identifies which publisher's session to subscribe to.
@@ -308,13 +307,15 @@ func forward(
 	token proto.Token,
 	port proto.PortIndex,
 ) {
+	sessionID := proto.DeriveSessionID(token)
+
 	dataConn, err := dialData(ctx, server, tlsConf)
 	if err != nil {
 		_ = local.Close()
 		return
 	}
 
-	attach := proto.Attach{Kind: proto.AttachSubscriber, Token: token, Port: port}
+	attach := proto.Attach{Kind: proto.AttachSubscriber, SessionID: sessionID, Port: port}
 	if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
 		_ = dataConn.Close()
 		_ = local.Close()
@@ -328,7 +329,17 @@ func forward(
 		return
 	}
 
-	streamio.Splice(local, dataConn)
+	// Everything past relay's ack is sealed end-to-end, so what relay splices
+	// is ciphertext: it pairs this connection with the publisher's by
+	// SessionID without holding the token those keys come from.
+	tunnel, err := proto.NewEncryptedConn(dataConn, token, proto.RoleSubscribe)
+	if err != nil {
+		_ = dataConn.Close()
+		_ = local.Close()
+		return
+	}
+
+	streamio.Splice(local, tunnel)
 }
 
 // runControlLoop sends a ControlPing on control every heartbeatInterval

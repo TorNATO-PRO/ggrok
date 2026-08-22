@@ -1,6 +1,7 @@
-// Package streamio pipes bytes between two full-duplex byte streams -
-// shared by share (local TCP conn <-> QUIC stream), listen (same, other
-// direction), and relay (subscriber stream <-> publisher stream).
+// Package streamio pipes bytes between two full-duplex byte streams - shared
+// by share (local service <-> encrypted tunnel), listen (local client <->
+// encrypted tunnel), and relay (subscriber connection <-> publisher
+// connection).
 package streamio
 
 import (
@@ -13,15 +14,14 @@ import (
 const directions = 2
 
 // copyBufferSize is the per-direction [io.Copy] buffer size. [io.Copy]'s
-// built-in default is 32KiB; a larger buffer trades a bit of memory for
-// fewer Read/Write calls per byte moved. This only takes effect on legs
-// where neither side is a *[net.TCPConn] - relay's subscriber<->publisher
-// QUIC streams (internal/relay/registry.go) - since *[net.TCPConn]
-// implements [io.ReaderFrom]/io.WriterTo, which [io.CopyBuffer] detects and
-// hands off to Go's own internal copy loop, silently ignoring this buffer.
-// That's the case on both legs of listen's and share's local-conn<->QUIC
-// splices, so this buffer is a no-op there. Benchmarked ~15% throughput
-// gain on the QUIC-stream-to-QUIC-stream leg (BenchmarkSplice).
+// built-in default is 32KiB; a larger buffer trades a bit of memory for fewer
+// Read/Write calls per byte moved.
+//
+// It only takes effect on legs where neither side is a *[net.TCPConn], since
+// *[net.TCPConn] implements [io.ReaderFrom]/[io.WriterTo] and [io.CopyBuffer]
+// hands those off to Go's own copy loop, silently ignoring this buffer. So it
+// applies to the encrypted tunnel legs in share and listen, and is a no-op
+// wherever a raw TCP connection sits on both sides.
 const copyBufferSize = 128 * 1024
 
 // bufPool recycles copy buffers across Splice calls so each forwarded

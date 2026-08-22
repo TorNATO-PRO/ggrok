@@ -7,21 +7,22 @@ import (
 	"io"
 )
 
-// ALPN is the protocol identifier both ends of every TLS connection in
-// ggrok negotiate (see internal/mtls.LoadConfig's NextProtos), so a peer
-// speaking some other protocol on the same port can't be mistaken for a
-// ggrok node.
+// ALPN is the protocol identifier both ends of every TLS connection in ggrok
+// negotiate (see internal/mtls.LoadConfig's NextProtos), so a peer speaking
+// some other protocol on the same port can't be mistaken for a ggrok node.
 //
-// Bumped to ggrok/3 when port ranges widened the datagram header again,
-// to six bytes, to carry the PortIndex a frame belongs to (see
-// FrameHeaderSize), and widened Hello and Attach to match. Every past bump
-// has had the same character: a peer speaking the older version frames its
-// datagrams differently, so a newer peer parses the header at the wrong
-// offsets and reads a different subscriber, flow and port entirely -
-// traffic silently delivered to the wrong local client rather than an
-// error. The version is part of the ALPN so that mismatch is refused
-// during the handshake instead of being discovered as misrouted packets.
-const ALPN = "ggrok/3"
+// The version has to change whenever the meaning of bytes on the wire does,
+// even when their layout is unchanged. Every message here is fixed-width with
+// no self-description, so peers that disagree about what a field means still
+// parse each other's messages successfully and act on the wrong values - a
+// failure that surfaces as traffic going somewhere it shouldn't rather than
+// as an error. Negotiating the version in the handshake turns that into a
+// clean refusal to connect.
+//
+// The current version covers: TCP-only sessions, Hello and Attach naming a
+// session by its derived SessionID rather than by its token, and a data
+// plane whose bytes are sealed end-to-end (see EncryptedConn).
+const ALPN = "ggrok/4"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never
@@ -38,13 +39,16 @@ const (
 	RoleSubscribe
 )
 
-// Mode says whether a session forwards a TCP service.
-// The zero value is deliberately unused, so a zeroed Hello is never mistaken
-// for a valid one.
+// Mode says what kind of service a session forwards. There is only one today,
+// but both ends still declare it and relay still checks that a subscriber
+// matches its publisher, so adding a second kind cannot silently pair two
+// peers that disagree. The zero value is deliberately unused, so a zeroed
+// Hello is never mistaken for a valid one.
 type Mode uint8
 
 const (
-	// ModeTCP forwards a local TCP service, one QUIC stream per connection.
+	// ModeTCP forwards a local TCP service, one data connection to relay per
+	// forwarded connection.
 	ModeTCP Mode = iota + 1
 )
 
@@ -60,19 +64,20 @@ func (m Mode) String() string {
 }
 
 // helloSize is the fixed wire size of a Hello: 1 byte Role + 1 byte Mode +
-// 2 byte Ports + 16 byte Token. Fixed width means no length prefix is needed.
-const helloSize = 1 + 1 + 2 + tokenSize
+// 2 byte Ports + 16 byte SessionID. Fixed width means no length prefix is
+// needed. helloSessionOffset locates the SessionID behind the port count.
+const (
+	helloSize          = 1 + 1 + 2 + SessionIDSize
+	helloPortsOffset   = 2
+	helloSessionOffset = helloPortsOffset + 2
+)
 
-// helloPortsOffset locates the Ports field, which comes after the mode.
-const helloPortsOffset = 2
-
-// Hello is the first message a peer sends relay on the first stream it
-// opens against a connection, identifying itself and which session it
-// wants to publish or subscribe to.
+// Hello is the first message a peer sends relay on a control connection,
+// identifying itself and which session it wants to publish or subscribe to.
 type Hello struct {
-	Role  Role
-	Mode  Mode
-	Token Token
+	Role      Role
+	Mode      Mode
+	SessionID SessionID
 
 	// Ports is how many consecutive ports this peer forwards (publish) or
 	// binds (subscribe) - see hostport.Range. Both ends of a session must
@@ -100,7 +105,7 @@ func WriteHello(w io.Writer, h Hello) error {
 	buf[0] = byte(h.Role)
 	buf[1] = byte(h.Mode)
 	binary.BigEndian.PutUint16(buf[helloPortsOffset:], h.Ports)
-	copy(buf[helloPortsOffset+2:], h.Token[:])
+	copy(buf[helloSessionOffset:], h.SessionID[:])
 
 	if _, err := w.Write(buf[:]); err != nil {
 		return fmt.Errorf("write hello: %w", err)
@@ -121,7 +126,7 @@ func ReadHello(r io.Reader) (Hello, error) {
 		Mode:  Mode(buf[1]),
 		Ports: binary.BigEndian.Uint16(buf[helloPortsOffset:]),
 	}
-	copy(h.Token[:], buf[helloPortsOffset+2:])
+	copy(h.SessionID[:], buf[helloSessionOffset:])
 
 	if h.Role != RolePublish && h.Role != RoleSubscribe {
 		return Hello{}, fmt.Errorf("read hello: invalid role %d", h.Role)
@@ -146,7 +151,7 @@ const (
 	// registered (publish) or bridged (subscribe).
 	AckOK AckStatus = iota
 
-	// AckNoSuchSession means a subscriber's token has no active
+	// AckNoSuchSession means a subscriber's SessionID has no active
 	// publisher.
 	AckNoSuchSession
 
@@ -154,7 +159,7 @@ const (
 	// session's publisher.
 	AckModeMismatch
 
-	// AckPublisherExists means a publisher's token already has an
+	// AckPublisherExists means a publisher's SessionID already has an
 	// active publisher.
 	AckPublisherExists
 
@@ -203,13 +208,18 @@ func ReadAck(r io.Reader) (AckStatus, error) {
 	return AckStatus(buf[0]), nil
 }
 
-// Handshake writes a Hello for role/mode/ports/token on stream and waits
-// for relay's ack, returning a descriptive error if relay rejected it.
-// Shared by share (RolePublish) and listen (RoleSubscribe): both open a
-// control stream and need the same send-Hello/await-ack handling before
-// doing anything else on the connection.
+// Handshake writes a Hello for role/mode/ports on stream and waits for
+// relay's ack, returning a descriptive error if relay rejected it. Shared by
+// share (RolePublish) and listen (RoleSubscribe): both open a control stream
+// and need the same send-Hello/await-ack handling before doing anything else
+// on the connection.
+//
+// token itself never reaches the wire - what identifies the session to relay
+// is its derived SessionID, which is enough to route by and not enough to
+// decrypt with.
 func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, token Token) error {
-	if err := WriteHello(stream, Hello{Role: role, Mode: mode, Ports: ports, Token: token}); err != nil {
+	sessionID := DeriveSessionID(token)
+	if err := WriteHello(stream, Hello{Role: role, Mode: mode, Ports: ports, SessionID: sessionID}); err != nil {
 		return err
 	}
 
@@ -221,15 +231,10 @@ func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, token T
 	return status.Err()
 }
 
-// SubscriberID identifies one listen connection within a session, assigned
-// by relay when it bridges a subscriber.
+// SubscriberID identifies one listen connection within a session, assigned by
+// relay when it bridges a subscriber. It is relay's own bookkeeping - it
+// never reaches either peer.
 type SubscriberID uint16
-
-// FlowID identifies one local UDP client within a subscriber's own
-// connection, assigned by listen. Together with SubscriberID it
-// disambiguates every local UDP client of every subscriber sharing one
-// publisher connection.
-type FlowID uint16
 
 // PortIndex names one port by its offset within a session's range rather
 // than by number - index 0 is the first port share forwards and the first

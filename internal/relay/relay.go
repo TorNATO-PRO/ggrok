@@ -27,9 +27,8 @@ const heartbeatSilenceTimeout = 30 * time.Second
 
 // Config is the input to Run.
 type Config struct {
-	// Listen is the address relay's TCP listener binds to. Its UDP-mode
-	// QUIC listener binds the same host:port - TCP and UDP have separate
-	// port namespaces, so this never conflicts.
+	// Listen is the address relay's TCP listener binds to, carrying both
+	// control connections and per-stream data connections.
 	Listen hostport.HostPort
 
 	// CertFile, KeyFile, and CAFile identify relay to its peers and
@@ -51,12 +50,11 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Run listens for TCP and QUIC connections on Config.Listen and brokers
-// them between share (publisher) and listen (subscriber) peers until ctx
-// is canceled. TCP carries every control connection and TCP-mode's data
-// connections; QUIC carries only UDP-mode's data-plane connections, one
-// per attached publisher/subscriber, each already implied to exist by a
-// prior TCP control connection's successful Register/Subscribe.
+// Run listens on Config.Listen and brokers connections between share
+// (publisher) and listen (subscriber) peers until ctx is canceled. Every
+// connection announces itself with a proto.ConnKind: one control connection
+// per peer for the life of its session, and one short-lived data connection
+// per forwarded stream.
 func Run(ctx context.Context, cfg Config) error {
 	revoked, err := loadRevokedSerials(cfg.RevokedFile)
 	if err != nil {
@@ -129,11 +127,11 @@ func loadRevokedSerials(path string) (map[string]struct{}, error) {
 	return serials, nil
 }
 
-// handleConn reads the ConnKind a peer sends immediately after connecting
-// - before anything else, including the TLS handshake proper, which
-// Read/Write trigger lazily - and dispatches to handleControlConn or
-// handleDataConn. It owns closing conn only for the cases where neither
-// of those takes over that responsibility (see their doc comments).
+// handleConn reads the ConnKind a peer sends immediately after connecting -
+// which is also what drives the TLS handshake, since Read/Write trigger it
+// lazily - and dispatches to handleControlConn or handleDataConn. It owns
+// closing conn only in the cases where neither of those takes over that
+// responsibility (see their doc comments).
 func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(helloTimeout))
 
@@ -172,7 +170,7 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 
 	switch hello.Role {
 	case proto.RolePublish:
-		unregister, err := registry.Register(conn, hello.Token, hello.Mode, hello.Ports)
+		unregister, err := registry.Register(conn, hello.SessionID, hello.Mode, hello.Ports)
 		if err != nil {
 			logger.WarnContext(ctx, "register publisher", "peer", conn.RemoteAddr(), "err", err)
 			return
@@ -182,7 +180,7 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 		runHeartbeatLoop(ctx, conn)
 
 	case proto.RoleSubscribe:
-		_, release, err := registry.Subscribe(conn, hello.Token, hello.Mode, hello.Ports)
+		_, release, err := registry.Subscribe(conn, hello.SessionID, hello.Mode, hello.Ports)
 		if err != nil {
 			logger.WarnContext(ctx, "subscribe", "peer", conn.RemoteAddr(), "err", err)
 			return
@@ -218,8 +216,8 @@ func runHeartbeatLoop(ctx context.Context, conn *tls.Conn) {
 	}
 }
 
-// handleDataConn reads the Attach a peer sends on a fresh TCP-mode data
-// connection and pairs it with its counterpart via the registry. It
+// handleDataConn reads the Attach a peer sends on a fresh data connection and
+// pairs it with its counterpart via the registry. It
 // closes conn itself only on a failure path - on success, ownership of
 // conn has passed into Registry.AttachSubscriberData/AttachPublisherData
 // (see their doc comments for why).
@@ -234,13 +232,13 @@ func handleDataConn(ctx context.Context, logger *slog.Logger, registry *Registry
 
 	switch attach.Kind {
 	case proto.AttachSubscriber:
-		if err := registry.AttachSubscriberData(conn, attach.Token, attach.Port); err != nil {
+		if err := registry.AttachSubscriberData(conn, attach.SessionID, attach.Port); err != nil {
 			logger.WarnContext(ctx, "attach subscriber data", "peer", conn.RemoteAddr(), "err", err)
 			_ = conn.Close()
 		}
 
 	case proto.AttachPublisher:
-		if err := registry.AttachPublisherData(attach.Token, attach.RequestID, conn); err != nil {
+		if err := registry.AttachPublisherData(attach.SessionID, attach.RequestID, conn); err != nil {
 			logger.WarnContext(ctx, "attach publisher data", "peer", conn.RemoteAddr(), "err", err)
 			_ = conn.Close()
 		}

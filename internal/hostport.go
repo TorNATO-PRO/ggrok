@@ -124,11 +124,9 @@ func (h HostPort) MarshalText() ([]byte, error) {
 	return []byte(h.String()), nil
 }
 
-// MaxPorts bounds how many ports one Range may span. A share or listen
-// holds a live socket per port in its range for the whole session, so the
-// span is a direct multiplier on file descriptors and - for listen's UDP
-// mode - on socket buffer memory, which is sized generously per socket
-// (see listen's udpSocketBufferSize). A thousand is far past any plausible
+// MaxPorts bounds how many ports one Range may span. A share or listen holds
+// a live socket per port in its range for the whole session, so the span is a
+// direct multiplier on file descriptors. A thousand is far past any plausible
 // service and still nowhere near a default fd limit.
 const MaxPorts = 1024
 

@@ -1,14 +1,11 @@
-// The listen subcommand creates a control connection to the relay server
-// and subscribes to a share's session by token, then binds a local port
-// per port the share forwards: for -tcp, every local connection accepted
-// dials a fresh data connection to relay, attached to the session by token
-// and tagged with the port it arrived on; for -udp, every local client's
-// datagrams are forwarded the same way, framed with a FlowID so relay can
-// route replies back to the right local client of the right listen
-// subscriber.
+// The listen subcommand creates a control connection to the relay server and
+// subscribes to a share's session by token, then binds one local port per
+// port the share forwards. Every local connection accepted dials a fresh data
+// connection to relay, attached to the session and tagged with the port it
+// arrived on, and is spliced to whatever share pairs it with.
 //
 // listen is a persistent local listener rather than a one-shot transfer -
-// forwarding a TCP/UDP service is inherently repeatable.
+// forwarding a TCP service is inherently repeatable.
 
 package main
 

@@ -1,6 +1,11 @@
-// Package proto is the tiny control-plane wire format shared by share,
-// listen, and relay: the token that scopes a subscriber to one publisher's
-// session, and the Hello handshake a peer sends relay to identify itself.
+// Package proto is the wire format shared by share, listen, and relay: the
+// token that scopes a subscriber to one publisher's session, the values
+// derived from it (see crypto.go), the Hello and Attach a peer sends relay to
+// identify itself, and the control frames that keep a session alive.
+//
+// It also owns the data plane's encryption (see EncryptedConn), because the
+// split between what relay may read and what only the two peers may read is a
+// property of this wire format rather than of either peer.
 package proto
 
 import (

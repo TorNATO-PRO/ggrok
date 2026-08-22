@@ -1,8 +1,9 @@
-// Package share is the publisher side of a TCP/UDP tunnel: it dials relay,
-// registers a token under proto.RolePublish, and for every stream/flow
-// relay hands it, connects to a local service and forwards bytes. relay
-// itself never terminates TCP or UDP - it only pairs this connection with
-// however many listen subscribers present the matching token.
+// Package share is the publisher side of a tunnel: it dials relay, registers
+// under proto.RolePublish, and for every connection relay asks it for, dials
+// the local service and forwards bytes. relay never terminates the forwarded
+// service - it only pairs this connection with however many listen
+// subscribers present the matching token, and what it splices between them is
+// ciphertext only the two peers can read.
 package share
 
 import (
@@ -46,11 +47,11 @@ type Config struct {
 	// Mode is which kind of local service Addr names.
 	Mode proto.Mode
 
-	// Addr is the local service being forwarded - share dials it fresh
-	// for every new stream (TCP) or NAT flow (UDP). A range of more than
-	// one port forwards each of them, and every subscriber has to bind a
-	// range of the same size: what crosses the wire is an index into this
-	// range, not a port number (see proto.PortIndex).
+	// Addr is the local service being forwarded - share dials it fresh for
+	// every connection relay asks it for. A range of more than one port
+	// forwards each of them, and every subscriber has to bind a range of the
+	// same size: what crosses the wire is an index into this range, not a
+	// port number (see proto.PortIndex).
 	Addr hostport.Range
 
 	// Token scopes which listen subscribers may reach this session.
@@ -197,6 +198,10 @@ func runTCP(
 		}
 	}()
 
+	// Derived once rather than per data connection: it is a fixed function of
+	// the token, and every connection this share opens names the same session.
+	sessionID := proto.DeriveSessionID(token)
+
 	fulfill := func(reqID uint64, port proto.PortIndex) {
 		// relay checks the index against the port count this share
 		// registered, but relay is the one that supplied it - so it's
@@ -212,8 +217,17 @@ func runTCP(
 			return
 		}
 
-		attach := proto.Attach{Kind: proto.AttachPublisher, Token: token, RequestID: reqID}
+		attach := proto.Attach{Kind: proto.AttachPublisher, SessionID: sessionID, RequestID: reqID}
 		if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
+			_ = dataConn.Close()
+			return
+		}
+
+		// Everything past the Attach is sealed end-to-end, so relay splices
+		// ciphertext: it pairs this connection with a subscriber's by
+		// SessionID without holding the token those keys come from.
+		tunnel, err := proto.NewEncryptedConn(dataConn, token, proto.RolePublish)
+		if err != nil {
 			_ = dataConn.Close()
 			return
 		}
@@ -225,7 +239,7 @@ func runTCP(
 			return
 		}
 
-		streamio.Splice(dataConn, localConn)
+		streamio.Splice(tunnel, localConn)
 	}
 
 	return runControlLoop(ctx, control, fulfill)

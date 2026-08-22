@@ -1,16 +1,10 @@
-// The share subcommand creates a TCP+mTLS connection to the relay server
-// and forwards a local TCP or UDP service through the tunnel to any number
-// of concurrent listen subscribers holding the session's token.
+// The share subcommand creates a TCP+mTLS connection to the relay server and
+// forwards a local TCP service through the tunnel to any number of concurrent
+// listen subscribers holding the session's token.
 //
-// Either flag takes a single host:port or a host:first-last range, in
-// which case every port in the range is forwarded and each subscriber
-// binds a range of its own of the same size.
-//
-// UDP is forwarded over a dedicated QUIC connection's unreliable datagram
-// extension (RFC 9221), so it keeps UDP's unordered, unreliable delivery
-// semantics - and gets QUIC's congestion control on that connection for
-// free - rather than being flattened into an ordered, retransmitted
-// stream.
+// -tcp takes a single host:port or a host:first-last range, in which case
+// every port in the range is forwarded and each subscriber binds a range of
+// its own of the same size.
 
 package main
 

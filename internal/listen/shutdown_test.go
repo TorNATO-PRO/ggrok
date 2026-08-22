@@ -10,7 +10,7 @@ import (
 	"tornato.dev/ggrok/v2/internal/listen"
 )
 
-// errClosed stands in for what Accept/ReadFromUDP actually return once
+// errClosed stands in for what Accept actually returns once
 // their socket has been closed out from under them.
 var errClosed = fmt.Errorf("use of closed network connection: %w", net.ErrClosed)
 
@@ -23,7 +23,7 @@ func TestShutdownErr(t *testing.T) {
 		return ctx
 	}
 
-	// buffered mirrors how runTCP/runUDP declare the channel: cap 1, so the
+	// buffered mirrors how runTCP declares the channel: cap 1, so the
 	// control loop's send always completes before it cancels ctx.
 	buffered := func(errs ...error) chan error {
 		ch := make(chan error, 1)

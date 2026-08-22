@@ -46,11 +46,12 @@ func TestAttachRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sid := proto.DeriveSessionID(token)
 
 	cases := []proto.Attach{
-		{Kind: proto.AttachSubscriber, Token: token},
-		{Kind: proto.AttachSubscriber, Token: token, Port: 0xfffe},
-		{Kind: proto.AttachPublisher, Token: token, RequestID: 0xdeadbeef},
+		{Kind: proto.AttachSubscriber, SessionID: sid},
+		{Kind: proto.AttachSubscriber, SessionID: sid, Port: 0xfffe},
+		{Kind: proto.AttachPublisher, SessionID: sid, RequestID: 0xdeadbeef},
 	}
 
 	for _, want := range cases {
@@ -187,9 +188,11 @@ func TestHelloRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sid := proto.DeriveSessionID(token)
+
 	cases := []proto.Hello{
-		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, Token: token},
-		{Role: proto.RoleSubscribe, Mode: proto.ModeTCP, Ports: 1024, Token: token},
+		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, SessionID: sid},
+		{Role: proto.RoleSubscribe, Mode: proto.ModeTCP, Ports: 1024, SessionID: sid},
 	}
 
 	for _, want := range cases {
@@ -231,42 +234,6 @@ func TestHelloRejectsZeroPorts(t *testing.T) {
 	raw[2], raw[3] = 0, 0 // zero the Ports field
 	if _, err := proto.ReadHello(bytes.NewReader(raw)); err == nil {
 		t.Error("ReadHello accepted a zero port count, want an error")
-	}
-}
-
-func TestSubscriberIDRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	want := proto.SubscriberID(0x1234)
-	if err := proto.WriteSubscriberID(&buf, want); err != nil {
-		t.Fatal(err)
-	}
-
-	typ, payload, err := proto.ReadControlFrame(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if typ != proto.ControlSubscriberID {
-		t.Errorf("type: got %v, want ControlSubscriberID", typ)
-	}
-
-	got, err := proto.ReadSubscriberID(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Errorf("got %#x, want %#x", got, want)
-	}
-}
-
-func TestReadSubscriberIDRejectsWrongLength(t *testing.T) {
-	t.Parallel()
-
-	for _, payload := range [][]byte{nil, {1}, {1, 2, 3}} {
-		if _, err := proto.ReadSubscriberID(payload); err == nil {
-			t.Errorf("expected error for %d-byte payload, got nil", len(payload))
-		}
 	}
 }
 
