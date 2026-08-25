@@ -4,10 +4,11 @@ package proto
 // about, so those tests can live in the external proto_test package alongside
 // the rest and still reach the things a caller never should.
 
-// FrameLenSize and MaxFramePlaintext are the frame geometry tests slice and
-// size payloads against.
+// FrameLenSize, NoncePrefixSize and MaxFramePlaintext are the frame geometry
+// tests slice and size payloads against.
 const (
 	FrameLenSize      = frameLenSize
+	NoncePrefixSize   = noncePrefixSize
 	MaxFramePlaintext = maxFramePlaintext
 )
 

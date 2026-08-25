@@ -7,7 +7,6 @@ package listen
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -15,30 +14,17 @@ import (
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/mtls"
+	"tornato.dev/ggrok/v2/internal/peer"
 	"tornato.dev/ggrok/v2/internal/proto"
 	"tornato.dev/ggrok/v2/internal/streamio"
 )
 
-// heartbeatInterval is how often listen sends a ControlPing on its
-// control connection to relay. heartbeatSilenceTimeout bounds how long
-// listen waits without receiving anything at all before treating relay
-// as dead - the same window relay itself uses to notice a dead/hung
-// listen, so either side detects the other within a comparable amount of
-// time. TCP-level keepalive (see dialControl) catches a severed network
-// path; this catches a peer that's still connected but hung.
-const (
-	heartbeatInterval       = 10 * time.Second
-	heartbeatSilenceTimeout = 30 * time.Second
-	tcpKeepAliveIdle        = 15 * time.Second
-	tcpKeepAliveInterval    = 15 * time.Second
-	tcpKeepAliveProbeCount  = 2
-)
-
 // ErrSessionClosed reports that relay told this subscriber its session
 // has ended - the publisher went away - rather than listen losing relay
-// itself. Run returns an error wrapping it, so a caller can tell an
-// orderly end of the shared session apart from a broken connection worth
-// retrying.
+// itself. It reaches a caller through Config.OnDisconnect rather than out
+// of Run: a publisher that went away is one of the things listen waits for
+// and resubscribes to, so it explains a gap in service rather than the end
+// of one.
 var ErrSessionClosed = errors.New("session ended")
 
 // Config is the input to Run.
@@ -71,11 +57,26 @@ type Config struct {
 	// live, and the only way for it to know at all when a port was
 	// auto-assigned.
 	OnListen func(net.Addr)
+
+	// OnDisconnect and OnReconnect, if non-nil, report the session losing
+	// relay and getting it back. Run keeps redialing rather than returning
+	// on a lost connection - including one relay ended deliberately, which
+	// arrives here wrapping ErrSessionClosed - so without these a listen
+	// whose publisher has gone is indistinguishable from one nobody is
+	// using. The bound ports stay bound throughout either way; what changes
+	// is that a connection to them can't be forwarded until the session is
+	// back. OnDisconnect is given the error that ended the session and how
+	// long until the next attempt.
+	OnDisconnect func(err error, retryIn time.Duration)
+	OnReconnect  func()
 }
 
-// Run dials relay, subscribes to Config.Token's session, and forwards
-// Config.Addr's local traffic through the tunnel until ctx is canceled or
-// an unrecoverable error occurs.
+// Run subscribes to Config.Token's session and forwards Config.Addr's local
+// traffic through the tunnel until ctx is canceled or an unrecoverable
+// error occurs. A relay that goes away, or a publisher that does, is waited
+// for and resubscribed to rather than reported: see [peer.Session.Serve]
+// for what counts as unrecoverable, and Config.OnDisconnect for how to hear
+// about the rest.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Addr.Len() < 1 {
 		return fmt.Errorf("listen: no local address to bind")
@@ -86,130 +87,67 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	control, err := dialControl(ctx, cfg.Server, tlsConf)
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
-	defer func() { _ = control.Close() }()
-
-	ports := uint16(cfg.Addr.Len()) //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
-
-	if err := proto.Handshake(control, proto.RoleSubscribe, cfg.Mode, ports, cfg.Token); err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
+	session := peer.NewSession(cfg.Server, tlsConf, cfg.Token, proto.RoleSubscribe)
 
 	switch cfg.Mode {
 	case proto.ModeTCP:
-		return runTCP(ctx, control, tlsConf, cfg.Server, cfg.Addr, cfg.Token, cfg.OnListen)
+		return runTCP(ctx, session, cfg)
 	default:
 		return fmt.Errorf("listen: unsupported mode %v", cfg.Mode)
 	}
 }
 
-// dialControl dials relay over TCP+mTLS, writes the ConnControl
-// discriminator, and configures TCP keepalive so a severed network path
-// is noticed promptly even before the application-level heartbeat in
-// runControlLoop would time out.
-func dialControl(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config) (*tls.Conn, error) {
-	conn, err := dialTLS(ctx, server, tlsConf)
-	if err != nil {
-		return nil, err
+// ShutdownErr explains why an accept loop stopped, given the error its
+// listener returned. The listener is closed from under that loop on the way
+// out - by the caller canceling ctx, or by the session giving up and
+// canceling it - so the accept error is a symptom of the shutdown, never
+// its cause, and reporting it verbatim ("use of closed network connection")
+// says nothing true about why we stopped.
+//
+// serveErr holds the better answer when the session is what ended, and it
+// needs no dressing up: it has already outlasted everything a redial could
+// fix, so whatever it carries is the reason listen is stopping. It's only
+// sampled, never waited on - on a plain SIGINT the session is still parked
+// in a read with nothing to report, and blocking for it would stall the
+// exit until its deadline elapsed.
+func ShutdownErr(ctx context.Context, serveErr <-chan error, err error, op string) error {
+	select {
+	case sErr := <-serveErr:
+		return sErr
+	default:
 	}
 
-	setTCPKeepAlive(conn)
-
-	if err := proto.WriteConnKind(conn, proto.ConnControl); err != nil {
-		_ = conn.Close()
-		return nil, err
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
-	return conn, nil
+	return fmt.Errorf("%s: %w", op, err)
 }
 
-// dialData dials a fresh TCP-mode data connection to relay and writes the
-// ConnData discriminator - the first step for every local connection
-// listen accepts. It configures the same TCP keepalive as dialControl:
-// a data connection is spliced raw bytes with no application-level
-// heartbeat of its own, so without this, a path a NAT/firewall silently
-// drops while the tunnel is idle goes unnoticed until the next write.
-func dialData(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config) (*tls.Conn, error) {
-	conn, err := dialTLS(ctx, server, tlsConf)
-	if err != nil {
-		return nil, err
-	}
-
-	setTCPKeepAlive(conn)
-
-	if err := proto.WriteConnKind(conn, proto.ConnData); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
-	return conn, nil
-}
-
-// setTCPKeepAlive best-effort enables TCP keepalive on conn's underlying
-// socket, per tcpKeepAliveIdle/Interval/ProbeCount - a no-op if conn isn't
-// backed by a [net.TCPConn].
-func setTCPKeepAlive(conn *tls.Conn) {
-	tcpConn, ok := conn.NetConn().(*net.TCPConn)
-	if !ok {
-		return
-	}
-
-	_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     tcpKeepAliveIdle,
-		Interval: tcpKeepAliveInterval,
-		Count:    tcpKeepAliveProbeCount,
-	})
-}
-
-// dialTLS is the raw dial shared by dialControl and dialData.
-func dialTLS(ctx context.Context, server hostport.HostPort, tlsConf *tls.Config) (*tls.Conn, error) {
-	dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsConf}
-	conn, err := dialer.DialContext(ctx, "tcp", server.String())
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", server, err)
-	}
-
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		// tls.Dialer.DialContext always returns a *tls.Conn; unreachable
-		// in practice, but fail closed rather than panic on assertion.
-		_ = conn.Close()
-		return nil, fmt.Errorf("dial %s: unexpected connection type %T", server, conn)
-	}
-
-	return tlsConn, nil
-}
-
-// runTCP binds every port in addr and, for each local connection accepted
-// on any of them, dials a fresh data connection to relay, attaches it to
-// token's session tagged with the port it arrived on, and - once relay acks
-// it - splices the two together. It runs until ctx is canceled, one of the
-// local listeners errors, or the control connection dies.
-func runTCP(
-	ctx context.Context,
-	control *tls.Conn,
-	tlsConf *tls.Config,
-	server hostport.HostPort,
-	addr hostport.Range,
-	token proto.Token,
-	onListen func(net.Addr),
-) error {
+// runTCP binds every port in cfg.Addr and, for each local connection
+// accepted on any of them, opens a tunnel tagged with the port it arrived
+// on and splices the two together. It runs until ctx is canceled, one of
+// the local listeners errors, or the session ends for a reason redialing
+// can't fix.
+func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	listeners, err := bindRange(ctx, addr)
+	// The local ports are bound once and held for the life of the process,
+	// across however many sessions that spans. Rebinding them per session
+	// would hand a port-0 listener a different port every time relay
+	// hiccuped, quietly invalidating the address already reported through
+	// OnListen - and in the gap it would refuse connections outright, where
+	// holding the socket at least lets a client connect and be told.
+	listeners, err := bindRange(ctx, cfg.Addr)
 	if err != nil {
 		return err
 	}
 	defer closeAll(listeners)
 
-	if onListen != nil {
+	if cfg.OnListen != nil {
 		for _, ln := range listeners {
-			onListen(ln.Addr())
+			cfg.OnListen(ln.Addr())
 		}
 	}
 
@@ -218,11 +156,28 @@ func runTCP(
 		closeAll(listeners)
 	}()
 
-	controlErr := make(chan error, 1)
+	serveErr := make(chan error, 1)
 	go func() {
-		err := runControlLoop(ctx, control)
-		controlErr <- err
-		cancel() // relay is gone or hung; stop accepting new local connections
+		serveErr <- session.Serve(ctx, peer.ServeConfig{
+			Mode:  cfg.Mode,
+			Ports: uint16(cfg.Addr.Len()), //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
+			// Nothing listen receives on its control connection carries
+			// meaning apart from ControlSessionClosed (ControlRequestData is
+			// publisher-only) - every other frame is just liveness, and what
+			// matters is that reading one at all reset the deadline for the
+			// next.
+			Handle: func(typ proto.ControlType, payload []byte) error {
+				if typ == proto.ControlSessionClosed {
+					return sessionClosedErr(payload)
+				}
+
+				return nil
+			},
+			OnReconnect:  cfg.OnReconnect,
+			OnDisconnect: cfg.OnDisconnect,
+		})
+
+		cancel() // the session is past saving; stop accepting local connections
 	}()
 
 	// One accept loop per port, each reporting into a channel deep enough
@@ -233,14 +188,14 @@ func runTCP(
 	for i, ln := range listeners {
 		port := proto.PortIndex(i)
 		go func() {
-			acceptErr <- acceptLoop(ctx, ln, tlsConf, server, token, port)
+			acceptErr <- acceptLoop(ctx, session, ln, port)
 		}()
 	}
 
 	// Whichever port fails first ends the whole listen. They share a
 	// session, and a subscriber serving some of its range but not the rest
 	// is worse than one that stops and says so.
-	return ShutdownErr(ctx, controlErr, <-acceptErr, "accept")
+	return ShutdownErr(ctx, serveErr, <-acceptErr, "accept")
 }
 
 // bindRange binds a TCP listener on every port in addr, unwinding the ones
@@ -278,10 +233,8 @@ func closeAll(listeners []net.Listener) {
 // on an orderly shutdown means it was closed out from under it.
 func acceptLoop(
 	ctx context.Context,
+	session peer.Session,
 	ln net.Listener,
-	tlsConf *tls.Config,
-	server hostport.HostPort,
-	token proto.Token,
 	port proto.PortIndex,
 ) error {
 	for {
@@ -290,122 +243,24 @@ func acceptLoop(
 			return err
 		}
 
-		go forward(ctx, local, tlsConf, server, token, port)
+		go forward(ctx, session, local, port)
 	}
 }
 
-// forward dials relay a data connection for local, attaches it to token's
-// session at port, and splices the two once relay acks the pairing. Every
-// failure before that point closes both ends, since a local client left
-// connected to a tunnel that never formed would wait on a reply that isn't
-// coming.
-func forward(
-	ctx context.Context,
-	local net.Conn,
-	tlsConf *tls.Config,
-	server hostport.HostPort,
-	token proto.Token,
-	port proto.PortIndex,
-) {
-	sessionID := proto.DeriveSessionID(token)
-
-	dataConn, err := dialData(ctx, server, tlsConf)
+// forward opens a tunnel for local, tagged with the port it arrived on, and
+// splices the two once relay has paired it with the publisher's end.
+func forward(ctx context.Context, session peer.Session, local net.Conn, port proto.PortIndex) {
+	tunnel, err := session.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachSubscriber, Port: port})
 	if err != nil {
-		_ = local.Close()
-		return
-	}
-
-	attach := proto.Attach{Kind: proto.AttachSubscriber, SessionID: sessionID, Port: port}
-	if attachErr := proto.WriteAttach(dataConn, attach); attachErr != nil {
-		_ = dataConn.Close()
-		_ = local.Close()
-		return
-	}
-
-	status, err := proto.ReadAck(dataConn)
-	if err != nil || status.Err() != nil {
-		_ = dataConn.Close()
-		_ = local.Close()
-		return
-	}
-
-	// Everything past relay's ack is sealed end-to-end, so what relay splices
-	// is ciphertext: it pairs this connection with the publisher's by
-	// SessionID without holding the token those keys come from.
-	tunnel, err := proto.NewEncryptedConn(dataConn, token, proto.RoleSubscribe)
-	if err != nil {
-		_ = dataConn.Close()
+		// A local client left connected to a tunnel that never formed would
+		// wait on a reply that isn't coming. This is also what a connection
+		// arriving while the session is between relays gets: closed at once,
+		// so the client sees a failure it can retry rather than a hang.
 		_ = local.Close()
 		return
 	}
 
 	streamio.Splice(local, tunnel)
-}
-
-// runControlLoop sends a ControlPing on control every heartbeatInterval
-// and reads frames off it until ctx is canceled, control errors, relay
-// goes silent for longer than heartbeatSilenceTimeout, or relay reports
-// the session over. Apart from ControlSessionClosed, nothing listen
-// receives here carries meaning (ControlRequestData is publisher-only) -
-// every other frame is just liveness, and what matters is that reading
-// one at all resets the deadline for the next.
-func runControlLoop(ctx context.Context, control *tls.Conn) error {
-	stop := make(chan struct{})
-	defer close(stop)
-	go sendPings(control, stop)
-
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		_ = control.SetReadDeadline(time.Now().Add(heartbeatSilenceTimeout))
-		typ, payload, err := proto.ReadControlFrame(control)
-		if err != nil {
-			return fmt.Errorf("read control frame: %w", err)
-		}
-
-		if typ == proto.ControlSessionClosed {
-			return sessionClosedErr(payload)
-		}
-	}
-}
-
-// ShutdownErr explains why a data-plane loop stopped, given the error its
-// local socket returned. The socket is closed from under that loop on the
-// way out - by the caller canceling ctx, or by the control loop giving up
-// and canceling it - so the read/accept error is a symptom of the
-// shutdown, never its cause, and reporting it verbatim ("use of closed
-// network connection") says nothing true about why we stopped.
-//
-// controlErr holds the better answer when the control loop is what failed,
-// but it's only sampled, never waited on: on a plain SIGINT the control
-// loop is still parked in a read with nothing to report, and blocking for
-// it would stall the exit until its deadline elapsed.
-func ShutdownErr(ctx context.Context, controlErr <-chan error, err error, op string) error {
-	select {
-	case cErr := <-controlErr:
-		return stopReason(cErr)
-	default:
-	}
-
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	return fmt.Errorf("%s: %w", op, err)
-}
-
-// stopReason labels why the data plane stopped, given whatever
-// runControlLoop returned. A session relay deliberately closed is already
-// a complete explanation of itself; anything else is the control
-// connection failing, and should say so.
-func stopReason(err error) error {
-	if errors.Is(err, ErrSessionClosed) {
-		return err
-	}
-
-	return fmt.Errorf("control connection: %w", err)
 }
 
 // sessionClosedErr renders a ControlSessionClosed frame's payload as an
@@ -419,24 +274,4 @@ func sessionClosedErr(payload []byte) error {
 	}
 
 	return fmt.Errorf("%w: %s", ErrSessionClosed, reason)
-}
-
-// sendPings writes a ControlPing on control every heartbeatInterval until
-// stop is closed. A failed write just ends the pinger silently -
-// runControlLoop's own read deadline is what surfaces a dead connection
-// as an error.
-func sendPings(control *tls.Conn, stop <-chan struct{}) {
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			if err := proto.WriteControlFrame(control, proto.ControlPing, nil); err != nil {
-				return
-			}
-		}
-	}
 }

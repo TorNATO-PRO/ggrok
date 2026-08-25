@@ -67,7 +67,10 @@ func (m Mode) String() string {
 // 2 byte Ports + 16 byte SessionID. Fixed width means no length prefix is
 // needed. helloSessionOffset locates the SessionID behind the port count.
 const (
-	helloSize          = 1 + 1 + 2 + SessionIDSize
+	roleByteSize       = 1
+	modeByteSize       = 1
+	portsByteSize      = 2
+	helloSize          = roleByteSize + modeByteSize + portsByteSize + SessionIDSize
 	helloPortsOffset   = 2
 	helloSessionOffset = helloPortsOffset + 2
 )
@@ -168,20 +171,34 @@ const (
 	AckPortsMismatch
 )
 
-// Err returns nil for AckOK, and a descriptive error for every rejection
+// The errors [AckStatus.Err] reports, one per rejection status. They're
+// sentinels rather than fresh errors so a caller can tell the transient
+// rejections apart from the permanent ones: a peer that arrives before its
+// counterpart, or one whose predecessor relay hasn't timed out yet, is
+// turned away with ErrNoSuchSession or ErrPublisherExists and should try
+// again, where a mode or port-count disagreement means the two peers were
+// started with incompatible arguments and no amount of retrying settles it.
+var (
+	ErrNoSuchSession   = errors.New("no active session for this token")
+	ErrModeMismatch    = errors.New("mode does not match this session's publisher")
+	ErrPublisherExists = errors.New("this token already has an active publisher")
+	ErrPortsMismatch   = errors.New("port count does not match this session's publisher")
+)
+
+// Err returns nil for AckOK, and the matching sentinel for every rejection
 // status.
 func (s AckStatus) Err() error {
 	switch s {
 	case AckOK:
 		return nil
 	case AckNoSuchSession:
-		return errors.New("no active session for this token")
+		return ErrNoSuchSession
 	case AckModeMismatch:
-		return errors.New("mode does not match this session's publisher")
+		return ErrModeMismatch
 	case AckPublisherExists:
-		return errors.New("this token already has an active publisher")
+		return ErrPublisherExists
 	case AckPortsMismatch:
-		return errors.New("port count does not match this session's publisher")
+		return ErrPortsMismatch
 	default:
 		return fmt.Errorf("unknown ack status %d", s)
 	}

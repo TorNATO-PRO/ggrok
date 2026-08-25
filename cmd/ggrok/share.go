@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"time"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/proto"
@@ -168,7 +169,25 @@ func runShare(args []string) error {
 		Mode:     proto.ModeTCP,
 		Addr:     cfg.addr,
 		Token:    *cfg.token,
+
+		OnDisconnect: reportDisconnect,
+		OnReconnect:  reportReconnect,
 	})
+}
+
+// reportDisconnect and reportReconnect narrate what share and listen do
+// when relay goes away, which is to keep redialing it. They write to stderr
+// rather than stdout: stdout carries the token and the bound addresses,
+// which people pipe into other things, and a tunnel that flaps for an hour
+// shouldn't append an hour of commentary to that.
+func reportDisconnect(err error, retryIn time.Duration) {
+	fmt.Fprintf(os.Stderr, "lost relay connection: %v; retrying in %s\n", err, retryIn.Round(time.Millisecond))
+}
+
+// reportReconnect notes that a session came back, which is the only signal
+// that the gap reportDisconnect announced is over.
+func reportReconnect() {
+	fmt.Fprintln(os.Stderr, "reconnected to relay")
 }
 
 // suggestedListenAddr is the local address the printed listen command

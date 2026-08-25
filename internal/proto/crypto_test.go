@@ -37,7 +37,14 @@ func newToken(t *testing.T) proto.Token {
 	return token
 }
 
-// sealed returns the frames a peer of the given role writes for plaintext.
+// body strips a stream's nonce prefix and its first frame's length prefix,
+// leaving the ciphertext itself - what a test XORs against another stream's.
+func body(wire []byte) []byte {
+	return wire[proto.NoncePrefixSize+proto.FrameLenSize:]
+}
+
+// sealed returns the frames a peer of the given role writes for plaintext,
+// led by the stream's nonce prefix as it goes out on the wire.
 func sealed(t *testing.T, token proto.Token, role proto.Role, plaintext []byte) []byte {
 	t.Helper()
 
@@ -129,8 +136,8 @@ func TestOppositeDirectionsDoNotShareKeystream(t *testing.T) {
 	pubPlain := []byte("GET /secret HTTP/1.1")
 	subPlain := []byte("HTTP/1.1 200 OK\r\n\r\n")
 
-	c1 := sealed(t, token, proto.RolePublish, pubPlain)[proto.FrameLenSize:]
-	c2 := sealed(t, token, proto.RoleSubscribe, subPlain)[proto.FrameLenSize:]
+	c1 := body(sealed(t, token, proto.RolePublish, pubPlain))
+	c2 := body(sealed(t, token, proto.RoleSubscribe, subPlain))
 
 	for i := range min(len(pubPlain), len(subPlain)) {
 		// Under one shared keystream this reconstructs pubPlain exactly.
@@ -140,6 +147,59 @@ func TestOppositeDirectionsDoNotShareKeystream(t *testing.T) {
 	}
 
 	t.Fatal("ciphertext XOR recovered plaintext: the two directions share a keystream")
+}
+
+// TestStreamsDoNotShareKeystream is the same property one scope out, and the
+// regression test for the reuse that survived the directional fix: the data
+// keys are a pure function of the token, so every stream in a session shares
+// them, and every stream numbers its frames from zero. Two streams in the
+// same direction - two subscribers, or one that connects twice, or one
+// connection after another - therefore sealed their first frames under the
+// same key and nonce until each stream drew a nonce prefix of its own.
+//
+// relay is the party this matters against: it sees every stream's ciphertext
+// and is precisely who the end-to-end layer exists to exclude.
+func TestStreamsDoNotShareKeystream(t *testing.T) {
+	t.Parallel()
+
+	token := newToken(t)
+
+	first := []byte("GET /alice HTTP/1.1")
+	second := []byte("GET /bob   HTTP/1.1")
+
+	// Same token, same role, same session: two forwarded connections.
+	c1 := body(sealed(t, token, proto.RolePublish, first))
+	c2 := body(sealed(t, token, proto.RolePublish, second))
+
+	for i := range min(len(first), len(second)) {
+		// Under one shared keystream this reconstructs first exactly, so a
+		// single byte that survives the XOR proves the streams diverged.
+		if c1[i]^c2[i]^second[i] != first[i] {
+			return
+		}
+	}
+
+	t.Fatal("ciphertext XOR recovered plaintext: two streams in one session share a keystream")
+}
+
+// TestStreamNoncePrefixesDiffer asserts the mechanism the test above measures
+// the effect of, so a regression names itself instead of surfacing as a
+// statistical claim about XORed bytes.
+func TestStreamNoncePrefixesDiffer(t *testing.T) {
+	t.Parallel()
+
+	token := newToken(t)
+
+	first := sealed(t, token, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
+	second := sealed(t, token, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
+
+	if bytes.Equal(first, second) {
+		t.Fatal("two streams drew the same nonce prefix")
+	}
+
+	if bytes.Equal(first, make([]byte, proto.NoncePrefixSize)) {
+		t.Fatal("nonce prefix is all zeros: it was never drawn")
+	}
 }
 
 func TestEncryptedConnRoundTrip(t *testing.T) {
@@ -245,8 +305,10 @@ func TestReplayedFrameIsRejected(t *testing.T) {
 
 	token := newToken(t)
 
+	// The prefix is sent once per stream, so the duplicate is the frame
+	// alone - a replay relay could mount by resending bytes it forwarded.
 	frame := sealed(t, token, proto.RolePublish, []byte("withdraw"))
-	replayed := append(bytes.Clone(frame), frame...)
+	replayed := append(bytes.Clone(frame), frame[proto.NoncePrefixSize:]...)
 
 	sub, err := proto.NewEncryptedConn(source{bytes.NewReader(replayed)}, token, proto.RoleSubscribe)
 	if err != nil {

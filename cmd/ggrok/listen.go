@@ -143,5 +143,7 @@ func runListen(args []string) error {
 		OnListen: func(addr net.Addr) {
 			fmt.Fprintf(os.Stdout, "listening on %s\n", addr)
 		},
+		OnDisconnect: reportDisconnect,
+		OnReconnect:  reportReconnect,
 	})
 }

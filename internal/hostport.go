@@ -12,22 +12,22 @@ import (
 	"strings"
 )
 
-// Kind is the kind of the HostPort, the variants of which
+// kind is the kind of the HostPort, the variants of which
 // are enumerated below.
-type Kind uint8
+type kind uint8
 
 const (
-	// KindIP is the kind when a HostPort is a resolved IP address.
-	KindIP Kind = iota
+	// kindIP is the kind when a HostPort is a resolved IP address.
+	kindIP kind = iota
 
-	// KindName is when the HostPort is a DNS name.
-	KindName
+	// kindName is when the HostPort is a DNS name.
+	kindName
 )
 
 // HostPort is host:port where host is either a resolved IP or a DNS name.
 type HostPort struct {
-	// kind is the kind of the HostPort
-	kind Kind
+	// kind is the kind of the HostPort.
+	kind kind
 
 	// ip is the IP address, if of course the host:port pair uses an IP address.
 	ip netip.Addr
@@ -71,38 +71,19 @@ func parsePort(s string) (uint16, error) {
 // kind of host it is.
 func newHostPort(host string, port uint16) (HostPort, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return HostPort{kind: KindIP, ip: ip, port: port}, nil
+		return HostPort{kind: kindIP, ip: ip, port: port}, nil
 	}
 
 	if host == "" || strings.ContainsAny(host, " \t") {
 		return HostPort{}, fmt.Errorf("%w: bad host %q", ErrInvalidHostPort, host)
 	}
 
-	return HostPort{kind: KindName, name: host, port: port}, nil
-}
-
-// IsIP returns true when the host:port pair is an IP.
-func (h HostPort) IsIP() bool {
-	return h.kind == KindIP
-}
-
-// IsName returns true when the host:port pair is a DNS name.
-func (h HostPort) IsName() bool {
-	return h.kind == KindName
-}
-
-// Match defines a pattern matching function over the HostPort pair.
-func (h HostPort) Match(onIP func(netip.Addr, uint16) any, onName func(string, uint16) any) any {
-	if h.kind == KindIP {
-		return onIP(h.ip, h.port)
-	}
-
-	return onName(h.name, h.port)
+	return HostPort{kind: kindName, name: host, port: port}, nil
 }
 
 // String obtains the underlying string from this type.
 func (h HostPort) String() string {
-	if h.kind == KindIP {
+	if h.kind == kindIP {
 		return net.JoinHostPort(h.ip.String(), strconv.Itoa(int(h.port)))
 	}
 	return net.JoinHostPort(h.name, strconv.Itoa(int(h.port)))
