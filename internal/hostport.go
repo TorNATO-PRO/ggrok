@@ -12,24 +12,22 @@ import (
 	"strings"
 )
 
-// Kind is the kind of the HostPort, the variants of which
+// kind is the kind of the HostPort, the variants of which
 // are enumerated below.
-type Kind uint8
+type kind uint8
 
 const (
-	// KindIP is the kind when a HostPort is a resolved IP address.
-	KindIP Kind = iota
+	// kindIP is the kind when a HostPort is a resolved IP address.
+	kindIP kind = iota
 
-	// KindName is when the HostPort is a DNS name.
-	KindName
+	// kindName is when the HostPort is a DNS name.
+	kindName
 )
 
 // HostPort is host:port where host is either a resolved IP or a DNS name.
-//
-//nolint:recvcheck // UnmarshalText needs a pointer receiver to satisfy encoding.TextUnmarshaler; every other method uses a value receiver since HostPort is a small, cheaply-copied value type.
 type HostPort struct {
-	// kind is the kind of the HostPort
-	kind Kind
+	// kind is the kind of the HostPort.
+	kind kind
 
 	// ip is the IP address, if of course the host:port pair uses an IP address.
 	ip netip.Addr
@@ -73,38 +71,19 @@ func parsePort(s string) (uint16, error) {
 // kind of host it is.
 func newHostPort(host string, port uint16) (HostPort, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return HostPort{kind: KindIP, ip: ip, port: port}, nil
+		return HostPort{kind: kindIP, ip: ip, port: port}, nil
 	}
 
 	if host == "" || strings.ContainsAny(host, " \t") {
 		return HostPort{}, fmt.Errorf("%w: bad host %q", ErrInvalidHostPort, host)
 	}
 
-	return HostPort{kind: KindName, name: host, port: port}, nil
-}
-
-// IsIP returns true when the host:port pair is an IP.
-func (h HostPort) IsIP() bool {
-	return h.kind == KindIP
-}
-
-// IsName returns true when the host:port pair is a DNS name.
-func (h HostPort) IsName() bool {
-	return h.kind == KindName
-}
-
-// Match defines a pattern matching function over the HostPort pair.
-func (h HostPort) Match(onIP func(netip.Addr, uint16) any, onName func(string, uint16) any) any {
-	if h.kind == KindIP {
-		return onIP(h.ip, h.port)
-	}
-
-	return onName(h.name, h.port)
+	return HostPort{kind: kindName, name: host, port: port}, nil
 }
 
 // String obtains the underlying string from this type.
 func (h HostPort) String() string {
-	if h.kind == KindIP {
+	if h.kind == kindIP {
 		return net.JoinHostPort(h.ip.String(), strconv.Itoa(int(h.port)))
 	}
 	return net.JoinHostPort(h.name, strconv.Itoa(int(h.port)))
@@ -126,11 +105,9 @@ func (h HostPort) MarshalText() ([]byte, error) {
 	return []byte(h.String()), nil
 }
 
-// MaxPorts bounds how many ports one Range may span. A share or listen
-// holds a live socket per port in its range for the whole session, so the
-// span is a direct multiplier on file descriptors and - for listen's UDP
-// mode - on socket buffer memory, which is sized generously per socket
-// (see listen's udpSocketBufferSize). A thousand is far past any plausible
+// MaxPorts bounds how many ports one Range may span. A share or listen holds
+// a live socket per port in its range for the whole session, so the span is a
+// direct multiplier on file descriptors. A thousand is far past any plausible
 // service and still nowhere near a default fd limit.
 const MaxPorts = 1024
 
@@ -148,8 +125,6 @@ var ErrInvalidRange = errors.New("hostport: invalid port range")
 // themselves: what crosses the wire is an index into the range (see
 // proto.PortIndex), so a share on 8000-8010 can be reached by a listen
 // bound to 9000-9010, index for index.
-//
-//nolint:recvcheck // same split as HostPort: UnmarshalText needs a pointer receiver to satisfy encoding.TextUnmarshaler, everything else is a value receiver on a small value type.
 type Range struct {
 	// base is the first port of the range, paired with the host every
 	// port in it shares.

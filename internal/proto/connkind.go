@@ -18,8 +18,8 @@ const (
 	// afterward, ControlType frames for the life of a session.
 	ConnControl ConnKind = iota + 1
 
-	// ConnData marks a connection carrying an Attach message and then
-	// raw forwarded bytes for exactly one logical TCP-mode stream.
+	// ConnData marks a connection carrying an Attach message and then the
+	// sealed bytes of exactly one forwarded stream.
 	ConnData
 )
 

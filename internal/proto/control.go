@@ -19,22 +19,12 @@ const (
 	ControlPing ControlType = iota + 1
 	ControlPong
 
-	// ControlRequestData is relay asking a publisher to open a new
-	// TCP-mode data connection for a specific pending subscriber
-	// request - payload is the RequestID (8 bytes) followed by the
-	// PortIndex the subscriber accepted that connection on (2 bytes),
-	// which is what tells the publisher which of its local ports to dial.
+	// ControlRequestData is relay asking a publisher to open a new data
+	// connection for a specific pending subscriber request - payload is the
+	// RequestID (8 bytes) followed by the PortIndex the subscriber accepted
+	// that connection on (2 bytes), which is what tells the publisher which
+	// of its local ports to dial.
 	ControlRequestData
-
-	// ControlSubscriberID is relay handing a UDP-mode subscriber the
-	// SubscriberID it assigned - payload is the SubscriberID (2 bytes).
-	// The subscriber presents this same ID in its UDPAttach handshake when
-	// it dials relay's QUIC data connection, so relay can tell which
-	// already-registered subscriber that datagram-only connection belongs
-	// to (a session can have many concurrent subscribers, and the QUIC
-	// connection carries no other identifying information beyond the
-	// token, which every subscriber shares).
-	ControlSubscriberID
 
 	// ControlSessionClosed is relay telling a subscriber that the session
 	// it is attached to has ended - payload is a single
@@ -167,24 +157,4 @@ func ReadRequestData(payload []byte) (uint64, PortIndex, error) {
 	port := PortIndex(binary.BigEndian.Uint16(payload[requestDataPortOff:]))
 
 	return id, port, nil
-}
-
-// subscriberIDSize is the width of a ControlSubscriberID frame's payload:
-// a single big-endian SubscriberID.
-const subscriberIDSize = 2
-
-// WriteSubscriberID writes a ControlSubscriberID frame for id.
-func WriteSubscriberID(w io.Writer, id SubscriberID) error {
-	var payload [subscriberIDSize]byte
-	binary.BigEndian.PutUint16(payload[:], uint16(id))
-	return WriteControlFrame(w, ControlSubscriberID, payload[:])
-}
-
-// ReadSubscriberID decodes a ControlSubscriberID frame's payload.
-func ReadSubscriberID(payload []byte) (SubscriberID, error) {
-	if len(payload) != subscriberIDSize {
-		return 0, fmt.Errorf("read subscriber id: want %d bytes, got %d", subscriberIDSize, len(payload))
-	}
-
-	return SubscriberID(binary.BigEndian.Uint16(payload)), nil
 }

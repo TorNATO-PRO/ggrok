@@ -1,4 +1,4 @@
-// Command ggrok forwards one or more local TCP/UDP ports through a relay
+// Command ggrok forwards one or more local TCP ports through a relay
 // to any number of subscribers holding the session's token, for the full
 // lifecycle of the process.
 //
@@ -24,11 +24,11 @@ import (
 )
 
 // a usage string to describe how the CLI utility is meant to be used.
-const usage = `ggrok: forward local TCP/UDP ports through a relay you run yourself.
+const usage = `ggrok: forward local TCP ports through a relay you run yourself.
 
 Usage:
-  ggrok share -tcp|-udp <addr> [flags]
-  ggrok listen -tcp|-udp <addr> [flags] <token>
+  ggrok share -tcp <addr> [flags]
+  ggrok listen -tcp <addr> [flags] <token>
   ggrok relay [flags]
   ggrok ca <init|issue|list|revoke> [flags]
 

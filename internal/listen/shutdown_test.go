@@ -8,9 +8,10 @@ import (
 	"testing"
 
 	"tornato.dev/ggrok/v2/internal/listen"
+	"tornato.dev/ggrok/v2/internal/proto"
 )
 
-// errClosed stands in for what Accept/ReadFromUDP actually return once
+// errClosed stands in for what Accept actually returns once
 // their socket has been closed out from under them.
 var errClosed = fmt.Errorf("use of closed network connection: %w", net.ErrClosed)
 
@@ -23,8 +24,8 @@ func TestShutdownErr(t *testing.T) {
 		return ctx
 	}
 
-	// buffered mirrors how runTCP/runUDP declare the channel: cap 1, so the
-	// control loop's send always completes before it cancels ctx.
+	// buffered mirrors how runTCP declares the channel: cap 1, so the
+	// session's send always completes before it cancels ctx.
 	buffered := func(errs ...error) chan error {
 		ch := make(chan error, 1)
 		for _, err := range errs {
@@ -34,48 +35,53 @@ func TestShutdownErr(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		ctx        context.Context
-		controlErr chan error
-		sockErr    error
-		want       error
-		wantMsg    string
+		name     string
+		ctx      context.Context
+		serveErr chan error
+		sockErr  error
+		want     error
+		wantMsg  string
 	}{
 		{
 			// The regression: SIGINT closes the listener, Accept fails, and
-			// the control loop is still parked in a read with nothing to
+			// the session is still parked in a read with nothing to
 			// report. Must exit clean, not blame the closed socket.
-			name:       "canceled ctx, control loop silent",
-			ctx:        canceled(),
-			controlErr: buffered(),
-			sockErr:    errClosed,
-			want:       context.Canceled,
+			name:     "canceled ctx, session silent",
+			ctx:      canceled(),
+			serveErr: buffered(),
+			sockErr:  errClosed,
+			want:     context.Canceled,
 		},
 		{
-			// The control loop failed and canceled ctx on its way out. Its
-			// reason outranks the socket error it caused.
-			name:       "control loop failed",
-			ctx:        canceled(),
-			controlErr: buffered(errors.New("read control frame: EOF")),
-			sockErr:    errClosed,
-			wantMsg:    "control connection: read control frame: EOF",
+			// The session gave up and canceled ctx on its way out. It only
+			// ever returns over something no redial could fix, so its
+			// reason outranks the socket error it caused and needs no
+			// dressing up.
+			name:     "session unrecoverable",
+			ctx:      canceled(),
+			serveErr: buffered(proto.ErrPortsMismatch),
+			sockErr:  errClosed,
+			want:     proto.ErrPortsMismatch,
+			wantMsg:  "port count does not match this session's publisher",
 		},
 		{
-			// A session relay deliberately ended explains itself.
-			name:       "session closed",
-			ctx:        canceled(),
-			controlErr: buffered(fmt.Errorf("%w: publisher gone", listen.ErrSessionClosed)),
-			sockErr:    errClosed,
-			want:       listen.ErrSessionClosed,
+			// A session relay deliberately ended explains itself. listen
+			// resubscribes rather than stopping over one, so this only
+			// reaches ShutdownErr if it happened on the very first attempt.
+			name:     "session closed",
+			ctx:      canceled(),
+			serveErr: buffered(fmt.Errorf("%w: publisher gone", listen.ErrSessionClosed)),
+			sockErr:  errClosed,
+			want:     listen.ErrSessionClosed,
 		},
 		{
 			// Nothing was canceled, so the socket really did fail on its
 			// own - that error is the whole story and must survive.
-			name:       "genuine socket failure",
-			ctx:        context.Background(),
-			controlErr: buffered(),
-			sockErr:    errors.New("too many open files"),
-			wantMsg:    "accept: too many open files",
+			name:     "genuine socket failure",
+			ctx:      context.Background(),
+			serveErr: buffered(),
+			sockErr:  errors.New("too many open files"),
+			wantMsg:  "accept: too many open files",
 		},
 	}
 
@@ -83,7 +89,7 @@ func TestShutdownErr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := listen.ShutdownErr(tt.ctx, tt.controlErr, tt.sockErr, "accept")
+			got := listen.ShutdownErr(tt.ctx, tt.serveErr, tt.sockErr, "accept")
 			if got == nil {
 				t.Fatal("listen.ShutdownErr returned nil, want an error")
 			}
@@ -98,9 +104,9 @@ func TestShutdownErr(t *testing.T) {
 	}
 }
 
-// TestShutdownErrDoesNotBlock pins the reason controlErr is sampled rather
+// TestShutdownErrDoesNotBlock pins the reason serveErr is sampled rather
 // than waited on: on a plain SIGINT nothing is ever sent, and blocking for
-// it would hang the exit until the control loop's read deadline elapsed.
+// it would hang the exit until the session's read deadline elapsed.
 func TestShutdownErrDoesNotBlock(t *testing.T) {
 	t.Parallel()
 

@@ -1,16 +1,10 @@
-// The share subcommand creates a TCP+mTLS connection to the relay server
-// and forwards a local TCP or UDP service through the tunnel to any number
-// of concurrent listen subscribers holding the session's token.
+// The share subcommand creates a TCP+mTLS connection to the relay server and
+// forwards a local TCP service through the tunnel to any number of concurrent
+// listen subscribers holding the session's token.
 //
-// Either flag takes a single host:port or a host:first-last range, in
-// which case every port in the range is forwarded and each subscriber
-// binds a range of its own of the same size.
-//
-// UDP is forwarded over a dedicated QUIC connection's unreliable datagram
-// extension (RFC 9221), so it keeps UDP's unordered, unreliable delivery
-// semantics - and gets QUIC's congestion control on that connection for
-// free - rather than being flattened into an ordered, retransmitted
-// stream.
+// -tcp takes a single host:port or a host:first-last range, in which case
+// every port in the range is forwarded and each subscriber binds a range of
+// its own of the same size.
 
 package main
 
@@ -21,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"time"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/proto"
@@ -31,13 +26,7 @@ import (
 type shareConfig struct {
 	nodeConnConfig
 
-	// mode is proto.ModeTCP or proto.ModeUDP, set by whichever of
-	// -tcp/-udp was given; exactly one is required. Its zero value doubles
-	// as the "no mode flag seen yet" sentinel while parsing.
-	mode proto.Mode
-
-	// addr is the local TCP/UDP service being forwarded, set together
-	// with mode - one port, or a whole range of them.
+	// addr is the local TCP service being forwarded - one port or a range.
 	addr hostport.Range
 
 	// token scopes which listen subscribers may reach this session. nil
@@ -46,10 +35,10 @@ type shareConfig struct {
 }
 
 // shareUsage marks the usage string for the share subcommand.
-const shareUsage = `ggrok share - forward a local TCP or UDP service through a relay
+const shareUsage = `ggrok share - forward a local TCP service through a relay
 
 Usage:
-  ggrok share -tcp|-udp <addr> [flags]
+  ggrok share -tcp <addr> [flags]
 
 An <addr> is host:port, or host:first-last to forward a whole range of
 ports at once. Subscribers bind a range of the same size, matched port
@@ -58,37 +47,19 @@ for port from the start of each range.
 Flags:
 `
 
-// registerModeFlags registers -tcp and -udp on fs, both writing into cfg.
-// cfg.mode's own zero value is the "no mode flag seen yet" sentinel,
-// checked at the point each flag is parsed. That makes a conflicting
-// second flag an immediate error instead of two independent bools that
-// could disagree with each other and with cfg.mode.
+// registerModeFlags registers -tcp on fs, writing into cfg.
 func registerModeFlags(fs *flag.FlagSet, cfg *shareConfig) {
-	setMode := func(m proto.Mode) func(string) error {
-		return func(addr string) error {
-			if cfg.mode != 0 {
-				return fmt.Errorf("-tcp and -udp are mutually exclusive")
-			}
-
+	fs.Func(
+		"tcp",
+		"local TCP service to forward, e.g. 127.0.0.1:5432 or 127.0.0.1:8000-8010",
+		func(addr string) error {
 			ports, err := hostport.ParseRange(addr)
 			if err != nil {
 				return err
 			}
-
 			cfg.addr = ports
-			cfg.mode = m
 			return nil
-		}
-	}
-	fs.Func(
-		"tcp",
-		"local TCP service to forward, e.g. 127.0.0.1:5432 or 127.0.0.1:8000-8010 (mutually exclusive with -udp)",
-		setMode(proto.ModeTCP),
-	)
-	fs.Func(
-		"udp",
-		"local UDP service to forward, e.g. 127.0.0.1:53 or 127.0.0.1:6000-6010 (mutually exclusive with -tcp)",
-		setMode(proto.ModeUDP),
+		},
 	)
 }
 
@@ -145,9 +116,9 @@ func parseShareFlags(args []string) (shareConfig, error) {
 		return shareConfig{}, err
 	}
 
-	if cfg.mode == 0 {
+	if cfg.addr.Len() == 0 {
 		fs.Usage()
-		return shareConfig{}, fmt.Errorf("exactly one of -tcp or -udp is required")
+		return shareConfig{}, fmt.Errorf("-tcp <addr> is required")
 	}
 
 	if tokenStr != "" {
@@ -183,8 +154,8 @@ func runShare(args []string) error {
 
 	fmt.Fprintf(
 		os.Stdout,
-		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -%s %s -server %s %s\n\n",
-		*cfg.token, cfg.mode, suggestedListenAddr(cfg.addr), cfg.server, *cfg.token,
+		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -tcp %s -server %s %s\n\n",
+		*cfg.token, suggestedListenAddr(cfg.addr), cfg.server, *cfg.token,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -195,10 +166,28 @@ func runShare(args []string) error {
 		CertFile: cfg.certFile,
 		KeyFile:  cfg.keyFile,
 		CAFile:   cfg.caFile,
-		Mode:     cfg.mode,
+		Mode:     proto.ModeTCP,
 		Addr:     cfg.addr,
 		Token:    *cfg.token,
+
+		OnDisconnect: reportDisconnect,
+		OnReconnect:  reportReconnect,
 	})
+}
+
+// reportDisconnect and reportReconnect narrate what share and listen do
+// when relay goes away, which is to keep redialing it. They write to stderr
+// rather than stdout: stdout carries the token and the bound addresses,
+// which people pipe into other things, and a tunnel that flaps for an hour
+// shouldn't append an hour of commentary to that.
+func reportDisconnect(err error, retryIn time.Duration) {
+	fmt.Fprintf(os.Stderr, "lost relay connection: %v; retrying in %s\n", err, retryIn.Round(time.Millisecond))
+}
+
+// reportReconnect notes that a session came back, which is the only signal
+// that the gap reportDisconnect announced is over.
+func reportReconnect() {
+	fmt.Fprintln(os.Stderr, "reconnected to relay")
 }
 
 // suggestedListenAddr is the local address the printed listen command

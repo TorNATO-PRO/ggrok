@@ -12,9 +12,10 @@ import (
 // plainConn wraps a [net.Conn] behind the [net.Conn] interface alone, which
 // only declares Read/Write/Close (among others) - not ReadFrom/WriteTo. So
 // unlike the concrete *[net.TCPConn] underneath, plainConn doesn't promote
-// those methods, and [io.Copy]'s type assertions for them fail. This mirrors
-// what a quic.Stream looks like to [io.Copy]: no shortcut, so the caller's
-// buffer is what actually moves the bytes.
+// those methods, and [io.Copy]'s type assertions for them fail. That mirrors
+// the legs that actually use the copy buffer in production - relay's
+// tls.Conn pairs and the encrypted tunnel in share and listen - where no
+// shortcut applies and the caller's buffer is what moves the bytes.
 type plainConn struct {
 	net.Conn
 }
@@ -107,7 +108,7 @@ func BenchmarkCopyBufferSizes(b *testing.B) {
 // BenchmarkSplice pushes b.N megabytes through two spliced TCP loopback
 // connections: a source pumps data into one leg, Splice forwards it across
 // to the other leg's pair, and a sink drains it. This isolates the copy
-// buffer's effect on throughput from QUIC/crypto overhead.
+// buffer's effect on throughput from any TLS or tunnel-encryption overhead.
 func BenchmarkSplice(b *testing.B) {
 	const chunkSize = 1 << 20 // 1MB per b.N unit
 
@@ -121,11 +122,11 @@ func BenchmarkSplice(b *testing.B) {
 		defer close(done)
 		// *net.TCPConn implements io.ReaderFrom/io.WriterTo, which makes
 		// io.Copy bypass our buffer entirely in favor of its own internal
-		// copy loop - exactly the fast path a *net.TCPConn gets in
+		// copy loop - exactly the fast path a raw *net.TCPConn gets in
 		// production too. Wrapping to only expose Read/Write/Close mimics
-		// the quic.Stream<->quic.Stream leg (relay/registry.go), which is
-		// the one Splice call site where neither side gets that shortcut
-		// and our buffer is actually the one doing the copying.
+		// the legs where neither side gets that shortcut and our buffer is
+		// the one doing the copying: relay's paired tls.Conns, and the
+		// proto.EncryptedConn side of share's and listen's splices.
 		streamio.Splice(plainConn{srcServer}, plainConn{sinkServer})
 	}()
 
