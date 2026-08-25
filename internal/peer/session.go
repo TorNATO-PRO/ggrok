@@ -1,0 +1,180 @@
+// Package peer holds what share (publisher) and listen (subscriber) do
+// identically on their way to a tunnel: dialing relay over mTLS, keeping a
+// control connection alive on it, and opening an encrypted data connection
+// per forwarded stream. The two differ only in what they do with a tunnel
+// once they hold one - share dials a local service, listen accepts from one
+// - and that difference is all their own packages are left carrying.
+package peer
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"time"
+
+	hostport "tornato.dev/ggrok/v2/internal"
+	"tornato.dev/ggrok/v2/internal/proto"
+)
+
+// TCP keepalive settings for every connection a peer opens to relay. This
+// catches a severed network path; the application-level heartbeat in
+// [RunControlLoop] catches a peer that's still connected but hung.
+const (
+	tcpKeepAliveIdle       = 15 * time.Second
+	tcpKeepAliveInterval   = 15 * time.Second
+	tcpKeepAliveProbeCount = 2
+)
+
+// Session is everything a peer needs to open connections to relay for one
+// session: where relay is, how to authenticate to it, and the token whose
+// derived keys seal the tunnels it opens.
+//
+// The token itself never reaches the wire. What identifies the session to
+// relay is the SessionID derived from it once here, which is enough to
+// route by and not enough to decrypt with.
+type Session struct {
+	relay hostport.HostPort
+	tls   *tls.Config
+	token proto.Token
+	role  proto.Role
+	id    proto.SessionID
+}
+
+// NewSession pairs relay's address and TLS config with the token and role
+// this peer holds, deriving the session's routing identifier up front -
+// it's a fixed function of the token, and every connection the session
+// opens names the same one.
+func NewSession(
+	relay hostport.HostPort,
+	tlsConf *tls.Config,
+	token proto.Token,
+	role proto.Role,
+) Session {
+	return Session{
+		relay: relay,
+		tls:   tlsConf,
+		token: token,
+		role:  role,
+		id:    proto.DeriveSessionID(token),
+	}
+}
+
+// DialControl opens the session's control connection - one per peer, held
+// for the life of the session, carrying the Hello handshake and then the
+// heartbeat and request frames [RunControlLoop] reads.
+func (s Session) DialControl(ctx context.Context) (*tls.Conn, error) {
+	return s.dial(ctx, proto.ConnControl)
+}
+
+// Handshake performs the Hello exchange for this session on control,
+// announcing mode and how many ports the peer's range spans.
+func (s Session) Handshake(control *tls.Conn, mode proto.Mode, ports uint16) error {
+	return proto.Handshake(control, s.role, mode, ports, s.token)
+}
+
+// OpenTunnel dials relay a fresh data connection, attaches it to this
+// session, and returns the encrypted stream to splice a local connection
+// to. attach's SessionID is filled in from the session, so callers supply
+// only what distinguishes this connection from the others: its Kind, and
+// the Port or RequestID that goes with it.
+//
+// Everything past the Attach is sealed end-to-end, so what relay splices is
+// ciphertext: it pairs this connection with its counterpart by SessionID
+// without holding the token those keys come from.
+//
+// A non-nil error leaves nothing open - the data connection is closed on
+// the way out. On success the returned tunnel owns it, and closing the
+// tunnel is what closes it.
+func (s Session) OpenTunnel(ctx context.Context, attach proto.Attach) (*proto.EncryptedConn, error) {
+	conn, err := s.dial(ctx, proto.ConnData)
+	if err != nil {
+		return nil, err
+	}
+
+	tunnel, err := s.attach(conn, attach)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return tunnel, nil
+}
+
+// attach writes attach on conn, waits for relay's verdict where there is
+// one, and wraps conn for this session's role. Split out of OpenTunnel so
+// every failure between the dial and a usable tunnel closes conn on one
+// path rather than each on its own.
+func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedConn, error) {
+	attach.SessionID = s.id
+	if err := proto.WriteAttach(conn, attach); err != nil {
+		return nil, err
+	}
+
+	// Only a subscriber's attach is acked: it asks relay to find it a
+	// publisher, and the ack is how relay says there isn't one (or that the
+	// port index named nothing). A publisher's attach fulfills a request
+	// relay already made, so relay has nothing left to accept or reject and
+	// sends no ack to wait for - see Registry.AttachPublisherData.
+	if attach.Kind == proto.AttachSubscriber {
+		status, err := proto.ReadAck(conn)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := status.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	return proto.NewEncryptedConn(conn, s.token, s.role)
+}
+
+// dial dials relay over TCP+mTLS and writes kind's discriminator, which is
+// the first thing relay reads off any connection and what tells it whether
+// a Hello or an Attach follows.
+func (s Session) dial(ctx context.Context, kind proto.ConnKind) (*tls.Conn, error) {
+	dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: s.tls}
+
+	conn, err := dialer.DialContext(ctx, "tcp", s.relay.String())
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", s.relay, err)
+	}
+
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		// tls.Dialer.DialContext always returns a *tls.Conn; unreachable
+		// in practice, but fail closed rather than panic on assertion.
+		_ = conn.Close()
+		return nil, fmt.Errorf("dial %s: unexpected connection type %T", s.relay, conn)
+	}
+
+	setTCPKeepAlive(tlsConn)
+
+	if err := proto.WriteConnKind(tlsConn, kind); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+
+	return tlsConn, nil
+}
+
+// setTCPKeepAlive best-effort enables TCP keepalive on conn's underlying
+// socket, per tcpKeepAliveIdle/Interval/ProbeCount - a no-op if conn isn't
+// backed by a [net.TCPConn]. A data connection is spliced raw bytes with no
+// application-level heartbeat of its own, so without this, a path a
+// NAT/firewall silently drops while the tunnel is idle goes unnoticed until
+// the next write.
+func setTCPKeepAlive(conn *tls.Conn) {
+	tcpConn, ok := conn.NetConn().(*net.TCPConn)
+	if !ok {
+		return
+	}
+
+	_ = tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     tcpKeepAliveIdle,
+		Interval: tcpKeepAliveInterval,
+		Count:    tcpKeepAliveProbeCount,
+	})
+}
