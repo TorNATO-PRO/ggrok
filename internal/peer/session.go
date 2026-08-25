@@ -26,6 +26,15 @@ const (
 	tcpKeepAliveProbeCount = 2
 )
 
+// dialTimeout bounds one attempt to reach relay. A relay that's merely gone
+// refuses connections immediately, but one whose host has dropped off the
+// network blackholes the SYN instead, and the OS would spend minutes on
+// that. [Session.Serve] is happier being told quickly so it can back off
+// and try again, and a subscriber's [Session.OpenTunnel] would otherwise
+// hold a local client open for those same minutes rather than closing it
+// and letting the client decide what to do.
+const dialTimeout = 10 * time.Second
+
 // Session is everything a peer needs to open connections to relay for one
 // session: where relay is, how to authenticate to it, and the token whose
 // derived keys seal the tunnels it opens.
@@ -58,19 +67,6 @@ func NewSession(
 		role:  role,
 		id:    proto.DeriveSessionID(token),
 	}
-}
-
-// DialControl opens the session's control connection - one per peer, held
-// for the life of the session, carrying the Hello handshake and then the
-// heartbeat and request frames [RunControlLoop] reads.
-func (s Session) DialControl(ctx context.Context) (*tls.Conn, error) {
-	return s.dial(ctx, proto.ConnControl)
-}
-
-// Handshake performs the Hello exchange for this session on control,
-// announcing mode and how many ports the peer's range spans.
-func (s Session) Handshake(control *tls.Conn, mode proto.Mode, ports uint16) error {
-	return proto.Handshake(control, s.role, mode, ports, s.token)
 }
 
 // OpenTunnel dials relay a fresh data connection, attaches it to this
@@ -135,6 +131,12 @@ func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedCo
 // a Hello or an Attach follows.
 func (s Session) dial(ctx context.Context, kind proto.ConnKind) (*tls.Conn, error) {
 	dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: s.tls}
+
+	// The deadline covers reaching relay and nothing after it: per
+	// [tls.Dialer.DialContext], a context that expires once the connection
+	// is up no longer affects it, so this can't cut a live tunnel short.
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
 
 	conn, err := dialer.DialContext(ctx, "tcp", s.relay.String())
 	if err != nil {

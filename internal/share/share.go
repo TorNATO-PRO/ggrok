@@ -8,9 +8,9 @@ package share
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
+	"time"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/mtls"
@@ -40,11 +40,22 @@ type Config struct {
 
 	// Token scopes which listen subscribers may reach this session.
 	Token proto.Token
+
+	// OnDisconnect and OnReconnect, if non-nil, report the session losing
+	// relay and getting it back. Run keeps redialing rather than returning
+	// on a lost connection (see [peer.Session.Serve]), so without these a
+	// share whose relay is unreachable is indistinguishable from one that's
+	// simply idle. OnDisconnect is given the error that ended the session
+	// and how long until the next attempt.
+	OnDisconnect func(err error, retryIn time.Duration)
+	OnReconnect  func()
 }
 
-// Run dials relay, registers Config.Token as a publisher, and forwards
-// traffic to Config.Addr until ctx is canceled or an unrecoverable error
-// occurs.
+// Run registers Config.Token as a publisher and forwards traffic to
+// Config.Addr until ctx is canceled or an unrecoverable error occurs. A
+// relay that goes away is redialed rather than reported: see
+// [peer.Session.Serve] for what counts as unrecoverable, and
+// Config.OnDisconnect for how to hear about the rest.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Addr.Len() < 1 {
 		return fmt.Errorf("share: no local address to forward")
@@ -57,61 +68,41 @@ func Run(ctx context.Context, cfg Config) error {
 
 	session := peer.NewSession(cfg.Server, tlsConf, cfg.Token, proto.RolePublish)
 
-	control, err := session.DialControl(ctx)
-	if err != nil {
-		return fmt.Errorf("share: %w", err)
-	}
-	defer func() { _ = control.Close() }()
-
-	ports := uint16(cfg.Addr.Len()) //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
-
-	if err := session.Handshake(control, cfg.Mode, ports); err != nil {
-		return fmt.Errorf("share: %w", err)
-	}
-
 	switch cfg.Mode {
 	case proto.ModeTCP:
-		return runTCP(ctx, session, control, cfg.Addr)
+		return runTCP(ctx, session, cfg)
 	default:
 		return fmt.Errorf("share: unsupported mode %v", cfg.Mode)
 	}
 }
 
 // runTCP runs share's TCP-mode data plane: for every ControlRequestData
-// relay sends on control, it opens a tunnel, dials the local service, and
-// splices the two together. It runs until ctx is canceled or the control
-// connection dies.
-func runTCP(ctx context.Context, session peer.Session, control *tls.Conn, addr hostport.Range) error {
-	// The control loop below is the only thing this function blocks on, and
-	// its read has no way to notice ctx being canceled on its own - it only
-	// unblocks whenever the next ControlPong happens to arrive, up to a
-	// heartbeat interval later. Closing control out from under it the moment
-	// ctx is done is what makes Ctrl+C take effect immediately instead of
-	// that much late.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = control.Close()
-		case <-stop:
-		}
-	}()
+// relay sends, it opens a tunnel, dials the local service, and splices the
+// two together. Serve holds the control connection up across reconnects, so
+// this runs until ctx is canceled or the session turns out to be one no
+// redial can restore.
+func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
+	return session.Serve(ctx, peer.ServeConfig{
+		Mode:  cfg.Mode,
+		Ports: uint16(cfg.Addr.Len()), //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
+		Handle: func(typ proto.ControlType, payload []byte) error {
+			if typ != proto.ControlRequestData {
+				return nil
+			}
 
-	return peer.RunControlLoop(ctx, control, func(typ proto.ControlType, payload []byte) error {
-		if typ != proto.ControlRequestData {
+			// A frame a misbehaving relay malformed is dropped rather than
+			// treated as the end of the session. What is well-formed is
+			// dispatched in a goroutine of its own, so a slow local dial
+			// doesn't stall the read loop - and with it, every other
+			// in-flight request.
+			if reqID, port, err := proto.ReadRequestData(payload); err == nil {
+				go fulfill(ctx, session, cfg.Addr, reqID, port)
+			}
+
 			return nil
-		}
-
-		// A frame a misbehaving relay malformed is dropped rather than
-		// treated as the end of the session. What is well-formed is
-		// dispatched in a goroutine of its own, so a slow local dial doesn't
-		// stall the read loop - and with it, every other in-flight request.
-		if reqID, port, err := proto.ReadRequestData(payload); err == nil {
-			go fulfill(ctx, session, addr, reqID, port)
-		}
-
-		return nil
+		},
+		OnReconnect:  cfg.OnReconnect,
+		OnDisconnect: cfg.OnDisconnect,
 	})
 }
 
