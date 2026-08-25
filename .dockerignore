@@ -1,0 +1,11 @@
+# Keep the build context to just the source the Dockerfile actually compiles.
+.git
+.github
+dist/
+ggrok
+Dockerfile
+.dockerignore
+justfile
+README.md
+.golangci.yml
+*_test.go

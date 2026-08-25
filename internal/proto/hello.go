@@ -22,7 +22,7 @@ import (
 // The current version covers: TCP-only sessions, Hello and Attach naming a
 // session by its derived SessionID rather than by its token, and a data
 // plane whose bytes are sealed end-to-end (see EncryptedConn).
-const ALPN = "ggrok/4"
+const ALPN = "ggrok/1"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never

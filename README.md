@@ -2,19 +2,18 @@
 
 Have you ever developed a web service and wanted to share it with someone else, securely and reliably so that only they may access it? This is the problem that `ggrok` solves.
 
-GGrok is a TCP/UDP tunneling tool. It operates at OSI level 4.
+GGrok is a TCP tunneling tool. It operates at OSI level 4.
 
-Using `ggrok share <-tcp|-udp>`, you may share a local TCP or UDP service - or a whole contiguous
+Using `ggrok share -tcp`, you may share a local TCP service - or a whole contiguous
 range of ports - through the tunnel to any number of concurrent `listen` subscribers holding the
 session's token.
 `relay` brokers every session over the public internet without ever terminating TLS. Each
 node is mutually authenticated by a private CA you run yourself!
 
-Every connection is TLS 1.3 mTLS against that same CA: control connections and TCP-mode data
-connections dial relay directly over TCP+TLS 1.3 (with that hybrid algorithm mentioned earlier).
-UDP-mode's data plane is a dedicate QUIC connection per publisher/subscriber, using its unreliable
-datagram extension (RFC 9221) rather than QUIC's ordered streams to maintain similar transport semantics
-to UDP. Using QUIC comes at a bit of a runtime cost, but it gives us QUIC's congestion control and other goodies that make the connection more robust and stay alive across network changes.
+Every connection is TLS 1.3 mTLS against that same CA: both the control connection and the data
+connections dial relay directly over TCP+TLS 1.3, with a post-quantum hybrid key exchange. On top of
+that, the data plane is sealed end-to-end - relay routes a session by an identifier derived from its
+token and cannot decrypt a byte of what passes through it.
 
 ## Install
 
@@ -32,6 +31,24 @@ that domain isn't wired up to redirect here - clone-and-install is the supported
 
 Cross-compiled binaries for Linux/macOS/Windows on amd64/arm64 can be built in one shot with `just
 build-all` (see the `justfile`), landing in `dist/`.
+
+### Docker, if you'd rather
+
+There's a `Dockerfile` too - it's `scratch` plus the static binary and nothing else, so the image is
+essentially just the binary (`docker images` reports ~9 MB). `relay` is the natural thing to run this
+way:
+
+```bash
+just docker-build          # or: docker build -t ggrok:latest .
+
+docker run --rm -p 4443:4443 -v /etc/ggrok/relay:/certs:ro ggrok:latest \
+  relay -listen 0.0.0.0:4443 \
+  -cert-file /certs/cert.pem -key-file /certs/key.pem -ca-file /certs/ca.pem
+```
+
+Point relay at its certificates explicitly - it has no default paths for them. `share` and `listen`
+do default to `~/.ggrok`, which inside the image is `/home/nonroot/.ggrok`, so mounting a bundle
+issued by `ggrok ca issue -out <dir>` there lets them run with no cert flags at all.
 
 ## Usage
 
@@ -66,9 +83,9 @@ ggrok relay -listen 0.0.0.0:4443 \
   -cert-file /etc/ggrok/relay/cert.pem -key-file /etc/ggrok/relay/key.pem -ca-file /etc/ggrok/relay/ca.pem
 ```
 
-Needs both the TCP and UDP flavors of that port reachable from outside - see the firewall note below.
+That TCP port needs to be reachable from outside - it's the only one relay listens on.
 
-### 4. Share a local TCP or UDP service
+### 4. Share a local TCP service
 
 ```bash
 ggrok share -tcp 127.0.0.1:8080 -server relay.example.com:4443
@@ -77,7 +94,7 @@ ggrok share -tcp 127.0.0.1:8080 -server relay.example.com:4443
 Prints a token (unless you pass `-token`, or set `GGROK_TOKEN`) - that's the only thing a `listen`
 subscriber needs to reach this session. Once `-server`/`-cert-file`/`-key-file`/`-ca-file` are set in
 `~/.ggrok/config.json` (see below) or their `GGROK_*` env var, day-to-day this shrinks to just `ggrok
-share -tcp 127.0.0.1:8080`. UDP mode is identical - `-udp` in place of `-tcp`.
+share -tcp 127.0.0.1:8080`.
 
 ### 5. Subscribe from the other side
 
@@ -86,12 +103,12 @@ ggrok listen -tcp 127.0.0.1:9090 -server relay.example.com:4443 <token>
 ```
 
 Binds `127.0.0.1:9090` locally; every connection to it is forwarded through relay to whatever `share`
-is serving. Swap in `-udp` to match a UDP-mode share. The token can come from `GGROK_TOKEN` instead of
-the positional argument, keeping it out of shell history.
+is serving. The token can come from `GGROK_TOKEN` instead of the positional argument, keeping it out
+of shell history.
 
 ### Port ranges
 
-Both `-tcp` and `-udp` take `host:first-last` in place of `host:port`, forwarding every port in the
+`-tcp` takes `host:first-last` in place of `host:port`, forwarding every port in the
 range over the one session:
 
 ```bash
@@ -136,9 +153,18 @@ ggrok relay ... -revoked-file revoked.txt
 
 #### The relay server never parses your traffic
 
-Relay parses a small routing header on every UDP datagram to know which subscriber's connection
-to forward it to/from. We never touch the payload bytes after that header. Relay has no idea what
-application-level protocol you are tunneling.
+Relay reads exactly one handshake message per connection - a `Hello` or `Attach` naming the session
+by its derived `SessionID` - and from then on splices raw bytes between publisher and subscriber
+without interpreting any of them. Relay has no idea what application-level protocol you are
+tunneling, and per the next section it could not read the payload even if it wanted to.
+
+#### End-to-end encryption, not just hop-by-hop
+
+mTLS secures each leg to relay separately, which would ordinarily make relay a place where plaintext
+appears. It isn't. The session token is run through HKDF-SHA256 to derive three independent values: a
+`SessionID`, and one ChaCha20-Poly1305 key per direction. Relay is handed only the `SessionID`, which
+is enough to pair a publisher with its subscribers and nowhere near enough to decrypt a frame - the
+data keys are not derivable from it, and relay never holds the token they come from.
 
 #### Data connections are bound to their control connection's certificate
 

@@ -1,7 +1,7 @@
 # This file is licensed under the terms of the MIT license https://opensource.org/license/mit
 # Copyright (c) 2021-2025 Marat Reimers
 
-## Golden config for golangci-lint v2.12.2
+## Golden config for golangci-lint v2.13.1
 #
 # This is the best config for golangci-lint based on my experience and opinion.
 # It is very strict, but not extremely strict.
@@ -17,6 +17,12 @@ issues:
   # Set to 0 to disable.
   # Default: 3
   max-same-issues: 50
+  # Report every finding on a line, not just the first. With this many
+  # overlapping linters enabled, the default silently discards real issues
+  # whenever two linters land on the same line (e.g. mnd hiding a staticcheck
+  # S1008 on the same condition).
+  # Default: true
+  uniq-by-line: false
 
 formatters:
   enable:

@@ -26,6 +26,10 @@ build-all:
     GOOS=windows GOARCH=amd64 go build -trimpath -o {{dist}}/{{binary}}-windows-amd64.exe {{pkg}}
     GOOS=windows GOARCH=arm64 go build -trimpath -o {{dist}}/{{binary}}-windows-arm64.exe {{pkg}}
 
+# build the scratch-based docker image
+docker-build tag="ggrok:latest":
+    docker build -t {{tag}} .
+
 # format code with gofumpt (falls back to gofmt) and tidy imports
 fmt:
     gofumpt -l -w .
@@ -43,6 +47,15 @@ lint:
 lint-fix:
     golangci-lint run --fix ./...
 
+# scan dependencies and stdlib for known vulnerabilities
+vuln:
+    go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# verify go.sum integrity and that go.mod is tidy
+mod-check:
+    go mod verify
+    go mod tidy -diff
+
 # run tests
 test:
     go test ./...
@@ -55,8 +68,8 @@ test-race:
 tidy:
     go mod tidy
 
-# run fmt-check, vet, lint, and test - use before committing
-verify: fmt-check lint test
+# run fmt-check, lint, test, module and vulnerability checks - use before committing
+verify: fmt-check lint test mod-check vuln
 
 # remove build artifacts
 clean:
