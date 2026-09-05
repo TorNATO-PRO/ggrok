@@ -39,16 +39,6 @@ var (
 	errNotPublisherCert = errors.New("data connection certificate does not match this session's publisher")
 )
 
-// pendingRequestTimeout bounds how long relay waits for a publisher to
-// fulfill a ControlRequestData before giving up on the subscriber's data
-// connection that's waiting on it.
-const pendingRequestTimeout = 10 * time.Second
-
-// notifyWriteTimeout bounds how long relay blocks writing a
-// ControlSessionClosed frame to any one subscriber - see
-// session.shutdown.
-const notifyWriteTimeout = 5 * time.Second
-
 // sessionAttr identifies a session in the logs without writing the whole
 // SessionID there. The SessionID is what a peer presents to attach to a
 // session, so anyone reading one out of a log file could take a subscriber
@@ -136,6 +126,7 @@ func (r *Registry) Register(
 		r.mu.Lock()
 		delete(r.sessions, sessionID)
 		r.mu.Unlock()
+		sess.shutdown()
 		return nil, fmt.Errorf("ack publisher: %w", err)
 	}
 
@@ -150,7 +141,7 @@ func (r *Registry) Register(
 		// Deleting the session above only stops peers that haven't looked
 		// it up yet; everything already attached has to be told, or it
 		// waits on a publisher that is never coming back.
-		notified := sess.shutdown(proto.ReasonPublisherGone)
+		notified := sess.shutdown()
 
 		r.logger.Info("publisher disconnected",
 			peerAttr(control), sessionAttr(sessionID),
@@ -175,9 +166,7 @@ func (r *Registry) Subscribe(
 	mode proto.Mode,
 	ports uint16,
 ) (proto.SubscriberID, func(), error) {
-	r.mu.Lock()
-	sess, ok := r.sessions[sessionID]
-	r.mu.Unlock()
+	sess, ok := r.sessionFor(sessionID)
 
 	switch {
 	case !ok:
@@ -313,6 +302,8 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 		return fmt.Errorf("unknown or expired request id %d", reqID)
 	}
 
+	_ = subConn.SetDeadline(time.Time{})
+	_ = pubConn.SetDeadline(time.Time{})
 	started := time.Now()
 	r.logger.Info(
 		"stream paired",
@@ -336,58 +327,6 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 	return nil
 }
 
-// session is one active publisher and its currently-attached subscribers.
-type session struct {
-	mode      proto.Mode
-	publisher *tls.Conn
-
-	// ports is how many consecutive ports the publisher forwards. relay
-	// knows nothing about which ports either side actually uses - only how
-	// many there are, which is enough to turn away a subscriber whose
-	// range is a different size and to reject a port index that names
-	// nothing.
-	ports uint16
-
-	// publisherCert is the client certificate the publisher's control
-	// connection authenticated with; AttachPublisherData requires the
-	// publisher's data connections to present the same one.
-	publisherCert *x509.Certificate
-
-	mu sync.Mutex
-
-	// closed marks a session whose publisher has gone (see shutdown).
-	// The registry has already dropped it by then, so this only matters
-	// to a peer that looked the session up just before that happened and
-	// is only now trying to join it.
-	closed bool
-
-	subscribers map[proto.SubscriberID]*subscriberConn
-	nextSubID   proto.SubscriberID
-
-	nextReqID uint64
-	pending   map[uint64]net.Conn
-}
-
-// subscriberConn is what session tracks per attached subscriber: its control
-// connection, which carries the heartbeat and the ControlSessionClosed frame
-// that tells the subscriber its publisher has gone.
-type subscriberConn struct {
-	control *tls.Conn
-}
-
-func newSession(mode proto.Mode, ports uint16, publisher *tls.Conn, publisherCert *x509.Certificate) *session {
-	s := &session{
-		mode:          mode,
-		ports:         ports,
-		publisher:     publisher,
-		publisherCert: publisherCert,
-		subscribers:   make(map[proto.SubscriberID]*subscriberConn),
-		pending:       make(map[uint64]net.Conn),
-	}
-
-	return s
-}
-
 // peerLeafCert returns conn's verified peer leaf certificate. relay's TLS
 // config uses RequireAndVerifyClientCert, so by the time any post-handshake
 // read has succeeded this is always present - but fail closed rather than
@@ -399,143 +338,4 @@ func peerLeafCert(conn *tls.Conn) (*x509.Certificate, error) {
 	}
 
 	return certs[0], nil
-}
-
-// addSubscriber registers control under a freshly allocated SubscriberID.
-// The returned release func removes it and must be called once the
-// subscriber's control connection is done. ok is false if the session has
-// already shut down, in which case nothing was registered and the caller
-// must reject the subscriber.
-func (s *session) addSubscriber(control *tls.Conn) (proto.SubscriberID, func(), bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return 0, nil, false
-	}
-
-	id := s.nextSubID
-	s.nextSubID++
-	s.subscribers[id] = &subscriberConn{control: control}
-
-	return id, func() { s.removeSubscriber(id) }, true
-}
-
-// removeSubscriber forgets id.
-func (s *session) removeSubscriber(id proto.SubscriberID) {
-	s.mu.Lock()
-	delete(s.subscribers, id)
-	s.mu.Unlock()
-}
-
-// addPending stashes conn under a freshly allocated RequestID and arms a
-// timeout that closes conn and forgets the entry if claimPending never
-// claims it within pendingRequestTimeout. ok is false if the session has
-// already shut down - there is no publisher left to fulfill the request,
-// so the caller must reject it rather than let conn wait out the timeout.
-func (s *session) addPending(conn net.Conn) (uint64, bool) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, false
-	}
-	id := s.nextReqID
-	s.nextReqID++
-	s.pending[id] = conn
-	s.mu.Unlock()
-
-	time.AfterFunc(pendingRequestTimeout, func() {
-		s.mu.Lock()
-		c, ok := s.pending[id]
-		if ok {
-			delete(s.pending, id)
-		}
-		s.mu.Unlock()
-
-		if ok {
-			_ = c.Close()
-		}
-	})
-
-	return id, true
-}
-
-// removePending forgets id without claiming it, closing its connection -
-// used when relay fails to even notify the publisher, since no timeout
-// would otherwise fire correctly (the publisher never learns to ask).
-func (s *session) removePending(id uint64) {
-	s.mu.Lock()
-	conn, ok := s.pending[id]
-	if ok {
-		delete(s.pending, id)
-	}
-	s.mu.Unlock()
-
-	if ok {
-		_ = conn.Close()
-	}
-}
-
-// shutdown ends the session for everyone still attached to it: it marks the
-// session closed so nothing new can join, closes every subscriber data
-// connection left waiting on a publisher that will never fulfill it, and
-// sends every attached subscriber a ControlSessionClosed frame carrying
-// reason.
-//
-// Marking closed under the same lock as the snapshot is what makes this
-// airtight: a subscriber that slips into addSubscriber between the
-// registry dropping this session and this call would otherwise never be
-// told, and would wait on the dead session forever - exactly the hang
-// this frame exists to prevent.
-//
-// The pending connections are closed rather than left to their addPending
-// timeouts, since a subscriber whose publisher just vanished shouldn't
-// spend the rest of pendingRequestTimeout finding that out.
-//
-// Subscriber control connections are deliberately left open: the
-// subscriber tears its own end down on reading the frame, and closing
-// here would risk resetting the connection out from under a frame the
-// peer hasn't read yet. A subscriber that ignores the frame is no worse
-// off than before it existed. The writes are best-effort and deadlined,
-// so one wedged subscriber can't hold up the publisher's teardown or the
-// notification owed to everyone behind it.
-// It returns how many subscribers it notified.
-func (s *session) shutdown(reason proto.SessionCloseReason) int {
-	s.mu.Lock()
-	s.closed = true
-
-	pending := s.pending
-	s.pending = make(map[uint64]net.Conn)
-
-	controls := make([]*tls.Conn, 0, len(s.subscribers))
-	for _, sub := range s.subscribers {
-		controls = append(controls, sub.control)
-	}
-
-	s.mu.Unlock()
-
-	for _, conn := range pending {
-		_ = conn.Close()
-	}
-
-	for _, control := range controls {
-		_ = control.SetWriteDeadline(time.Now().Add(notifyWriteTimeout))
-		_ = proto.WriteSessionClosed(control, reason)
-		_ = control.SetWriteDeadline(time.Time{})
-	}
-
-	return len(controls)
-}
-
-// claimPending removes and returns id's pending connection, if it's still
-// there (not yet timed out or already claimed).
-func (s *session) claimPending(id uint64) (net.Conn, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	conn, ok := s.pending[id]
-	if ok {
-		delete(s.pending, id)
-	}
-	return conn, ok
 }

@@ -19,6 +19,9 @@ import (
 	"tornato.dev/ggrok/v2/internal/streamio"
 )
 
+// localDialTimeout bounds attempts to reach a shared service.
+const localDialTimeout = 10 * time.Second
+
 // Config is the input to Run.
 type Config struct {
 	// Server is relay's listen address.
@@ -82,6 +85,9 @@ func Run(ctx context.Context, cfg Config) error {
 // this runs until ctx is canceled or the session turns out to be one no
 // redial can restore.
 func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	slots := make(chan struct{}, peer.MaxTunnels)
 	return session.Serve(ctx, peer.ServeConfig{
 		Mode:  cfg.Mode,
 		Ports: uint16(cfg.Addr.Len()), //nolint:gosec // hostport.ParseRange bounds a range at MaxPorts
@@ -96,7 +102,15 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 			// doesn't stall the read loop - and with it, every other
 			// in-flight request.
 			if reqID, port, err := proto.ReadRequestData(payload); err == nil {
-				go fulfill(ctx, session, cfg.Addr, reqID, port)
+				select {
+				case slots <- struct{}{}:
+					go func() {
+						defer func() { <-slots }()
+						fulfill(ctx, session, cfg.Addr, reqID, port)
+					}()
+				default:
+					// relay will expire requests beyond our capacity.
+				}
 			}
 
 			return nil
@@ -126,12 +140,16 @@ func fulfill(
 		return
 	}
 
-	tunnel, err := session.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachPublisher, RequestID: reqID})
+	tunnel, err := session.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachPublisher, RequestID: reqID, Port: port})
 	if err != nil {
 		return
 	}
 
-	var dialer net.Dialer
+	defer func() { _ = tunnel.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = tunnel.Close() })
+	defer stop()
+
+	dialer := net.Dialer{Timeout: localDialTimeout}
 	localConn, err := dialer.DialContext(ctx, "tcp", local.String())
 	if err != nil {
 		_ = tunnel.Close()

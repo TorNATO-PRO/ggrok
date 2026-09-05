@@ -35,6 +35,9 @@ const (
 // and letting the client decide what to do.
 const dialTimeout = 10 * time.Second
 
+// MaxTunnels bounds concurrent active and establishing tunnels per peer process.
+const MaxTunnels = 256
+
 // Session is everything a peer needs to open connections to relay for one
 // session: where relay is, how to authenticate to it, and the token whose
 // derived keys seal the tunnels it opens.
@@ -83,10 +86,13 @@ func NewSession(
 // the way out. On success the returned tunnel owns it, and closing the
 // tunnel is what closes it.
 func (s Session) OpenTunnel(ctx context.Context, attach proto.Attach) (*proto.EncryptedConn, error) {
-	conn, err := s.dial(ctx, proto.ConnData)
+	conn, err := s.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	tunnel, err := s.attach(conn, attach)
 	if err != nil {
@@ -94,6 +100,7 @@ func (s Session) OpenTunnel(ctx context.Context, attach proto.Attach) (*proto.En
 		return nil, err
 	}
 
+	_ = conn.SetDeadline(time.Time{})
 	return tunnel, nil
 }
 
@@ -103,7 +110,7 @@ func (s Session) OpenTunnel(ctx context.Context, attach proto.Attach) (*proto.En
 // path rather than each on its own.
 func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedConn, error) {
 	attach.SessionID = s.id
-	if err := proto.WriteAttach(conn, attach); err != nil {
+	if err := proto.WriteDataAttach(conn, attach); err != nil {
 		return nil, err
 	}
 
@@ -123,13 +130,12 @@ func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedCo
 		}
 	}
 
-	return proto.NewEncryptedConn(conn, s.token, s.role)
+	return proto.NewAuthenticatedConn(conn, s.token, s.role, attach.Port)
 }
 
-// dial dials relay over TCP+mTLS and writes kind's discriminator, which is
-// the first thing relay reads off any connection and what tells it whether
-// a Hello or an Attach follows.
-func (s Session) dial(ctx context.Context, kind proto.ConnKind) (*tls.Conn, error) {
+// dial dials relay over TCP+mTLS. The caller writes the discriminator
+// alongside its control or data handshake.
+func (s Session) dial(ctx context.Context) (*tls.Conn, error) {
 	dialer := tls.Dialer{NetDialer: &net.Dialer{}, Config: s.tls}
 
 	// The deadline covers reaching relay and nothing after it: per
@@ -151,12 +157,13 @@ func (s Session) dial(ctx context.Context, kind proto.ConnKind) (*tls.Conn, erro
 		return nil, fmt.Errorf("dial %s: unexpected connection type %T", s.relay, conn)
 	}
 
-	setTCPKeepAlive(tlsConn)
-
-	if err := proto.WriteConnKind(tlsConn, kind); err != nil {
+	if tlsConn.ConnectionState().NegotiatedProtocol != proto.ALPN {
 		_ = tlsConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("relay did not negotiate %s", proto.ALPN)
 	}
+
+	_ = tlsConn.SetDeadline(time.Now().Add(dialTimeout))
+	setTCPKeepAlive(tlsConn)
 
 	return tlsConn, nil
 }

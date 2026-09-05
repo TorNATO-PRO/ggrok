@@ -18,8 +18,7 @@ import (
 // Remember that a byte is 8 bits :).
 const tokenSize = 16
 
-// tokenEncoding renders a Token as lowercase, unpadded base32 - shorter and
-// more copy/paste friendly than hex, and case-insensitive unlike base64.
+// tokenEncoding renders a Token as uppercase, unpadded base32.
 var tokenEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
 // Token is the bearer secret that scopes a listen subscriber to one share's

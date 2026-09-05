@@ -14,8 +14,9 @@ import (
 // unlike the concrete *[net.TCPConn] underneath, plainConn doesn't promote
 // those methods, and [io.Copy]'s type assertions for them fail. That mirrors
 // the legs that actually use the copy buffer in production - relay's
-// tls.Conn pairs and the encrypted tunnel in share and listen - where no
-// shortcut applies and the caller's buffer is what moves the bytes.
+// tls.Conn pairs - where no shortcut applies and the caller's buffer is
+// what moves the bytes. Share/listen instead have a raw TCP connection on
+// one side, so those copies bypass the supplied buffer.
 type plainConn struct {
 	net.Conn
 }
@@ -125,8 +126,8 @@ func BenchmarkSplice(b *testing.B) {
 		// copy loop - exactly the fast path a raw *net.TCPConn gets in
 		// production too. Wrapping to only expose Read/Write/Close mimics
 		// the legs where neither side gets that shortcut and our buffer is
-		// the one doing the copying: relay's paired tls.Conns, and the
-		// proto.EncryptedConn side of share's and listen's splices.
+		// the one doing the copying: relay's paired tls.Conns. Share/listen's
+		// splices include raw TCP connections and bypass this buffer.
 		streamio.Splice(plainConn{srcServer}, plainConn{sinkServer})
 	}()
 

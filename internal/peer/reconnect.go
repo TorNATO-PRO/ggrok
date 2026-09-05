@@ -128,16 +128,24 @@ func (s Session) Serve(ctx context.Context, cfg ServeConfig) error {
 // the pair of steps that either yields a live session or yields nothing -
 // a handshake relay rejects leaves no connection worth keeping.
 func (s Session) connect(ctx context.Context, mode proto.Mode, ports uint16) (*tls.Conn, error) {
-	control, err := s.dial(ctx, proto.ConnControl)
+	control, err := s.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	stop := context.AfterFunc(ctx, func() { _ = control.Close() })
+	defer stop()
+
+	if err := proto.WriteConnKind(control, proto.ConnControl); err != nil {
+		_ = control.Close()
+		return nil, err
+	}
 	if err := proto.Handshake(control, s.role, mode, ports, s.token); err != nil {
 		_ = control.Close()
 		return nil, err
 	}
 
+	_ = control.SetDeadline(time.Time{})
 	return control, nil
 }
 

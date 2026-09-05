@@ -46,23 +46,39 @@ type Attach struct {
 	// relay carries it to the publisher in the ControlRequestData that
 	// asks for the matching data connection, since that's the only thing
 	// telling share which of its local ports to dial. A publisher's
-	// attach names the request rather than the port, and leaves this zero.
+	// attach names the request; its local Port is also used by the end-to-end
+	// handshake to verify that relay preserved the subscriber's requested port.
 	Port PortIndex
 }
 
 // WriteAttach writes a's fixed-width wire encoding to w in a single Write.
 func WriteAttach(w io.Writer, a Attach) error {
+	return writeAttach(w, a, false)
+}
+
+// WriteDataAttach writes the connection discriminator and Attach together.
+// The bytes are identical to WriteConnKind(ConnData) followed by WriteAttach.
+func WriteDataAttach(w io.Writer, a Attach) error {
+	return writeAttach(w, a, true)
+}
+
+func writeAttach(w io.Writer, a Attach, withKind bool) error {
 	if a.Kind != AttachSubscriber && a.Kind != AttachPublisher {
 		return fmt.Errorf("write attach: invalid kind %d", a.Kind)
 	}
 
-	var buf [attachSize]byte
+	var storage [1 + attachSize]byte
+	buf := storage[1:]
 	buf[0] = byte(a.Kind)
 	copy(buf[1:], a.SessionID[:])
 	binary.BigEndian.PutUint64(buf[attachRequestOffset:], a.RequestID)
 	binary.BigEndian.PutUint16(buf[attachPortOffset:], uint16(a.Port))
 
-	if _, err := w.Write(buf[:]); err != nil {
+	if withKind {
+		storage[0] = byte(ConnData)
+		buf = storage[:]
+	}
+	if err := writeFull(w, buf); err != nil {
 		return fmt.Errorf("write attach: %w", err)
 	}
 

@@ -101,7 +101,7 @@ func WriteControlFrame(w io.Writer, typ ControlType, payload []byte) error {
 	binary.BigEndian.PutUint32(buf[1:], uint32(len(payload))) //nolint:gosec // bounded by maxControlPayload above
 	copy(buf[controlHeaderSize:], payload)
 
-	if _, err := w.Write(buf); err != nil {
+	if err := writeFull(w, buf); err != nil {
 		return fmt.Errorf("write control frame: %w", err)
 	}
 

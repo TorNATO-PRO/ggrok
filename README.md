@@ -7,7 +7,7 @@ GGrok is a TCP tunneling tool. It operates at OSI level 4.
 Using `ggrok share -tcp`, you may share a local TCP service - or a whole contiguous
 range of ports - through the tunnel to any number of concurrent `listen` subscribers holding the
 session's token.
-`relay` brokers every session over the public internet without ever terminating TLS. Each
+`relay` terminates each peer's transport TLS connection and forwards a separate end-to-end encrypted stream. Each
 node is mutually authenticated by a private CA you run yourself!
 
 Every connection is TLS 1.3 mTLS against that same CA: both the control connection and the data
@@ -106,6 +106,21 @@ Binds `127.0.0.1:9090` locally; every connection to it is forwarded through rela
 is serving. The token can come from `GGROK_TOKEN` instead of the positional argument, keeping it out
 of shell history.
 
+### Upgrading the wire protocol
+
+This version uses ALPN `ggrok/2`. Upgrade relay, share, and listen together; version 1 peers
+cannot connect. The new end-to-end handshake prevents recorded connections or data frames
+from being replayed into a fresh tunnel, and authenticates the requested port before share
+opens the local service. Tokens and certificates keep their existing format.
+
+Credential issuance now requires fresh output files: existing `cert.pem`, `key.pem`, or
+`ca.pem` files (including symlinks) are refused. For rotation, issue into a new directory
+that you control, then explicitly switch the node to the new bundle.
+
+Relay permits at most 1024 concurrent sockets, including TLS handshakes, control sockets,
+pending data sockets, and both halves of active streams. Excess connections are closed. Share and listen each cap concurrent tunnels at 256;
+excess publisher requests time out and excess local listener connections are closed.
+
 ### Port ranges
 
 `-tcp` takes `host:first-last` in place of `host:port`, forwarding every port in the
@@ -161,8 +176,10 @@ tunneling, and per the next section it could not read the payload even if it wan
 #### End-to-end encryption, not just hop-by-hop
 
 mTLS secures each leg to relay separately, which would ordinarily make relay a place where plaintext
-appears. It isn't. The session token is run through HKDF-SHA256 to derive three independent values: a
-`SessionID`, and one ChaCha20-Poly1305 key per direction. Relay is handed only the `SessionID`, which
+appears. It isn't. The session token derives the routing `SessionID`. Before forwarding application bytes,
+share and listen exchange fresh challenges and HMAC-SHA256 proofs of token possession, binding
+both roles and the requested port index. A separate transcript-bound secret derives one
+XChaCha20-Poly1305 key per direction for that connection. Relay is handed only the `SessionID`, which
 is enough to pair a publisher with its subscribers and nowhere near enough to decrypt a frame - the
 data keys are not derivable from it, and relay never holds the token they come from.
 
@@ -190,10 +207,21 @@ cert = "you're allowed on my network", token = "you're allowed in *this* tunnel.
 You can revoke a certificate and send it to the server. A subsequent connection will no longer work for
 the revoked client.
 
-#### Tokens never touch argv or shell history
+#### Keeping tokens out of argv and shell history
 
 You can use environment variables to accomplish this. I recommend passing in sensitive data as environment variables.
 
 ### Disclaimers
 
-I don't recommend using this to subvert a firewall. I imagine this would be pretty easy to fingerprint (the ALPN is literally `ggrok/1`, and ALPNs are sent in cleartext in TLS 1.3). You also should keep your endpoints secure, as if those are owned, then no amount of channel security will save you.
+I don't recommend using this to subvert a firewall. I imagine this would be pretty easy to fingerprint (the ALPN is literally `ggrok/2`, and ALPNs are sent in cleartext in TLS 1.3). You also should keep your endpoints secure, as if those are owned, then no amount of channel security will save you.
+
+
+### Security limits and audit
+
+Anyone with the session token can authenticate as either end of its encrypted streams;
+issue a separate token for each trust group. Token-derived encryption does not provide
+forward secrecy against later disclosure of that token. A relay can still deny service,
+observe traffic sizes and timing, and terminate a TCP stream; applications that need an
+authenticated end-of-message must enforce that in their own protocol.
+
+See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for the audit findings and remaining improvements.

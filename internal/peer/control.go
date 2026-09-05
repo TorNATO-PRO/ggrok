@@ -79,6 +79,7 @@ func sendPings(control *tls.Conn, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
+			_ = control.SetWriteDeadline(time.Now().Add(heartbeatInterval))
 			if err := proto.WriteControlFrame(control, proto.ControlPing, nil); err != nil {
 				return
 			}

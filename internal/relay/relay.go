@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -56,6 +57,8 @@ type Config struct {
 // per peer for the life of its session, and one short-lived data connection
 // per forwarded stream.
 func Run(ctx context.Context, cfg Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	revoked, err := loadRevokedSerials(cfg.RevokedFile)
 	if err != nil {
 		return fmt.Errorf("relay: %w", err)
@@ -66,11 +69,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("relay: %w", err)
 	}
 
-	listener, err := tls.Listen("tcp", cfg.Listen.String(), tlsConf)
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(ctx, "tcp", cfg.Listen.String())
 	if err != nil {
 		return fmt.Errorf("relay: listen on %s: %w", cfg.Listen, err)
 	}
 	defer func() { _ = listener.Close() }()
+	var connections connectionSet
+	defer connections.closeAll()
 
 	go func() {
 		<-ctx.Done()
@@ -92,14 +98,12 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("relay: accept: %w", err)
 		}
 
-		tlsConn, ok := conn.(*tls.Conn)
+		tracked, ok := connections.track(conn)
 		if !ok {
-			// tls.Listen's Listener always hands back *tls.Conn from
-			// Accept; this is unreachable in practice, but fail closed
-			// rather than panic on a type assertion further down.
 			_ = conn.Close()
 			continue
 		}
+		tlsConn := tls.Server(tracked, tlsConf)
 
 		go handleConn(ctx, logger, registry, tlsConn)
 	}
@@ -133,11 +137,16 @@ func loadRevokedSerials(path string) (map[string]struct{}, error) {
 // closing conn only in the cases where neither of those takes over that
 // responsibility (see their doc comments).
 func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
-	_ = conn.SetReadDeadline(time.Now().Add(helloTimeout))
+	_ = conn.SetDeadline(time.Now().Add(helloTimeout))
 
 	kind, err := proto.ReadConnKind(conn)
 	if err != nil {
 		logger.WarnContext(ctx, "read conn kind", "peer", conn.RemoteAddr(), "err", err)
+		_ = conn.Close()
+		return
+	}
+
+	if conn.ConnectionState().NegotiatedProtocol != proto.ALPN {
 		_ = conn.Close()
 		return
 	}
@@ -200,8 +209,10 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 // hung, symmetric to how share/listen notice a dead relay by timing out
 // waiting for a ControlPong.
 func runHeartbeatLoop(ctx context.Context, conn *tls.Conn) {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	for ctx.Err() == nil {
-		_ = conn.SetReadDeadline(time.Now().Add(heartbeatSilenceTimeout))
+		_ = conn.SetDeadline(time.Now().Add(heartbeatSilenceTimeout))
 
 		typ, _, err := proto.ReadControlFrame(conn)
 		if err != nil {

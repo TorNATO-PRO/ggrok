@@ -17,11 +17,9 @@ const directions = 2
 // built-in default is 32KiB; a larger buffer trades a bit of memory for fewer
 // Read/Write calls per byte moved.
 //
-// It only takes effect on legs where neither side is a *[net.TCPConn], since
-// *[net.TCPConn] implements [io.ReaderFrom]/[io.WriterTo] and [io.CopyBuffer]
-// hands those off to Go's own copy loop, silently ignoring this buffer. So it
-// applies to the encrypted tunnel legs in share and listen, and is a no-op
-// wherever a raw TCP connection sits on both sides.
+// It only takes effect when neither source WriterTo nor destination ReaderFrom
+// handles the copy. In particular, share/listen's TCP legs bypass this buffer;
+// relay's TLS-to-TLS copies use it.
 const copyBufferSize = 128 * 1024
 
 // bufPool recycles copy buffers across Splice calls so each forwarded
@@ -49,21 +47,30 @@ func Splice(a, b io.ReadWriteCloser) (int64, int64) {
 
 	go func() {
 		defer wg.Done()
-		buf, _ := bufPool.Get().(*[]byte)
-		defer bufPool.Put(buf)
-		intoA, _ = io.CopyBuffer(a, b, *buf) // best-effort proxy; the Close below is what matters
+		intoA, _ = copyStream(a, b) // best-effort proxy; the Close below is what matters
 		_ = a.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		buf, _ := bufPool.Get().(*[]byte)
-		defer bufPool.Put(buf)
-		intoB, _ = io.CopyBuffer(b, a, *buf) // best-effort proxy; the Close below is what matters
+		intoB, _ = copyStream(b, a) // best-effort proxy; the Close below is what matters
 		_ = b.Close()
 	}()
 
 	wg.Wait()
 
 	return intoA, intoB
+}
+
+// copyStream borrows a buffer only when [io.Copy] will actually use it.
+func copyStream(dst io.Writer, src io.Reader) (int64, error) {
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	if rf, ok := dst.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	buf, _ := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+	return io.CopyBuffer(dst, src, *buf)
 }

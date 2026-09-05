@@ -358,3 +358,77 @@ func TestSameRoleBothEndsFails(t *testing.T) {
 		t.Fatal("a peer with the same role decrypted the frame")
 	}
 }
+
+func TestReadAcrossChangingFrameSizes(t *testing.T) {
+	t.Parallel()
+	token := newToken(t)
+	var wire, want bytes.Buffer
+	writer, err := proto.NewEncryptedConn(sink{&wire}, token, proto.RolePublish)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, size := range []int{1, 32768, 3, proto.MaxFramePlaintext, 19} {
+		data := bytes.Repeat([]byte{byte(i + 1)}, size)
+		want.Write(data)
+		if _, writeErr := writer.Write(data); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	reader, err := proto.NewEncryptedConn(source{&wire}, token, proto.RoleSubscribe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got bytes.Buffer
+	buf := make([]byte, 7)
+	for {
+		n, err := reader.Read(buf)
+		got.Write(buf[:n])
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatal("frame buffer reuse corrupted partial reads")
+	}
+}
+
+// BenchmarkEncryptedRead includes per-stream setup and decryption of 1 MiB.
+func BenchmarkEncryptedRead(b *testing.B) {
+	var token proto.Token
+	var wire bytes.Buffer
+	writer, err := proto.NewEncryptedConn(sink{&wire}, token, proto.RolePublish)
+	if err != nil {
+		b.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{42}, 1<<20)
+	if _, err := writer.Write(payload); err != nil {
+		b.Fatal(err)
+	}
+	raw := wire.Bytes()
+	buf := make([]byte, 4096)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for b.Loop() {
+		reader, err := proto.NewEncryptedConn(source{bytes.NewReader(raw)}, token, proto.RoleSubscribe)
+		if err != nil {
+			b.Fatal(err)
+		}
+		total := 0
+		for {
+			n, err := reader.Read(buf)
+			total += n
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		if total != len(payload) {
+			b.Fatalf("read %d bytes", total)
+		}
+	}
+}

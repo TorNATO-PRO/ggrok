@@ -184,11 +184,12 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 	// to take every one of them: canceling ctx closes all the listeners at
 	// once, so they all fail together, and a shallower channel would leave
 	// every loop but the first parked on a send forever.
+	slots := make(chan struct{}, peer.MaxTunnels)
 	acceptErr := make(chan error, len(listeners))
 	for i, ln := range listeners {
 		port := proto.PortIndex(i)
 		go func() {
-			acceptErr <- acceptLoop(ctx, session, ln, port)
+			acceptErr <- acceptLoop(ctx, session, ln, port, slots)
 		}()
 	}
 
@@ -236,6 +237,7 @@ func acceptLoop(
 	session peer.Session,
 	ln net.Listener,
 	port proto.PortIndex,
+	slots chan struct{},
 ) error {
 	for {
 		local, err := ln.Accept()
@@ -243,13 +245,24 @@ func acceptLoop(
 			return err
 		}
 
-		go forward(ctx, session, local, port)
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				forward(ctx, session, local, port)
+			}()
+		default:
+			_ = local.Close()
+		}
 	}
 }
 
 // forward opens a tunnel for local, tagged with the port it arrived on, and
 // splices the two once relay has paired it with the publisher's end.
 func forward(ctx context.Context, session peer.Session, local net.Conn, port proto.PortIndex) {
+	stop := context.AfterFunc(ctx, func() { _ = local.Close() })
+	defer stop()
+
 	tunnel, err := session.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachSubscriber, Port: port})
 	if err != nil {
 		// A local client left connected to a tunnel that never formed would

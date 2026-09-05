@@ -151,28 +151,16 @@ func runCAInit(args []string) error {
 		return err
 	}
 
-	// A second `ca init` over an existing root would silently orphan every
-	// certificate it already signed, since their trust chain depends on
-	// this exact key. Refuse rather than clobber.
-	if _, err := os.Stat(filepath.Join(cfg.out, caCertFile)); err == nil {
-		return fmt.Errorf("a CA already exists at %s; remove it first if you mean to replace it", cfg.out)
-	}
-
 	bundle, err := ca.Init(cfg.commonName, cfg.validity)
 	if err != nil {
 		return fmt.Errorf("generate root CA: %w", err)
 	}
 
-	if err := os.MkdirAll(cfg.out, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", cfg.out, err)
-	}
-
-	if err := os.WriteFile(filepath.Join(cfg.out, caCertFile), bundle.CertPEM, 0o600); err != nil {
-		return fmt.Errorf("write root certificate: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(cfg.out, caKeyFile), bundle.KeyPEM, 0o600); err != nil {
-		return fmt.Errorf("write root key: %w", err)
+	if err := writeCredentials(cfg.out, map[string][]byte{
+		caCertFile: bundle.CertPEM,
+		caKeyFile:  bundle.KeyPEM,
+	}); err != nil {
+		return err
 	}
 
 	fmt.Fprintf(os.Stdout, "initialized root CA %q in %s, valid until %s\n",
@@ -292,22 +280,12 @@ func runCAIssue(args []string) error {
 		return fmt.Errorf("record issued certificate: %w", err)
 	}
 
-	if err := os.MkdirAll(cfg.out, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", cfg.out, err)
-	}
-
-	// cert.pem/key.pem/ca.pem mirrors the layout share/get expect in their
-	// own config directory, so -out can point straight at one.
-	if err := os.WriteFile(filepath.Join(cfg.out, "cert.pem"), bundle.CertPEM, 0o600); err != nil {
-		return fmt.Errorf("write issued certificate: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(cfg.out, "key.pem"), bundle.KeyPEM, 0o600); err != nil {
-		return fmt.Errorf("write issued key: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(cfg.out, "ca.pem"), root.CertPEM, 0o600); err != nil {
-		return fmt.Errorf("write root certificate: %w", err)
+	if err := writeCredentials(cfg.out, map[string][]byte{
+		"cert.pem": bundle.CertPEM,
+		"key.pem":  bundle.KeyPEM,
+		"ca.pem":   root.CertPEM,
+	}); err != nil {
+		return err
 	}
 
 	fmt.Fprintf(os.Stdout, "issued certificate for %q (serial %s) in %s, valid until %s\n",

@@ -337,7 +337,16 @@ func ParseRevokedSerials(r io.Reader) (map[string]struct{}, error) {
 			continue
 		}
 
-		serials[line] = struct{}{}
+		for _, digit := range line {
+			if !strings.ContainsRune("0123456789abcdefABCDEF", digit) {
+				return nil, fmt.Errorf("invalid revoked serial %q", line)
+			}
+		}
+		serial, ok := new(big.Int).SetString(line, SerialTextBase)
+		if !ok || serial.Sign() <= 0 {
+			return nil, fmt.Errorf("invalid revoked serial %q", line)
+		}
+		serials[serial.Text(SerialTextBase)] = struct{}{}
 	}
 
 	if err := scanner.Err(); err != nil {

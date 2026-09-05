@@ -282,3 +282,47 @@ func TestSessionCloseReasonStringsUnknownValue(t *testing.T) {
 		t.Error("unknown reason rendered as empty string")
 	}
 }
+
+type countingWriter struct {
+	bytes.Buffer
+
+	writes int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
+}
+
+func TestDataAttachMatchesSeparateWrites(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []proto.AttachKind{proto.AttachSubscriber, proto.AttachPublisher} {
+		want := proto.Attach{Kind: kind, SessionID: proto.SessionID{1, 2, 3}, RequestID: 123, Port: 42}
+		var separate bytes.Buffer
+		if err := proto.WriteConnKind(&separate, proto.ConnData); err != nil {
+			t.Fatal(err)
+		}
+		if err := proto.WriteAttach(&separate, want); err != nil {
+			t.Fatal(err)
+		}
+		var combined countingWriter
+		if err := proto.WriteDataAttach(&combined, want); err != nil {
+			t.Fatal(err)
+		}
+		if combined.writes != 1 || !bytes.Equal(combined.Bytes(), separate.Bytes()) {
+			t.Fatal("combined handshake changed bytes or used multiple writes")
+		}
+		gotKind, err := proto.ReadConnKind(&combined)
+		if err != nil || gotKind != proto.ConnData {
+			t.Fatalf("kind = %v, %v", gotKind, err)
+		}
+		got, err := proto.ReadAttach(&combined)
+		if err != nil || got != want {
+			t.Fatalf("attach = %+v, %v", got, err)
+		}
+	}
+	var invalid countingWriter
+	if err := proto.WriteDataAttach(&invalid, proto.Attach{}); err == nil || invalid.writes != 0 {
+		t.Fatal("invalid attach emitted bytes")
+	}
+}

@@ -29,7 +29,7 @@ func WriteConnKind(w io.Writer, kind ConnKind) error {
 		return fmt.Errorf("write conn kind: invalid kind %d", kind)
 	}
 
-	if _, err := w.Write([]byte{byte(kind)}); err != nil {
+	if err := writeFull(w, []byte{byte(kind)}); err != nil {
 		return fmt.Errorf("write conn kind: %w", err)
 	}
 

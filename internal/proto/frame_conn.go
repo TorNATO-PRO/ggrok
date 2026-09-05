@@ -64,6 +64,7 @@ type EncryptedConn struct {
 	// independent and never contend. Each is still guarded, because a
 	// counter that drifts from the order frames actually hit the wire
 	// desynchronizes the peer permanently rather than corrupting one frame.
+	writeErr    error
 	writeMu     sync.Mutex
 	writeAEAD   cipher.AEAD
 	writeSeq    uint64
@@ -71,21 +72,26 @@ type EncryptedConn struct {
 	writePrefix [noncePrefixSize]byte
 	prefixSent  bool
 
+	readErr    error
 	readMu     sync.Mutex
 	readAEAD   cipher.AEAD
 	readSeq    uint64
 	readPrefix [noncePrefixSize]byte
 	prefixSeen bool
-	readBuf    []byte // ciphertext staging, reused per frame
-	plainBuf   []byte // decrypted frame, reused per frame
-	plain      []byte // the part of plainBuf not yet handed to a Read
+	readBuf    []byte // ciphertext and in-place plaintext storage, reused per frame
+	plain      []byte // the part of readBuf not yet handed to a Read
 }
 
+// NewEncryptedConn is the low-level frame codec. Network callers must use
+// NewAuthenticatedConn, which supplies a fresh, authenticated stream secret.
 // NewEncryptedConn wraps conn for role's side of token's session. role picks
 // which of the two directional keys this peer writes with and which it reads
 // with; the two ends of a connection must pass opposite roles or neither can
 // decrypt the other.
 func NewEncryptedConn(conn io.ReadWriteCloser, token Token, role Role) (*EncryptedConn, error) {
+	if role != RolePublish && role != RoleSubscribe {
+		return nil, fmt.Errorf("encrypted conn: invalid role %d", role)
+	}
 	pubToSub, subToPub := deriveDataKeys(token)
 
 	writeKey, readKey := pubToSub, subToPub
@@ -134,8 +140,18 @@ func (c *EncryptedConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	written := 0
 	for {
+		if c.writeSeq == math.MaxUint64 {
+			c.writeErr = fmt.Errorf("frame counter exhausted")
+			return written, c.writeErr
+		}
 		chunk := p[written:]
 		if len(chunk) > maxFramePlaintext {
 			chunk = chunk[:maxFramePlaintext]
@@ -160,8 +176,9 @@ func (c *EncryptedConn) Write(p []byte) (int, error) {
 		binary.BigEndian.PutUint16(c.writeBuf[lenAt:], uint16(len(c.writeBuf)-lenAt-frameLenSize))
 		c.writeSeq++
 
-		if _, err := c.conn.Write(c.writeBuf); err != nil {
-			return written, fmt.Errorf("write frame: %w", err)
+		if err := writeFull(c.conn, c.writeBuf); err != nil {
+			c.writeErr = fmt.Errorf("write frame: %w", err)
+			return written, c.writeErr
 		}
 		c.prefixSent = true
 
@@ -182,10 +199,15 @@ func (c *EncryptedConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+
 	// A peer that sends empty frames would otherwise have Read return
 	// (0, nil) forever, which io.Copy spins on rather than treating as EOF.
 	for len(c.plain) == 0 {
 		if err := c.readFrame(); err != nil {
+			c.readErr = err
 			return 0, err
 		}
 	}
@@ -196,9 +218,13 @@ func (c *EncryptedConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// readFrame pulls one frame off the wire and opens it into plainBuf. Callers
+// readFrame pulls one frame off the wire and decrypts it in place. Callers
 // must hold readMu.
 func (c *EncryptedConn) readFrame() error {
+	if c.readSeq == math.MaxUint64 {
+		return fmt.Errorf("frame counter exhausted")
+	}
+
 	// The peer's nonce prefix comes once, ahead of its first frame. An EOF
 	// here is a peer that closed without ever sending one - nothing was
 	// forwarded, which is a clean end of stream rather than a failure.
@@ -238,13 +264,12 @@ func (c *EncryptedConn) readFrame() error {
 	}
 
 	open := nonce(c.readPrefix, c.readSeq)
-	plain, err := c.readAEAD.Open(c.plainBuf[:0], open[:], c.readBuf, nil)
+	plain, err := c.readAEAD.Open(c.readBuf[:0], open[:], c.readBuf, nil)
 	if err != nil {
 		return fmt.Errorf("decrypt frame %d: %w", c.readSeq, err)
 	}
 	c.readSeq++
 
-	c.plainBuf = plain
 	c.plain = plain
 
 	return nil

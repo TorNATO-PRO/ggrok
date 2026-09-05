@@ -21,8 +21,9 @@ import (
 //
 // The current version covers: TCP-only sessions, Hello and Attach naming a
 // session by its derived SessionID rather than by its token, and a data
-// plane whose bytes are sealed end-to-end (see EncryptedConn).
-const ALPN = "ggrok/1"
+// plane authenticated against fresh challenges and its port before any local
+// service is opened (see NewAuthenticatedConn).
+const ALPN = "ggrok/2"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never
@@ -110,7 +111,7 @@ func WriteHello(w io.Writer, h Hello) error {
 	binary.BigEndian.PutUint16(buf[helloPortsOffset:], h.Ports)
 	copy(buf[helloSessionOffset:], h.SessionID[:])
 
-	if _, err := w.Write(buf[:]); err != nil {
+	if err := writeFull(w, buf[:]); err != nil {
 		return fmt.Errorf("write hello: %w", err)
 	}
 
@@ -206,7 +207,7 @@ func (s AckStatus) Err() error {
 
 // WriteAck writes status to w in a single Write.
 func WriteAck(w io.Writer, status AckStatus) error {
-	if _, err := w.Write([]byte{byte(status)}); err != nil {
+	if err := writeFull(w, []byte{byte(status)}); err != nil {
 		return fmt.Errorf("write ack: %w", err)
 	}
 
@@ -251,7 +252,7 @@ func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, token T
 // SubscriberID identifies one listen connection within a session, assigned by
 // relay when it bridges a subscriber. It is relay's own bookkeeping - it
 // never reaches either peer.
-type SubscriberID uint16
+type SubscriberID uint64
 
 // PortIndex names one port by its offset within a session's range rather
 // than by number - index 0 is the first port share forwards and the first
