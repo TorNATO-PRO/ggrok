@@ -146,7 +146,8 @@ type PeerSummary struct {
 }
 
 // StreamSummary is one forwarded connection currently being spliced. The
-// byte counts are monotonic totals for this stream, not rates.
+// byte counts are monotonic totals for this stream, not rates; clients may
+// derive a rate from the stream start time or from successive snapshots.
 type StreamSummary struct {
 	ReqID      uint64    `json:"req"`
 	Port       uint16    `json:"port"`

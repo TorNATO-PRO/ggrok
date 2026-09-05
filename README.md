@@ -229,15 +229,17 @@ ggrok admin reload-crl                        # re-read the revoked list, and en
 
 `ls` reports each session's publisher and subscribers by the identity the CA vouched for, plus every
 forwarded connection currently open with a running byte count - which for a tunnel that stays up for
-hours is the only account there is, since the log line for a stream is written when it *ends*.
+hours is the only account there is, since the log line for a stream is written when it *ends*. Each
+byte count is followed by the average rate in decimal megabits per second over the stream's whole
+life, so a snapshot answers "is this moving?" without having to diff two of them by hand.
 
 ```
 session 8f8220ea7b37  tcp  1 port(s)  up 4m12s
   ROLE        COMMON NAME  SERIAL                            ADDRESS          UP
   publisher   my-laptop    568c02dc8f5b2edddc5435018992b366  10.0.0.4:51558   4m12s
   subscriber  friends-lap  f3de3b55a4d3c7cc0d95eddf208cbc01  10.0.0.9:51565   4m10s
-  STREAM  PORT  AGE    TO SUBSCRIBER  TO PUBLISHER
-  0       0     3m58s  525520         525520
+  STREAM  PORT  AGE    TO SUBSCRIBER  Mb/s   TO PUBLISHER  Mb/s
+  0       0     3m58s  525520         0.018  525520        0.018
 ```
 
 Note what that means, because it is a real change and not only a convenience: **an operator can see

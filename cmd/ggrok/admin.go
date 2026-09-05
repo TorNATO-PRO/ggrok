@@ -373,19 +373,42 @@ func printStreams(out *os.File, now time.Time, sess proto.SessionSummary) {
 	sort.Slice(streams, func(i, j int) bool { return streams[i].ReqID < streams[j].ReqID })
 
 	w := tabwriter.NewWriter(out, 0, tableTabWidth, tableColumnPadding, ' ', 0)
-	fmt.Fprintln(w, "  STREAM\tPORT\tAGE\tTO SUBSCRIBER\tTO PUBLISHER")
+	fmt.Fprintln(w, "  STREAM\tPORT\tAGE\tTO SUBSCRIBER\tMb/s\tTO PUBLISHER\tMb/s")
 	for _, str := range streams {
-		fmt.Fprintf(w, "  %d\t%d\t%s\t%d\t%d\n",
-			str.ReqID, str.Port, roundedSince(now, str.Started), str.BytesToSub, str.BytesToPub)
+		fmt.Fprintf(w, "  %d\t%d\t%s\t%d\t%s\t%d\t%s\n",
+			str.ReqID, str.Port, roundedSince(now, str.Started),
+			str.BytesToSub, megabitsPerSecond(str.BytesToSub, now, str.Started),
+			str.BytesToPub, megabitsPerSecond(str.BytesToPub, now, str.Started))
 	}
 	// A pending request is a subscriber waiting on a publisher that has not
 	// answered yet. Showing it separately is the point: a tunnel that is
 	// stuck looks entirely different from one that is merely quiet.
 	for _, req := range sess.Pending {
-		fmt.Fprintf(w, "  %d\t%d\t%s\tpending\tpending\n",
+		fmt.Fprintf(w, "  %d\t%d\t%s\tpending\tpending\tpending\tpending\n",
 			req.ReqID, req.Port, roundedSince(now, req.Since))
 	}
 	_ = w.Flush()
+}
+
+// bitsPerByte and bitsPerMegabit convert a byte count into the decimal
+// megabits network throughput is conventionally quoted in - decimal, so a
+// megabit is 10^6 bits and not 2^20.
+const (
+	bitsPerByte    = 8
+	bitsPerMegabit = 1_000_000
+)
+
+// megabitsPerSecond renders the average decimal megabits per second since a
+// stream started. A one-shot snapshot cannot measure a recent window without
+// retaining state between admin commands, while this average remains useful
+// and deterministic for every invocation.
+func megabitsPerSecond(byteCount int64, now, started time.Time) string {
+	seconds := now.Sub(started).Seconds()
+	if byteCount <= 0 || seconds <= 0 {
+		return "0.000"
+	}
+
+	return fmt.Sprintf("%.3f", float64(byteCount)*bitsPerByte/(seconds*bitsPerMegabit))
 }
 
 // roundedSince renders how long ago t was, relative to the snapshot's own
