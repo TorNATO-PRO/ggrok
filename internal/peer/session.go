@@ -39,36 +39,36 @@ const dialTimeout = 10 * time.Second
 const MaxTunnels = 256
 
 // Session is everything a peer needs to open connections to relay for one
-// session: where relay is, how to authenticate to it, and the token whose
-// derived keys seal the tunnels it opens.
+// session: where relay is, how to authenticate to it, and the credentials
+// whose derived keys seal the tunnels it opens.
 //
-// The token itself never reaches the wire. What identifies the session to
-// relay is the SessionID derived from it once here, which is enough to
-// route by and not enough to decrypt with.
+// No secret in those credentials reaches the wire. What identifies the
+// session to relay is their SessionID, which is enough to route by and not
+// enough to decrypt with; a publisher additionally signs for it, which proves
+// the session is its own without handing over what did the signing.
 type Session struct {
 	relay hostport.HostPort
 	tls   *tls.Config
-	token proto.Token
+	creds proto.Credentials
 	role  proto.Role
 	id    proto.SessionID
 }
 
-// NewSession pairs relay's address and TLS config with the token and role
-// this peer holds, deriving the session's routing identifier up front -
-// it's a fixed function of the token, and every connection the session
-// opens names the same one.
+// NewSession pairs relay's address and TLS config with the credentials and
+// role this peer holds, lifting out the session's routing identifier up front
+// - every connection the session opens names the same one.
 func NewSession(
 	relay hostport.HostPort,
 	tlsConf *tls.Config,
-	token proto.Token,
+	creds proto.Credentials,
 	role proto.Role,
 ) Session {
 	return Session{
 		relay: relay,
 		tls:   tlsConf,
-		token: token,
+		creds: creds,
 		role:  role,
-		id:    proto.DeriveSessionID(token),
+		id:    creds.SessionID(),
 	}
 }
 
@@ -130,7 +130,7 @@ func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedCo
 		}
 	}
 
-	return proto.NewAuthenticatedConn(conn, s.token, s.role, attach.Port)
+	return proto.NewAuthenticatedConn(conn, s.creds, s.role, attach.Port)
 }
 
 // dial dials relay over TCP+mTLS. The caller writes the discriminator

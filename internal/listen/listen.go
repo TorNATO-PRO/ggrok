@@ -46,8 +46,10 @@ type Config struct {
 	// different size.
 	Addr hostport.Range
 
-	// Token identifies which publisher's session to subscribe to.
-	Token proto.Token
+	// Token identifies which publisher's session to subscribe to, and
+	// carries the secret sealing its traffic. It is what share hands out;
+	// it deliberately cannot publish the session (see proto.SubscriberToken).
+	Token proto.SubscriberToken
 
 	// OnListen, if non-nil, is called once per port with that socket's
 	// actual bound address right after it's bound - the requested address
@@ -87,7 +89,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	session := peer.NewSession(cfg.Server, tlsConf, cfg.Token, proto.RoleSubscribe)
+	session := peer.NewSession(cfg.Server, tlsConf, cfg.Token.Credentials(), proto.RoleSubscribe)
 
 	switch cfg.Mode {
 	case proto.ModeTCP:

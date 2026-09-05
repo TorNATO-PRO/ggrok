@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/proto"
 	"tornato.dev/ggrok/v2/internal/streamio"
 )
@@ -91,23 +92,65 @@ func peerAttr(conn net.Conn) slog.Attr {
 	return slog.Group("peer", addr, slog.String("cn", cert.Subject.CommonName))
 }
 
-// Register adds control as sessionID's publisher control connection and
-// writes the corresponding ack to control. ports is how many consecutive
-// ports the publisher forwards, which every subscriber then has to match.
-// On success it returns an unregister func the caller must invoke (e.g.
-// via defer) once control is done, so a later publish under the same sessionID
-// can succeed; the returned error is nil. On failure the returned func is
-// nil and the error describes why - the caller owns closing control in
+// peerIdentity is who a connection belongs to, in the form an operator reads
+// and acts on. It is peerAttr's content captured as data rather than as a log
+// record, because the same three facts answer "who is attached" in a snapshot
+// and "which connections does this serial cover" for a kick.
+//
+// Serial is rendered in ca.SerialTextBase, the same form ca crl writes and
+// verifyNotRevoked compares, so a serial read off a listing can be pasted
+// straight into a revoked file.
+type peerIdentity struct {
+	cn     string
+	serial string
+	addr   string
+}
+
+// identityOf renders cert and addr as a peerIdentity. A nil cert yields the
+// address alone - relay requires and verifies a client certificate, so that
+// should not happen, but a snapshot is not worth a panic.
+func identityOf(cert *x509.Certificate, addr net.Addr) peerIdentity {
+	id := peerIdentity{}
+	if addr != nil {
+		id.addr = addr.String()
+	}
+	if cert != nil {
+		id.cn = cert.Subject.CommonName
+		id.serial = cert.SerialNumber.Text(ca.SerialTextBase)
+	}
+
+	return id
+}
+
+// Register adds control as hello.SessionID's publisher control connection and
+// writes the corresponding ack to control. hello.Ports is how many
+// consecutive ports the publisher forwards, which every subscriber then has
+// to match. On success it returns an unregister func the caller must invoke
+// (e.g. via defer) once control is done, so a later publish under the same
+// SessionID can succeed; the returned error is nil. On failure the returned
+// func is nil and the error describes why - the caller owns closing control in
 // that case.
-func (r *Registry) Register(
-	control *tls.Conn,
-	sessionID proto.SessionID,
-	mode proto.Mode,
-	ports uint16,
-) (func(), error) {
+//
+// The slot is only ever handed to a peer that proves the session is its own.
+// A SessionID is not a credential - it's a pure function of the publisher's
+// session public key, and every subscriber holds it - so without the claim
+// below, any token holder could wait for the real publisher's connection to
+// sever and register in its place, serving its own service to every other
+// subscriber while the displaced publisher was locked out of its own tunnel.
+func (r *Registry) Register(control *tls.Conn, hello proto.Hello) (func(), error) {
+	sessionID, mode, ports := hello.SessionID, hello.Mode, hello.Ports
+
 	publisherCert, err := peerLeafCert(control)
 	if err != nil {
-		_ = proto.WriteAck(control, proto.AckNoSuchSession)
+		_ = proto.WriteAck(control, proto.AckDenied)
+		return nil, fmt.Errorf("register publisher: %w", err)
+	}
+
+	// Prove first, claim second. Running the challenge before the occupancy
+	// check also keeps relay from telling an unauthenticated claimant
+	// whether a session exists at all.
+	if err := proto.VerifyPublishClaim(control, hello); err != nil {
+		_ = proto.WriteAck(control, proto.AckDenied)
 		return nil, fmt.Errorf("register publisher: %w", err)
 	}
 
@@ -150,8 +193,8 @@ func (r *Registry) Register(
 }
 
 // Subscribe attaches control as a subscriber's control connection to
-// sessionID's session and writes the corresponding ack. ports is how many
-// consecutive ports the subscriber binds, which must match what the
+// hello.SessionID's session and writes the corresponding ack. hello.Ports is
+// how many consecutive ports the subscriber binds, which must match what the
 // session's publisher registered: the two sides address ports by index
 // into their own ranges, so a subscriber binding more ports than the
 // publisher forwards has ports that lead nowhere, and one binding fewer
@@ -160,12 +203,14 @@ func (r *Registry) Register(
 // control is done; the returned error is nil. On failure the returned func
 // is nil and the error describes why - the caller owns closing control in
 // that case.
-func (r *Registry) Subscribe(
-	control *tls.Conn,
-	sessionID proto.SessionID,
-	mode proto.Mode,
-	ports uint16,
-) (proto.SubscriberID, func(), error) {
+//
+// There is no counterpart to Register's publish claim here, and deliberately
+// so: holding the SessionID is what a subscriber's authorization consists of,
+// and everything it can then reach is sealed under a secret relay does not
+// have.
+func (r *Registry) Subscribe(control *tls.Conn, hello proto.Hello) (proto.SubscriberID, func(), error) {
+	sessionID, mode, ports := hello.SessionID, hello.Mode, hello.Ports
+
 	sess, ok := r.sessionFor(sessionID)
 
 	switch {
@@ -248,7 +293,7 @@ func (r *Registry) AttachSubscriberData(subConn net.Conn, sessionID proto.Sessio
 	// As in Subscribe, take the slot before acking, so a publisher
 	// unregistering right now can't leave an acked connection waiting on
 	// a request it will never make.
-	reqID, ok := sess.addPending(subConn)
+	reqID, ok := sess.addPending(subConn, port)
 	if !ok {
 		_ = proto.WriteAck(subConn, proto.AckNoSuchSession)
 		return errNoSuchSession
@@ -297,7 +342,7 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 		return errNotPublisherCert
 	}
 
-	subConn, ok := sess.claimPending(reqID)
+	subConn, port, ok := sess.claimPending(reqID)
 	if !ok {
 		return fmt.Errorf("unknown or expired request id %d", reqID)
 	}
@@ -305,6 +350,19 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 	_ = subConn.SetDeadline(time.Time{})
 	_ = pubConn.SetDeadline(time.Time{})
 	started := time.Now()
+
+	// Register the stream before splicing and forget it after. A session
+	// that shut down between claimPending and here has already been told
+	// there is nothing left to tear down, so splicing into it would leave a
+	// stream nothing owns - close both legs instead.
+	str := &stream{port: port, started: started, counter: &streamio.Counter{}, sub: subConn, pub: pubConn}
+	if !sess.addStream(reqID, str) {
+		_ = subConn.Close()
+		_ = pubConn.Close()
+		return errNoSuchSession
+	}
+	defer sess.removeStream(reqID)
+
 	r.logger.Info(
 		"stream paired",
 		sessionAttr(sessionID), slog.Uint64("req", reqID),
@@ -312,10 +370,11 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 		slog.Group("publisher", "addr", pubConn.RemoteAddr()),
 	)
 
-	// Splice blocks for the whole life of the forwarded connection, so
-	// this is the only moment relay can say what it carried - both legs
-	// are closed by the time it returns.
-	toSub, toPub := streamio.Splice(subConn, pubConn)
+	// Splice blocks for the whole life of the forwarded connection, so its
+	// return values are the only complete record of what the connection
+	// carried. str.counter is the same account while it is still running,
+	// which is what an operator can actually observe.
+	toSub, toPub := streamio.SpliceCounted(subConn, pubConn, str.counter)
 
 	r.logger.Info(
 		"stream closed",

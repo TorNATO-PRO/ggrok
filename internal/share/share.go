@@ -2,8 +2,8 @@
 // under proto.RolePublish, and for every connection relay asks it for, dials
 // the local service and forwards bytes. relay never terminates the forwarded
 // service - it only pairs this connection with however many listen
-// subscribers present the matching token, and what it splices between them is
-// ciphertext only the two peers can read.
+// subscribers present the matching subscriber token, and what it splices
+// between them is ciphertext only the two peers can read.
 package share
 
 import (
@@ -41,8 +41,11 @@ type Config struct {
 	// port number (see proto.PortIndex).
 	Addr hostport.Range
 
-	// Token scopes which listen subscribers may reach this session.
-	Token proto.Token
+	// SessionKey is this session's root secret. Everything else is derived
+	// from it: the identifier relay routes by, the signing key that proves
+	// to relay the session is ours, and the subscriber token to hand out
+	// (see proto.Credentials).
+	SessionKey proto.SessionKey
 
 	// OnDisconnect and OnReconnect, if non-nil, report the session losing
 	// relay and getting it back. Run keeps redialing rather than returning
@@ -54,9 +57,9 @@ type Config struct {
 	OnReconnect  func()
 }
 
-// Run registers Config.Token as a publisher and forwards traffic to
-// Config.Addr until ctx is canceled or an unrecoverable error occurs. A
-// relay that goes away is redialed rather than reported: see
+// Run registers Config.SessionKey's session as a publisher and forwards
+// traffic to Config.Addr until ctx is canceled or an unrecoverable error
+// occurs. A relay that goes away is redialed rather than reported: see
 // [peer.Session.Serve] for what counts as unrecoverable, and
 // Config.OnDisconnect for how to hear about the rest.
 func Run(ctx context.Context, cfg Config) error {
@@ -64,12 +67,17 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("share: no local address to forward")
 	}
 
+	creds, err := cfg.SessionKey.Credentials()
+	if err != nil {
+		return fmt.Errorf("share: %w", err)
+	}
+
 	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, false, nil)
 	if err != nil {
 		return fmt.Errorf("share: %w", err)
 	}
 
-	session := peer.NewSession(cfg.Server, tlsConf, cfg.Token, proto.RolePublish)
+	session := peer.NewSession(cfg.Server, tlsConf, creds, proto.RolePublish)
 
 	switch cfg.Mode {
 	case proto.ModeTCP:

@@ -9,6 +9,7 @@ import (
 
 	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/proto"
+	"tornato.dev/ggrok/v2/internal/streamio"
 )
 
 // certificateConn completes a real handshake to populate ConnectionState.
@@ -64,13 +65,13 @@ func TestSubscriberCertificateReferences(t *testing.T) {
 	}
 	releaseA()
 	releaseA() // release must not decrement the remaining registration twice
-	id, ok := s.addPending(conn)
+	id, ok := s.addPending(conn, 0)
 	if !ok {
 		t.Fatal("remaining registration lost authorization")
 	}
 	s.removePending(id)
 	releaseB()
-	if _, ok := s.addPending(conn); ok {
+	if _, ok := s.addPending(conn, 0); ok {
 		t.Fatal("last release retained authorization")
 	}
 	if len(s.subscriberCerts) != 0 {
@@ -90,7 +91,7 @@ func TestPendingTimerCleanup(t *testing.T) {
 				t.Fatal("registration rejected")
 			}
 			defer release()
-			id, ok := s.addPending(conn)
+			id, ok := s.addPending(conn, 0)
 			if !ok {
 				t.Fatal("pending request rejected")
 			}
@@ -110,7 +111,7 @@ func TestPendingTimerCleanup(t *testing.T) {
 			if timer.Stop() {
 				t.Fatal("completed request left an active timer")
 			}
-			if _, ok := s.claimPending(id); ok {
+			if _, _, ok := s.claimPending(id); ok {
 				t.Fatal("completed request could be claimed again")
 			}
 		})
@@ -136,7 +137,7 @@ func waitPendingGone(t *testing.T, s *session, id uint64) {
 
 func assertClaim(t *testing.T, s *session, id uint64, want net.Conn) {
 	t.Helper()
-	got, ok := s.claimPending(id)
+	got, _, ok := s.claimPending(id)
 	if !ok || got != want {
 		t.Fatal("claim lost connection")
 	}
@@ -189,7 +190,7 @@ func checkPendingOwnership(t *testing.T, shutdown bool) {
 		}
 	}()
 	close(start)
-	claimed, ok := s.claimPending(0)
+	claimed, _, ok := s.claimPending(0)
 	<-done
 	wantCloses := int32(1)
 	if ok {
@@ -203,5 +204,40 @@ func checkPendingOwnership(t *testing.T, shutdown bool) {
 	}
 	if timer.Stop() {
 		t.Fatal("completed request retained an active timer")
+	}
+}
+
+// TestStreamRegistration covers the bookkeeping an admin snapshot reads: a
+// live stream is visible while it runs and forgotten after, and a session that
+// has already shut down refuses to take one, since beginShutdown has finished
+// closing everything it knew about and a stream registered afterwards would be
+// owned by nobody.
+func TestStreamRegistration(t *testing.T) {
+	t.Parallel()
+
+	s := newSession(proto.ModeTCP, 1, nil, nil)
+	str := &stream{port: 3, started: time.Now(), counter: &streamio.Counter{}}
+
+	if !s.addStream(7, str) {
+		t.Fatal("open session refused a stream")
+	}
+	s.mu.Lock()
+	got, tracked := s.streams[7]
+	s.mu.Unlock()
+	if !tracked || got != str {
+		t.Fatal("registered stream is not visible")
+	}
+
+	s.removeStream(7)
+	s.mu.Lock()
+	_, tracked = s.streams[7]
+	s.mu.Unlock()
+	if tracked {
+		t.Fatal("finished stream is still tracked")
+	}
+
+	s.shutdown()
+	if s.addStream(8, str) {
+		t.Fatal("shut-down session accepted a stream")
 	}
 }

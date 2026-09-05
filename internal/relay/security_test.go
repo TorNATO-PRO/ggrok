@@ -2,7 +2,9 @@ package relay_test
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -43,7 +45,16 @@ func testTLSConfig(t *testing.T, root *ca.CA, server bool) *tls.Config {
 	return cfg
 }
 
-func registerControl(t *testing.T, addr string, cfg *tls.Config, token proto.Token, role proto.Role) *tls.Conn {
+// dialControl opens a control connection and runs its handshake, returning
+// relay's verdict rather than failing on it - the tests below care about
+// which peers relay turns away as much as which it accepts.
+func dialControl(
+	t *testing.T,
+	addr string,
+	cfg *tls.Config,
+	creds proto.Credentials,
+	role proto.Role,
+) (*tls.Conn, error) {
 	t.Helper()
 	conn, err := tls.Dial("tcp", addr, cfg)
 	if err != nil {
@@ -54,16 +65,31 @@ func registerControl(t *testing.T, addr string, cfg *tls.Config, token proto.Tok
 	if err := proto.WriteConnKind(conn, proto.ConnControl); err != nil {
 		t.Fatal(err)
 	}
-	if err := proto.Handshake(conn, role, proto.ModeTCP, 2, token); err != nil {
+
+	return conn, proto.Handshake(conn, role, proto.ModeTCP, 2, creds)
+}
+
+func registerControl(
+	t *testing.T,
+	addr string,
+	cfg *tls.Config,
+	creds proto.Credentials,
+	role proto.Role,
+) *tls.Conn {
+	t.Helper()
+	conn, err := dialControl(t, addr, cfg, creds, role)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return conn
 }
 
-func TestTunnelCertificateBindingAndRoundTrip(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+// testRelay stands a relay up on a fresh CA and returns its address along
+// with that CA, so a test can mint however many distinct peer identities it
+// needs against it.
+func testRelay(ctx context.Context, t *testing.T) (hostport.HostPort, *ca.CA) {
+	t.Helper()
+
 	bundle, err := ca.Init("test root", ca.DefaultCAValidity)
 	if err != nil {
 		t.Fatal(err)
@@ -72,44 +98,168 @@ func TestTunnelCertificateBindingAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", testTLSConfig(t, root, true))
+
+	serverTLS := testTLSConfig(t, root, true)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { _ = ln.Close() })
+
 	logger := slog.New(slog.DiscardHandler)
 	registry := relay.NewRegistry(logger)
+	handle := relay.HandleConnFunc(logger, registry, relay.TestServerConfig{Admin: true})
 	go func() {
 		for {
 			conn, acceptErr := ln.Accept()
 			if acceptErr != nil {
 				return
 			}
-			go relay.HandleConn(ctx, logger, registry, conn.(*tls.Conn))
+			go handle(ctx, conn, serverTLS)
 		}
 	}()
+
 	addr, err := hostport.Parse(ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := proto.NewToken()
+
+	return addr, root
+}
+
+// newSession mints a fresh session key and returns the publisher's
+// credentials and the subscriber's, exactly as share would derive one and
+// hand out the other.
+func newSession(t *testing.T) (proto.Credentials, proto.Credentials) {
+	t.Helper()
+
+	key, err := proto.NewSessionKey()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	publisher, err := key.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return publisher, publisher.SubscriberToken().Credentials()
+}
+
+// TestSubscriberCannotTakeThePublisherSlot is the hijack this protocol
+// version exists to close. A subscriber holds the session's data secret and
+// can derive its SessionID, so under the old first-come-wins registration it
+// could wait for the real publisher's connection to sever - which relay
+// tolerates for a full heartbeat timeout, and which the reconnect backoff is
+// deliberately shaped around - register in its place, and serve its own
+// service to every other subscriber while the displaced publisher was locked
+// out of its own tunnel.
+//
+// Relay now hands the slot only to a peer that signs for the key the
+// SessionID commits to, which a subscriber token does not carry.
+func TestSubscriberCannotTakeThePublisherSlot(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	addr, root := testRelay(ctx, t)
+	publisher, subscriber := newSession(t)
+
+	// An honest build won't even try: Handshake has nothing to sign with.
+	// That is defence in depth rather than the defence - an attacker runs
+	// whatever build it likes - so it is asserted and then stepped around.
+	if _, err := dialControl(
+		t, addr.String(), testTLSConfig(t, root, false), subscriber, proto.RolePublish,
+	); err == nil {
+		t.Fatal("a subscriber's own client produced a publish claim")
+	}
+
+	// What an attacker actually sends. The slot is free - nobody has
+	// published this session yet - so the claim is the only thing between a
+	// forged Hello and the session.
+	forged := proto.Hello{
+		Role:      proto.RolePublish,
+		Mode:      proto.ModeTCP,
+		Ports:     2,
+		SessionID: subscriber.SessionID(), // which is the publisher's, derived
+	}
+	if err := forgeClaim(t, addr.String(), testTLSConfig(t, root, false), forged); !errors.Is(err, proto.ErrDenied) {
+		t.Fatalf("forged publish claim = %v, want ErrDenied", err)
+	}
+
+	// And the real publisher still gets the slot afterwards - a denied claim
+	// must not have consumed or poisoned it on the way out.
+	registerControl(t, addr.String(), testTLSConfig(t, root, false), publisher, proto.RolePublish)
+}
+
+// forgeClaim registers hello with a fabricated answer to relay's challenge,
+// which is the best a peer without the session key can do, and returns
+// relay's verdict. A relay that hung up rather than acking is reported as a
+// denial: it is one, and the distinction is not what this test is about.
+func forgeClaim(t *testing.T, addr string, cfg *tls.Config, hello proto.Hello) error {
+	t.Helper()
+
+	conn, dialErr := tls.Dial("tcp", addr, cfg)
+	if dialErr != nil {
+		t.Fatal(dialErr)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if err := proto.WriteConnKind(conn, proto.ConnControl); err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.WriteHello(conn, hello); err != nil {
+		t.Fatal(err)
+	}
+
+	var challenge [32]byte
+	if _, err := io.ReadFull(conn, challenge[:]); err != nil {
+		return proto.ErrDenied
+	}
+
+	proof := make([]byte, forgedProofSize)
+	if _, err := rand.Read(proof); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(proof); err != nil {
+		return proto.ErrDenied
+	}
+
+	status, ackErr := proto.ReadAck(conn)
+	if ackErr != nil {
+		return proto.ErrDenied
+	}
+
+	return status.Err()
+}
+
+// forgedProofSize is the width of an ML-DSA-65 public key plus a signature,
+// which is what relay reads before it decides. A forgery has to be the right
+// length to even reach the check that rejects it.
+const forgedProofSize = 1952 + 3309
+
+func TestTunnelCertificateBindingAndRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	addr, root := testRelay(ctx, t)
+	publisher, subscriber := newSession(t)
+
 	pubCfg, subCfg := testTLSConfig(t, root, false), testTLSConfig(t, root, false)
-	pubControl := registerControl(t, addr.String(), pubCfg, token, proto.RolePublish)
-	registerControl(t, addr.String(), subCfg, token, proto.RoleSubscribe)
+	pubControl := registerControl(t, addr.String(), pubCfg, publisher, proto.RolePublish)
+	registerControl(t, addr.String(), subCfg, subscriber, proto.RoleSubscribe)
 
 	// Same CN and CA, different leaf: a routing ID and a network certificate
 	// must not substitute for that subscriber's control certificate.
-	intruder := peer.NewSession(addr, testTLSConfig(t, root, false), token, proto.RoleSubscribe)
+	intruder := peer.NewSession(addr, testTLSConfig(t, root, false), subscriber, proto.RoleSubscribe)
 	if tunnel, attachErr := intruder.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachSubscriber}); attachErr == nil {
 		_ = tunnel.Close()
 		t.Fatal("unregistered certificate attached a subscriber stream")
 	}
 
-	pub := peer.NewSession(addr, pubCfg, token, proto.RolePublish)
-	sub := peer.NewSession(addr, subCfg, token, proto.RoleSubscribe)
+	pub := peer.NewSession(addr, pubCfg, publisher, proto.RolePublish)
+	sub := peer.NewSession(addr, subCfg, subscriber, proto.RoleSubscribe)
 	result := make(chan error, 1)
 	go func() { result <- echoRequest(ctx, pubControl, pub) }()
 	tunnel, err := sub.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachSubscriber, Port: 1})

@@ -30,21 +30,23 @@ type listenConfig struct {
 	addr hostport.Range
 
 	// token identifies which publisher's session to subscribe to.
-	token proto.Token
+	token proto.SubscriberToken
 }
 
 // listenUsage marks the usage string for the listen subcommand.
 const listenUsage = `ggrok listen - subscribe to a share's session and forward it to local ports
 
 Usage:
-  ggrok listen -tcp <addr> [flags] <token>
+  ggrok listen -tcp <addr> -token-file <file> [flags]
 
 An <addr> is host:port, or host:first-last to bind a whole range of ports
 at once. The range must be the same size as the one the share forwards;
 the two are matched port for port from the start of each range.
 
-The token may instead be supplied via the GGROK_TOKEN environment
-variable, which keeps it out of process listings and shell history.
+The subscriber token comes from -token-file (or "-" for stdin), the
+GGROK_TOKEN environment variable, or -token. It is still accepted as a
+positional argument, which is deprecated: an argument is visible to every
+local user through ps and is kept in shell history.
 
 Flags:
 `
@@ -89,6 +91,14 @@ func parseListenFlags(args []string) (listenConfig, error) {
 		},
 	)
 
+	// Registered after parsing rather than as flag defaults, so
+	// PrintDefaults never echoes the token into usage or flag-error output.
+	var tokenStr, tokenFile string
+	fs.StringVar(&tokenStr, "token", "",
+		"the subscriber token to join (env GGROK_TOKEN; prefer -token-file)")
+	fs.StringVar(&tokenFile, "token-file", "",
+		"read the subscriber token from this file instead of -token or the environment (\"-\" for stdin)")
+
 	if err = parseFlags(fs, args); err != nil {
 		return listenConfig{}, err
 	}
@@ -102,22 +112,49 @@ func parseListenFlags(args []string) (listenConfig, error) {
 		return listenConfig{}, fmt.Errorf("-tcp <addr> is required")
 	}
 
-	tokenStr := os.Getenv("GGROK_TOKEN")
-	switch {
-	case fs.NArg() == 1:
-		tokenStr = fs.Arg(0)
-	case fs.NArg() != 0 || tokenStr == "":
-		fs.Usage()
-		return listenConfig{}, fmt.Errorf("exactly one token argument (or GGROK_TOKEN) is required")
+	tokenStr, err = resolveSubscriberToken(fs, tokenStr, tokenFile)
+	if err != nil {
+		return listenConfig{}, err
 	}
 
-	token, err := proto.ParseToken(tokenStr)
+	token, err := proto.ParseSubscriberToken(tokenStr)
 	if err != nil {
-		return listenConfig{}, fmt.Errorf("invalid token: %w", err)
+		return listenConfig{}, fmt.Errorf("invalid subscriber token: %w", err)
 	}
 	cfg.token = token
 
 	return cfg, nil
+}
+
+// resolveSubscriberToken picks the token out of the sources listen accepts,
+// in descending order of how well each keeps it out of view: a file, an
+// explicit flag, the environment, and finally the positional argument.
+//
+// The positional form is deprecated rather than removed - it is what every
+// existing script and every README predating -token-file passes - so it still
+// works and says why it shouldn't.
+func resolveSubscriberToken(fs *flag.FlagSet, tokenStr, tokenFile string) (string, error) {
+	if fs.NArg() > 1 {
+		fs.Usage()
+		return "", fmt.Errorf("at most one token argument is accepted")
+	}
+
+	switch {
+	case tokenFile != "":
+		return readSecretFile(tokenFile)
+	case tokenStr != "":
+		return tokenStr, nil
+	case os.Getenv("GGROK_TOKEN") != "":
+		return os.Getenv("GGROK_TOKEN"), nil
+	case fs.NArg() == 1:
+		fmt.Fprintln(os.Stderr,
+			"warning: passing the subscriber token as an argument is deprecated - "+
+				"it is visible in process listings and shell history; use -token-file or GGROK_TOKEN")
+		return fs.Arg(0), nil
+	default:
+		fs.Usage()
+		return "", fmt.Errorf("a subscriber token is required (-token-file, -token, or GGROK_TOKEN)")
+	}
 }
 
 // runListen runs the listen command, subscribing to a share's session by

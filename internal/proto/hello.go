@@ -19,11 +19,19 @@ import (
 // as an error. Negotiating the version in the handshake turns that into a
 // clean refusal to connect.
 //
+// Purely additive changes do not bump it, because they cannot produce that
+// failure. A new ConnKind value (see ConnAdmin) is the worked example: an
+// older peer reading it fails in ReadConnKind and closes, which is already
+// the clean refusal this pin exists to produce. What forces a bump is an
+// existing byte meaning something new, or a handshake growing a round-trip.
+//
 // The current version covers: TCP-only sessions, Hello and Attach naming a
-// session by its derived SessionID rather than by its token, and a data
-// plane authenticated against fresh challenges and its port before any local
-// service is opened (see NewAuthenticatedConn).
-const ALPN = "ggrok/2"
+// session by a SessionID derived from the publisher's session public key, a
+// publish handshake in which relay challenges the claimant to sign for that
+// key (see VerifyPublishClaim), and a data plane authenticated against fresh
+// challenges and its port before any local service is opened (see
+// NewAuthenticatedConn).
+const ALPN = "ggrok/3"
 
 // Role says which end of a session a connection belongs to. The zero value
 // is deliberately unused by either constant, so a zeroed Hello is never
@@ -105,17 +113,25 @@ func WriteHello(w io.Writer, h Hello) error {
 		return fmt.Errorf("write hello: port count must be at least 1")
 	}
 
-	var buf [helloSize]byte
-	buf[0] = byte(h.Role)
-	buf[1] = byte(h.Mode)
-	binary.BigEndian.PutUint16(buf[helloPortsOffset:], h.Ports)
-	copy(buf[helloSessionOffset:], h.SessionID[:])
-
+	buf := encodeHello(h)
 	if err := writeFull(w, buf[:]); err != nil {
 		return fmt.Errorf("write hello: %w", err)
 	}
 
 	return nil
+}
+
+// encodeHello renders h's fixed-width wire encoding. It is shared with
+// publishClaim, so what a publisher signs is byte-for-byte what relay read -
+// re-deriving the bytes on either side would risk the two drifting apart the
+// next time a field is added.
+func encodeHello(h Hello) [helloSize]byte {
+	var buf [helloSize]byte
+	buf[0] = byte(h.Role)
+	buf[1] = byte(h.Mode)
+	binary.BigEndian.PutUint16(buf[helloPortsOffset:], h.Ports)
+	copy(buf[helloSessionOffset:], h.SessionID[:])
+	return buf
 }
 
 // ReadHello reads and validates a Hello previously written by WriteHello.
@@ -170,6 +186,12 @@ const (
 	// AckPortsMismatch means a subscriber's port count doesn't match the
 	// session's publisher - see Hello.Ports.
 	AckPortsMismatch
+
+	// AckDenied means relay refused this peer outright rather than because
+	// of a timing or configuration mismatch: a publisher that could not
+	// prove the session is its own (see VerifyPublishClaim) is the only
+	// thing that earns it today.
+	AckDenied
 )
 
 // The errors [AckStatus.Err] reports, one per rejection status. They're
@@ -179,11 +201,14 @@ const (
 // turned away with ErrNoSuchSession or ErrPublisherExists and should try
 // again, where a mode or port-count disagreement means the two peers were
 // started with incompatible arguments and no amount of retrying settles it.
+// ErrDenied is terminal in the same way for a different reason: relay
+// refused this peer for who it is, and another attempt is the same peer.
 var (
 	ErrNoSuchSession   = errors.New("no active session for this token")
 	ErrModeMismatch    = errors.New("mode does not match this session's publisher")
-	ErrPublisherExists = errors.New("this token already has an active publisher")
+	ErrPublisherExists = errors.New("this session already has an active publisher")
 	ErrPortsMismatch   = errors.New("port count does not match this session's publisher")
+	ErrDenied          = errors.New("relay denied this peer")
 )
 
 // Err returns nil for AckOK, and the matching sentinel for every rejection
@@ -200,6 +225,8 @@ func (s AckStatus) Err() error {
 		return ErrPublisherExists
 	case AckPortsMismatch:
 		return ErrPortsMismatch
+	case AckDenied:
+		return ErrDenied
 	default:
 		return fmt.Errorf("unknown ack status %d", s)
 	}
@@ -232,13 +259,25 @@ func ReadAck(r io.Reader) (AckStatus, error) {
 // and need the same send-Hello/await-ack handling before doing anything else
 // on the connection.
 //
-// token itself never reaches the wire - what identifies the session to relay
-// is its derived SessionID, which is enough to route by and not enough to
-// decrypt with.
-func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, token Token) error {
-	sessionID := DeriveSessionID(token)
-	if err := WriteHello(stream, Hello{Role: role, Mode: mode, Ports: ports, SessionID: sessionID}); err != nil {
+// A publisher answers relay's challenge in between, since the SessionID names
+// a session without proving any right to it - every subscriber can derive the
+// same value. Nothing a subscriber can produce passes that step, which is
+// what keeps one from taking the publisher slot the moment the real
+// publisher's connection drops.
+//
+// No secret in creds reaches the wire: what identifies the session to relay
+// is the SessionID, which is enough to route by and not enough to decrypt
+// with, and what claims it is a signature rather than the key that made it.
+func Handshake(stream io.ReadWriter, role Role, mode Mode, ports uint16, creds Credentials) error {
+	hello := Hello{Role: role, Mode: mode, Ports: ports, SessionID: creds.SessionID()}
+	if err := WriteHello(stream, hello); err != nil {
 		return err
+	}
+
+	if role == RolePublish {
+		if err := provePublisher(stream, creds, hello); err != nil {
+			return err
+		}
 	}
 
 	status, err := ReadAck(stream)

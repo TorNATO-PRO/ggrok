@@ -21,11 +21,30 @@ const (
 	// ConnData marks a connection carrying an Attach message and then the
 	// sealed bytes of exactly one forwarded stream.
 	ConnData
+
+	// ConnAdmin marks a connection from an operator's admin client: it
+	// carries an AdminHello and then admin frames for as long as the
+	// operator keeps it open. Unlike ConnControl and ConnData it belongs to
+	// no session - it is about relay itself.
+	//
+	// Adding this value did not bump ALPN, deliberately. The pin exists so
+	// that peers which disagree about what a byte means refuse each other,
+	// and an older relay reading this kind fails in ReadConnKind with
+	// "invalid kind 3" and closes - a clean refusal, which is the outcome
+	// the pin is there to guarantee. No existing byte changed meaning.
+	ConnAdmin
 )
+
+// validConnKind reports whether kind is one this build knows. Both directions
+// check it, so a garbled or newer byte is refused at the edge rather than
+// dispatched on.
+func validConnKind(kind ConnKind) bool {
+	return kind == ConnControl || kind == ConnData || kind == ConnAdmin
+}
 
 // WriteConnKind writes kind to w in a single Write.
 func WriteConnKind(w io.Writer, kind ConnKind) error {
-	if kind != ConnControl && kind != ConnData {
+	if !validConnKind(kind) {
 		return fmt.Errorf("write conn kind: invalid kind %d", kind)
 	}
 
@@ -44,7 +63,7 @@ func ReadConnKind(r io.Reader) (ConnKind, error) {
 	}
 
 	kind := ConnKind(buf[0])
-	if kind != ConnControl && kind != ConnData {
+	if !validConnKind(kind) {
 		return 0, fmt.Errorf("read conn kind: invalid kind %d", kind)
 	}
 

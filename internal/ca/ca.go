@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -42,6 +43,21 @@ const (
 
 	// serialBits is the width of a freshly generated serial number.
 	serialBits = 128
+
+	// adminEKUEnterprise is the private-enterprise arc this project's role
+	// OIDs live under, and adminEKULeaf identifies the admin role within
+	// it. Split into two named components so a second role, if one is ever
+	// justified, is a sibling leaf rather than an unrelated number.
+	//
+	// The RFC 4122 arc (2.25.<uuid as an integer>) would be the
+	// collision-free choice and needs no registration, but a 128-bit UUID
+	// cannot be expressed here: [x509.Certificate]'s UnknownExtKeyUsage is
+	// [][asn1.ObjectIdentifier], and an [asn1.ObjectIdentifier] is []int, so a
+	// component caps at maxint. (x509.OID does carry arbitrary precision,
+	// but only Certificate.Policies is wired to it, not extended key
+	// usages.)
+	adminEKUEnterprise = 62841
+	adminEKULeaf       = 1
 
 	// issuedDirName and revokedDirName are the subdirectories of a CA
 	// directory that List, Revoke, and Store agree on.
@@ -84,10 +100,22 @@ type IssueRequest struct {
 	// Validity determines how long the certificate should remain valid.
 	Validity time.Duration
 
-	// Server marks the certificate for server authentication as well as client
-	// authentication. The relay needs one of these to present on its own
-	// listener; publishing devices do not.
+	// Server marks the certificate for server authentication instead of
+	// client authentication. The relay needs one of these to present on its
+	// own listener; publishing devices do not.
+	//
+	// Dedicated-use rather than both: relay only ever calls tls.Listen, so a
+	// leaf that also asserts clientAuth claims a capability nothing in this
+	// system exercises. Certificates issued before this was narrowed keep
+	// working - they simply assert more than they need.
 	Server bool
+
+	// Admin marks the certificate as authorized on relay's admin connection
+	// path (see AdminEKU). It keeps clientAuth as well, which is not
+	// optional: Go verifies client chains against that usage, so an admin
+	// certificate without it would fail the TLS handshake outright and
+	// never reach the role check.
+	Admin bool
 
 	// DNSNames marks the different DNS names that are covered under this certificate.
 	DNSNames []string
@@ -99,6 +127,44 @@ type IssueRequest struct {
 // serialLimit is the largest possible number you can have
 // for a serial number.
 var serialLimit = new(big.Int).Lsh(big.NewInt(1), serialBits)
+
+// AdminEKU marks a certificate as authorized on relay's admin connection
+// path. Relay checks for it on the verified leaf and nowhere else.
+//
+// It is an extended key usage rather than a Common Name convention because
+// Issue's own invariant - the CN is a label for logging and audit, never an
+// input to an authorization decision - is exactly what a CN check would
+// break, and because a CN is spoofable by anyone who can ask the CA operator
+// for a certificate with a particular name.
+//
+// Nothing here ever chains to the public web PKI: LoadConfig never consults
+// the system trust store, the root asserts no EKU at all (so it is
+// unconstrained and permits any usage beneath it), and MaxPathLenZero means
+// there is no intermediate for the public dedicated-use rules to describe.
+// That independence is the argument for a private OID over a standard one:
+// the certificates broken by the ecosystem's clientAuth churn were the ones
+// keying authorization off a usage whose meaning was defined elsewhere.
+//
+// Written out in full rather than derived from a shared parent slice: an
+// [asn1.ObjectIdentifier] is []int, and building siblings with append invites
+// the aliasing bug where two of them share a backing array.
+var AdminEKU = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, adminEKUEnterprise, 1, adminEKULeaf}
+
+// HasAdminEKU reports whether cert carries AdminEKU. Certificates list
+// unrecognized usages in UnknownExtKeyUsage - "unknown" meaning unknown to
+// crypto/x509's own enum, not unrecognized by us.
+func HasAdminEKU(cert *x509.Certificate) bool {
+	if cert == nil {
+		return false
+	}
+	for _, oid := range cert.UnknownExtKeyUsage {
+		if oid.Equal(AdminEKU) {
+			return true
+		}
+	}
+
+	return false
+}
 
 // Init generates a new self-signed root certificate authority.
 func Init(commonName string, validity time.Duration) (*Bundle, error) {
@@ -191,12 +257,22 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		return nil, err
 	}
 
-	// Every device cert can authenticate as a client; that is the publish gate.
-	// Any valid cert is equally trusted to publish, so the CN is a label for
-	// logging and audit, never an input to an authorization decision.
+	// Every device cert can authenticate as a client; that is the gate on
+	// connecting at all. Any valid cert is equally trusted to connect, so
+	// the CN is a label for logging and audit, never an input to an
+	// authorization decision - the one role that is an authorization
+	// decision rides on an EKU below, for exactly that reason.
+	//
+	// A relay's certificate asserts serverAuth instead of clientAuth rather
+	// than in addition to it: relay only listens, and a leaf asserting a
+	// usage nothing exercises is the multi-purpose pattern worth avoiding.
 	usages := []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	var unknownUsages []asn1.ObjectIdentifier
 	if request.Server {
-		usages = append(usages, x509.ExtKeyUsageServerAuth)
+		usages = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	if request.Admin {
+		unknownUsages = append(unknownUsages, AdminEKU)
 	}
 
 	tmpl := &x509.Certificate{
@@ -205,10 +281,11 @@ func (c *CA) Issue(request IssueRequest) (*Bundle, error) {
 		NotBefore:    now.Add(-5 * time.Minute),
 		NotAfter:     now.Add(request.Validity),
 		// Digital signature only: keyEncipherment is not valid for ML-DSA.
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: usages,
-		DNSNames:    request.DNSNames,
-		IPAddresses: request.IPs,
+		KeyUsage:           x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:        usages,
+		UnknownExtKeyUsage: unknownUsages,
+		DNSNames:           request.DNSNames,
+		IPAddresses:        request.IPs,
 
 		BasicConstraintsValid: true,
 		IsCA:                  false,

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	hostport "tornato.dev/ggrok/v2/internal"
@@ -44,6 +45,14 @@ type Config struct {
 	// until it naturally expires.
 	RevokedFile string
 
+	// Admin enables relay's admin plane: without it, a ConnAdmin connection
+	// is refused no matter what certificate it presents. It defaults off so
+	// that an operator who wants no control plane has no admin surface at
+	// all, rather than one whose safety rests entirely on nobody holding a
+	// certificate with the role. The role check is the second gate, not the
+	// only one.
+	Admin bool
+
 	// Logger, if non-nil, receives relay's per-connection attach/detach
 	// records instead of the default stderr handler. Mainly for tests and
 	// benchmarks that run a relay in-process, where the default's output
@@ -59,10 +68,11 @@ type Config struct {
 func Run(ctx context.Context, cfg Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	revoked, err := loadRevokedSerials(cfg.RevokedFile)
+	serials, err := loadRevokedSerials(cfg.RevokedFile)
 	if err != nil {
 		return fmt.Errorf("relay: %w", err)
 	}
+	revoked := mtls.NewRevocationSet(serials)
 
 	tlsConf, err := mtls.LoadConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile, true, revoked)
 	if err != nil {
@@ -87,7 +97,14 @@ func Run(ctx context.Context, cfg Config) error {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	registry := NewRegistry(logger)
+	srv := &server{
+		logger:      logger,
+		registry:    NewRegistry(logger),
+		admin:       cfg.Admin,
+		revoked:     revoked,
+		revokedFile: cfg.RevokedFile,
+		connections: &connections,
+	}
 
 	for {
 		conn, err := listener.Accept()
@@ -105,7 +122,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		tlsConn := tls.Server(tracked, tlsConf)
 
-		go handleConn(ctx, logger, registry, tlsConn)
+		go srv.handleConn(ctx, tlsConn)
 	}
 }
 
@@ -131,17 +148,38 @@ func loadRevokedSerials(path string) (map[string]struct{}, error) {
 	return serials, nil
 }
 
+// server is the per-relay state a connection handler needs beyond the
+// registry: what to log to, and which planes are enabled. It exists so the
+// dispatcher's signature stays readable as relay grows policy that is neither
+// session state nor connection state.
+type server struct {
+	connections *connectionSet
+	reloadMu    sync.Mutex
+	logger      *slog.Logger
+	registry    *Registry
+
+	// admin mirrors Config.Admin.
+	admin bool
+
+	// revoked is the live revocation set the TLS config consults on every
+	// handshake, and revokedFile is where reloading it reads from. Held
+	// here rather than captured at startup so `admin reload-crl` has
+	// something to swap.
+	revoked     *mtls.RevocationSet
+	revokedFile string
+}
+
 // handleConn reads the ConnKind a peer sends immediately after connecting -
 // which is also what drives the TLS handshake, since Read/Write trigger it
-// lazily - and dispatches to handleControlConn or handleDataConn. It owns
-// closing conn only in the cases where neither of those takes over that
-// responsibility (see their doc comments).
-func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, conn *tls.Conn) {
+// lazily - and dispatches to the handler for that kind. It owns closing conn
+// only in the cases where none of those takes over that responsibility (see
+// their doc comments).
+func (s *server) handleConn(ctx context.Context, conn *tls.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(helloTimeout))
 
 	kind, err := proto.ReadConnKind(conn)
 	if err != nil {
-		logger.WarnContext(ctx, "read conn kind", "peer", conn.RemoteAddr(), "err", err)
+		s.logger.WarnContext(ctx, "read conn kind", "peer", conn.RemoteAddr(), "err", err)
 		_ = conn.Close()
 		return
 	}
@@ -151,11 +189,30 @@ func handleConn(ctx context.Context, logger *slog.Logger, registry *Registry, co
 		return
 	}
 
+	cert, err := peerLeafCert(conn)
+	if err != nil || !s.connections.authenticate(conn.NetConn(), cert.SerialNumber.Text(ca.SerialTextBase), s.revoked) {
+		_ = conn.Close()
+		return
+	}
+
 	switch kind {
 	case proto.ConnControl:
-		handleControlConn(ctx, logger, registry, conn)
+		handleControlConn(ctx, s.logger, s.registry, conn)
 	case proto.ConnData:
-		handleDataConn(ctx, logger, registry, conn)
+		handleDataConn(ctx, s.logger, s.registry, conn)
+	case proto.ConnAdmin:
+		if !s.admin {
+			// Closed without a refusal frame, deliberately. The gate is
+			// off, so this relay has no admin plane to be refused by,
+			// and saying so would tell an unauthenticated scan which
+			// relays are worth returning to with a better certificate.
+			s.logger.WarnContext(ctx, "admin connection refused: admin plane is disabled",
+				"peer", conn.RemoteAddr())
+			_ = conn.Close()
+
+			return
+		}
+		s.handleAdminConn(ctx, conn)
 	default:
 		_ = conn.Close()
 	}
@@ -175,27 +232,32 @@ func handleControlConn(ctx context.Context, logger *slog.Logger, registry *Regis
 		logger.WarnContext(ctx, "read hello", "peer", conn.RemoteAddr(), "err", err)
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{}) // runHeartbeatLoop manages its own deadlines from here
 
 	switch hello.Role {
 	case proto.RolePublish:
-		unregister, err := registry.Register(conn, hello.SessionID, hello.Mode, hello.Ports)
+		// The helloTimeout deadline is still live here, and has to be:
+		// Register challenges a publisher to sign for its session, and a
+		// claimant that goes quiet mid-exchange would otherwise hold the
+		// connection open indefinitely.
+		unregister, err := registry.Register(conn, hello)
 		if err != nil {
 			logger.WarnContext(ctx, "register publisher", "peer", conn.RemoteAddr(), "err", err)
 			return
 		}
 		defer unregister()
 
+		_ = conn.SetReadDeadline(time.Time{}) // runHeartbeatLoop manages its own deadlines from here
 		runHeartbeatLoop(ctx, conn)
 
 	case proto.RoleSubscribe:
-		_, release, err := registry.Subscribe(conn, hello.SessionID, hello.Mode, hello.Ports)
+		_, release, err := registry.Subscribe(conn, hello)
 		if err != nil {
 			logger.WarnContext(ctx, "subscribe", "peer", conn.RemoteAddr(), "err", err)
 			return
 		}
 		defer release()
 
+		_ = conn.SetReadDeadline(time.Time{})
 		runHeartbeatLoop(ctx, conn)
 	}
 }

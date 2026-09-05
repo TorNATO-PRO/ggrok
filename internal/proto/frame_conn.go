@@ -22,8 +22,9 @@ const frameLenSize = 2
 // sends once, ahead of its first frame, and prepends to every nonce it
 // builds from there (see nonce).
 //
-// The data keys are a pure function of the session's token, so every stream
-// in a session shares them - and every stream numbers its frames from zero.
+// The data keys are a pure function of the secret they came from, so two
+// streams sharing one share them - and every stream numbers its frames from
+// zero.
 // Without something to separate them, two streams in the same direction seal
 // their first frames under the same key and the same nonce, which is
 // keystream reuse across streams exactly as a shared key would be across
@@ -40,10 +41,10 @@ const noncePrefixSize = 16
 const maxFramePlaintext = math.MaxUint16 - chacha20poly1305.Overhead
 
 // EncryptedConn wraps a relay-facing connection so everything crossing it is
-// sealed with XChaCha20-Poly1305 under a key derived from the session's token.
-// relay holds no token, so it splices ciphertext it cannot read - the tunnel
-// is end-to-end encrypted between share and listen, on top of the mTLS that
-// already protects each leg separately.
+// sealed with XChaCha20-Poly1305 under a key derived from the session's data
+// secret. relay holds no such secret, so it splices ciphertext it cannot read
+// - the tunnel is end-to-end encrypted between share and listen, on top of
+// the mTLS that already protects each leg separately.
 //
 // Each direction has its own key, and each stream within a direction has its
 // own random nonce prefix (see noncePrefixSize), so no two frames anywhere in
@@ -84,15 +85,15 @@ type EncryptedConn struct {
 
 // NewEncryptedConn is the low-level frame codec. Network callers must use
 // NewAuthenticatedConn, which supplies a fresh, authenticated stream secret.
-// NewEncryptedConn wraps conn for role's side of token's session. role picks
+// NewEncryptedConn wraps conn for role's side of secret's stream. role picks
 // which of the two directional keys this peer writes with and which it reads
 // with; the two ends of a connection must pass opposite roles or neither can
 // decrypt the other.
-func NewEncryptedConn(conn io.ReadWriteCloser, token Token, role Role) (*EncryptedConn, error) {
+func NewEncryptedConn(conn io.ReadWriteCloser, secret DataSecret, role Role) (*EncryptedConn, error) {
 	if role != RolePublish && role != RoleSubscribe {
 		return nil, fmt.Errorf("encrypted conn: invalid role %d", role)
 	}
-	pubToSub, subToPub := deriveDataKeys(token)
+	pubToSub, subToPub := deriveDataKeys(secret)
 
 	writeKey, readKey := pubToSub, subToPub
 	if role == RoleSubscribe {

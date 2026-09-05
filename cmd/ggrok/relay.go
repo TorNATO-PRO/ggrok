@@ -44,6 +44,12 @@ type relayConfig struct {
 	// connecting peer matching one is rejected even though its chain
 	// still verifies against caFile.
 	revokedFile string
+
+	// admin enables relay's admin plane, which is off unless asked for. An
+	// operator who does not want one then has no admin surface at all,
+	// rather than one gated solely on nobody holding a certificate with
+	// the admin role.
+	admin bool
 }
 
 // relayUsage marks the usage string for the relay subcommand.
@@ -81,6 +87,8 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 	fs.StringVar(&cfg.caFile, "ca-file", "", "path to the CA certificate used to verify peers")
 	fs.StringVar(&cfg.revokedFile, "revoked-file", "",
 		"path to a revoked-serial list from `ggrok ca crl` (optional; omit to skip revocation checks)")
+	fs.BoolVar(&cfg.admin, "admin", false,
+		"accept admin connections from clients holding a certificate issued with `ggrok ca issue -admin`")
 
 	if err := parseFlags(fs, args); err != nil {
 		return relayConfig{}, err
@@ -112,5 +120,6 @@ func runRelay(args []string) error {
 		KeyFile:     cfg.keyFile,
 		CAFile:      cfg.caFile,
 		RevokedFile: cfg.revokedFile,
+		Admin:       cfg.admin,
 	})
 }

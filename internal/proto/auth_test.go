@@ -40,17 +40,19 @@ func checkAuthenticatedTunnel(t *testing.T, mismatch string) {
 	defer b.Close()
 	_ = a.SetDeadline(time.Now().Add(3 * time.Second))
 	_ = b.SetDeadline(time.Now().Add(3 * time.Second))
-	token := newToken(t)
-	other := token
+	creds := newCredentials(t)
+	// The subscriber joins with what share would actually have handed it,
+	// so the round trip through a subscriber token is on the tested path.
+	other := creds.SubscriberToken().Credentials()
 	var port proto.PortIndex
 	if mismatch == "token" {
-		other = newToken(t)
+		other = newCredentials(t)
 	}
 	if mismatch == "port" {
 		port = 1
 	}
 	result := make(chan error, 1)
-	go func() { result <- sendGreeting(a, token) }()
+	go func() { result <- sendGreeting(a, creds) }()
 	sub, err := proto.NewAuthenticatedConn(b, other, proto.RoleSubscribe, port)
 	if mismatch != "none" {
 		_ = b.Close()
@@ -71,9 +73,9 @@ func checkAuthenticatedTunnel(t *testing.T, mismatch string) {
 	}
 }
 
-func sendGreeting(conn net.Conn, token proto.Token) error {
+func sendGreeting(conn net.Conn, creds proto.Credentials) error {
 	defer conn.Close()
-	pub, err := proto.NewAuthenticatedConn(conn, token, proto.RolePublish, 0)
+	pub, err := proto.NewAuthenticatedConn(conn, creds, proto.RolePublish, 0)
 	if err != nil {
 		return err
 	}
@@ -83,7 +85,7 @@ func sendGreeting(conn net.Conn, token proto.Token) error {
 
 func TestWholeConnectionReplayRejected(t *testing.T) {
 	t.Parallel()
-	token := newToken(t)
+	creds := newCredentials(t)
 	a, b := net.Pipe()
 	defer a.Close()
 	defer b.Close()
@@ -92,10 +94,10 @@ func TestWholeConnectionReplayRejected(t *testing.T) {
 	pubWire, subWire := &recordingConn{Conn: a}, &recordingConn{Conn: b}
 	result := make(chan error, 1)
 	go func() {
-		_, err := proto.NewAuthenticatedConn(pubWire, token, proto.RolePublish, 0)
+		_, err := proto.NewAuthenticatedConn(pubWire, creds, proto.RolePublish, 0)
 		result <- err
 	}()
-	if _, err := proto.NewAuthenticatedConn(subWire, token, proto.RoleSubscribe, 0); err != nil {
+	if _, err := proto.NewAuthenticatedConn(subWire, creds, proto.RoleSubscribe, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-result; err != nil {
@@ -112,7 +114,7 @@ func TestWholeConnectionReplayRejected(t *testing.T) {
 		{proto.RoleSubscribe, pubWire.wire.Bytes()},
 	} {
 		conn := source{bytes.NewReader(replay.wire)}
-		if _, err := proto.NewAuthenticatedConn(conn, token, replay.role, 0); err == nil {
+		if _, err := proto.NewAuthenticatedConn(conn, creds, replay.role, 0); err == nil {
 			t.Fatal("recorded connection authenticated against a fresh challenge")
 		}
 	}
@@ -124,7 +126,7 @@ func (shortWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
 
 func TestEncryptedWriteFailureIsPermanent(t *testing.T) {
 	t.Parallel()
-	conn, err := proto.NewEncryptedConn(sink{shortWriter{}}, newToken(t), proto.RolePublish)
+	conn, err := proto.NewEncryptedConn(sink{shortWriter{}}, newSecret(t), proto.RolePublish)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +152,7 @@ func (c *replaceableReader) Read(p []byte) (int, error) {
 
 func TestCiphertextCannotMoveBetweenAuthenticatedStreams(t *testing.T) {
 	t.Parallel()
-	token := newToken(t)
+	creds := newCredentials(t)
 	var captured []byte
 	for attempt := range 2 {
 		a, b := net.Pipe()
@@ -161,13 +163,13 @@ func TestCiphertextCannotMoveBetweenAuthenticatedStreams(t *testing.T) {
 		reader := &replaceableReader{Conn: b}
 		result := make(chan *proto.EncryptedConn, 1)
 		go func() {
-			pub, err := proto.NewAuthenticatedConn(writer, token, proto.RolePublish, 0)
+			pub, err := proto.NewAuthenticatedConn(writer, creds, proto.RolePublish, 0)
 			if err != nil {
 				t.Error(err)
 			}
 			result <- pub
 		}()
-		sub, err := proto.NewAuthenticatedConn(reader, token, proto.RoleSubscribe, 0)
+		sub, err := proto.NewAuthenticatedConn(reader, creds, proto.RoleSubscribe, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

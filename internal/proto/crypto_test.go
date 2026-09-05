@@ -26,15 +26,36 @@ type source struct{ io.Reader }
 func (source) Write(p []byte) (int, error) { return len(p), nil }
 func (source) Close() error                { return nil }
 
-func newToken(t *testing.T) proto.Token {
+// newSecret draws a fresh data secret. The frame codec cares only about the
+// secret its keys come from, so these tests take one directly rather than
+// deriving one from a session key.
+func newSecret(t *testing.T) proto.DataSecret {
 	t.Helper()
 
-	token, err := proto.NewToken()
+	var secret proto.DataSecret
+	if _, err := rand.Read(secret[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	return secret
+}
+
+// newCredentials derives a fresh publisher's credentials, for the tests that
+// need a whole session rather than just a stream key.
+func newCredentials(t *testing.T) proto.Credentials {
+	t.Helper()
+
+	key, err := proto.NewSessionKey()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return token
+	creds, err := key.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return creds
 }
 
 // body strips a stream's nonce prefix and its first frame's length prefix,
@@ -45,12 +66,12 @@ func body(wire []byte) []byte {
 
 // sealed returns the frames a peer of the given role writes for plaintext,
 // led by the stream's nonce prefix as it goes out on the wire.
-func sealed(t *testing.T, token proto.Token, role proto.Role, plaintext []byte) []byte {
+func sealed(t *testing.T, secret proto.DataSecret, role proto.Role, plaintext []byte) []byte {
 	t.Helper()
 
 	var wire bytes.Buffer
 
-	conn, err := proto.NewEncryptedConn(sink{&wire}, token, role)
+	conn, err := proto.NewEncryptedConn(sink{&wire}, secret, role)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,19 +83,19 @@ func sealed(t *testing.T, token proto.Token, role proto.Role, plaintext []byte) 
 	return wire.Bytes()
 }
 
-// pair wraps both ends of an in-memory pipe for the same token, one per role.
-func pair(t *testing.T, token proto.Token) (*proto.EncryptedConn, *proto.EncryptedConn) {
+// pair wraps both ends of an in-memory pipe for the same secret, one per role.
+func pair(t *testing.T, secret proto.DataSecret) (*proto.EncryptedConn, *proto.EncryptedConn) {
 	t.Helper()
 
 	a, b := net.Pipe()
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 
-	pub, err := proto.NewEncryptedConn(a, token, proto.RolePublish)
+	pub, err := proto.NewEncryptedConn(a, secret, proto.RolePublish)
 	if err != nil {
 		t.Fatalf("NewEncryptedConn(publish): %v", err)
 	}
 
-	sub, err := proto.NewEncryptedConn(b, token, proto.RoleSubscribe)
+	sub, err := proto.NewEncryptedConn(b, secret, proto.RoleSubscribe)
 	if err != nil {
 		t.Fatalf("NewEncryptedConn(subscribe): %v", err)
 	}
@@ -85,7 +106,7 @@ func pair(t *testing.T, token proto.Token) (*proto.EncryptedConn, *proto.Encrypt
 func TestDirectionalKeysDiffer(t *testing.T) {
 	t.Parallel()
 
-	pubToSub, subToPub := proto.DeriveDataKeys(newToken(t))
+	pubToSub, subToPub := proto.DeriveDataKeys(newSecret(t))
 
 	// The two directions must not share a key. Both peers number their frames
 	// from zero, so one shared key would put both first frames under the same
@@ -96,24 +117,93 @@ func TestDirectionalKeysDiffer(t *testing.T) {
 	}
 }
 
-func TestDerivationIsDeterministicPerToken(t *testing.T) {
+// TestDerivationIsDeterministicPerSessionKey is what makes a session key
+// reusable: the same key has to keep producing the same SessionID and the
+// same subscriber token, or every restart of share would invalidate every
+// token already handed out.
+func TestDerivationIsDeterministicPerSessionKey(t *testing.T) {
 	t.Parallel()
 
-	token, other := newToken(t), newToken(t)
-
-	first, again := proto.DeriveSessionID(token), proto.DeriveSessionID(token)
-	if first != again {
-		t.Error("DeriveSessionID is not deterministic")
+	key, err := proto.NewSessionKey()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if first == proto.DeriveSessionID(other) {
-		t.Error("distinct tokens collided on one SessionID")
+
+	first, err := key.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := key.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first.SessionID() != again.SessionID() {
+		t.Error("one session key derived two SessionIDs")
+	}
+	if first.SubscriberToken() != again.SubscriberToken() {
+		t.Error("one session key derived two subscriber tokens")
+	}
+	if other := newCredentials(t); first.SessionID() == other.SessionID() {
+		t.Error("distinct session keys collided on one SessionID")
+	}
+}
+
+// TestSubscriberTokenCarriesNoSigningKey is the property the whole publish
+// claim rests on. A subscriber token round-trips to credentials that can join
+// the session and read its traffic, and to nothing that can sign for it.
+func TestSubscriberTokenCarriesNoSigningKey(t *testing.T) {
+	t.Parallel()
+
+	pub := newCredentials(t)
+	sub := pub.SubscriberToken().Credentials()
+
+	if sub.SessionID() != pub.SessionID() {
+		t.Fatal("subscriber token names a different session than the key it came from")
+	}
+	if sub.SubscriberToken() != pub.SubscriberToken() {
+		t.Fatal("subscriber token did not round-trip")
+	}
+	if sub.SessionPublicKey() != nil {
+		t.Fatal("subscriber credentials carry a signing key")
+	}
+	if pub.SessionPublicKey() == nil {
+		t.Fatal("publisher credentials carry no signing key")
+	}
+}
+
+// TestSubscriberTokenParsesRoundTrip also pins the two secrets apart by
+// length, which is how someone who pasted the wrong one finds out.
+func TestSubscriberTokenParsesRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	creds := newCredentials(t)
+	token := creds.SubscriberToken()
+
+	parsed, err := proto.ParseSubscriberToken(token.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed != token {
+		t.Fatal("subscriber token did not survive String/Parse")
+	}
+
+	key, err := proto.NewSessionKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proto.ParseSubscriberToken(key.String()); err == nil {
+		t.Error("a session key parsed as a subscriber token")
+	}
+	if _, err := proto.ParseSessionKey(token.String()); err == nil {
+		t.Error("a subscriber token parsed as a session key")
 	}
 }
 
 func TestSessionLogTagIsTruncated(t *testing.T) {
 	t.Parallel()
 
-	id := proto.DeriveSessionID(newToken(t))
+	id := newCredentials(t).SessionID()
 
 	// The SessionID is what a peer presents to attach to a session, so a log
 	// line must not carry enough of it to replay.
@@ -131,13 +221,13 @@ func TestSessionLogTagIsTruncated(t *testing.T) {
 func TestOppositeDirectionsDoNotShareKeystream(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
 	pubPlain := []byte("GET /secret HTTP/1.1")
 	subPlain := []byte("HTTP/1.1 200 OK\r\n\r\n")
 
-	c1 := body(sealed(t, token, proto.RolePublish, pubPlain))
-	c2 := body(sealed(t, token, proto.RoleSubscribe, subPlain))
+	c1 := body(sealed(t, secret, proto.RolePublish, pubPlain))
+	c2 := body(sealed(t, secret, proto.RoleSubscribe, subPlain))
 
 	for i := range min(len(pubPlain), len(subPlain)) {
 		// Under one shared keystream this reconstructs pubPlain exactly.
@@ -151,7 +241,7 @@ func TestOppositeDirectionsDoNotShareKeystream(t *testing.T) {
 
 // TestStreamsDoNotShareKeystream is the same property one scope out, and the
 // regression test for the reuse that survived the directional fix: the data
-// keys are a pure function of the token, so every stream in a session shares
+// keys are a pure function of the secret, so every stream sharing one shares
 // them, and every stream numbers its frames from zero. Two streams in the
 // same direction - two subscribers, or one that connects twice, or one
 // connection after another - therefore sealed their first frames under the
@@ -162,14 +252,14 @@ func TestOppositeDirectionsDoNotShareKeystream(t *testing.T) {
 func TestStreamsDoNotShareKeystream(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
 	first := []byte("GET /alice HTTP/1.1")
 	second := []byte("GET /bob   HTTP/1.1")
 
-	// Same token, same role, same session: two forwarded connections.
-	c1 := body(sealed(t, token, proto.RolePublish, first))
-	c2 := body(sealed(t, token, proto.RolePublish, second))
+	// Same secret, same role, same session: two forwarded connections.
+	c1 := body(sealed(t, secret, proto.RolePublish, first))
+	c2 := body(sealed(t, secret, proto.RolePublish, second))
 
 	for i := range min(len(first), len(second)) {
 		// Under one shared keystream this reconstructs first exactly, so a
@@ -188,10 +278,10 @@ func TestStreamsDoNotShareKeystream(t *testing.T) {
 func TestStreamNoncePrefixesDiffer(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
-	first := sealed(t, token, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
-	second := sealed(t, token, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
+	first := sealed(t, secret, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
+	second := sealed(t, secret, proto.RolePublish, []byte("x"))[:proto.NoncePrefixSize]
 
 	if bytes.Equal(first, second) {
 		t.Fatal("two streams drew the same nonce prefix")
@@ -205,7 +295,7 @@ func TestStreamNoncePrefixesDiffer(t *testing.T) {
 func TestEncryptedConnRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
 	// Sizes that straddle a frame boundary, so the split in Write and the
 	// carry-over buffer in Read both get exercised.
@@ -224,7 +314,7 @@ func TestEncryptedConnRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		pub, sub := pair(t, token)
+		pub, sub := pair(t, secret)
 
 		go func() {
 			if _, writeErr := pub.Write(want); writeErr != nil {
@@ -254,7 +344,7 @@ func TestReadReassemblesAcrossSmallBuffers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pub, sub := pair(t, newToken(t))
+	pub, sub := pair(t, newSecret(t))
 
 	go func() {
 		_, _ = pub.Write(want)
@@ -282,12 +372,12 @@ func TestReadReassemblesAcrossSmallBuffers(t *testing.T) {
 func TestTamperedFrameIsRejected(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
-	frame := sealed(t, token, proto.RolePublish, []byte("transfer $10 to alice"))
+	frame := sealed(t, secret, proto.RolePublish, []byte("transfer $10 to alice"))
 	frame[len(frame)-1] ^= 0x01 // flip a bit in the tag
 
-	sub, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, token, proto.RoleSubscribe)
+	sub, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, secret, proto.RoleSubscribe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,14 +393,14 @@ func TestTamperedFrameIsRejected(t *testing.T) {
 func TestReplayedFrameIsRejected(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
+	secret := newSecret(t)
 
 	// The prefix is sent once per stream, so the duplicate is the frame
 	// alone - a replay relay could mount by resending bytes it forwarded.
-	frame := sealed(t, token, proto.RolePublish, []byte("withdraw"))
+	frame := sealed(t, secret, proto.RolePublish, []byte("withdraw"))
 	replayed := append(bytes.Clone(frame), frame[proto.NoncePrefixSize:]...)
 
-	sub, err := proto.NewEncryptedConn(source{bytes.NewReader(replayed)}, token, proto.RoleSubscribe)
+	sub, err := proto.NewEncryptedConn(source{bytes.NewReader(replayed)}, secret, proto.RoleSubscribe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,15 +419,15 @@ func TestReplayedFrameIsRejected(t *testing.T) {
 func TestWrongTokenCannotDecrypt(t *testing.T) {
 	t.Parallel()
 
-	frame := sealed(t, newToken(t), proto.RolePublish, []byte("secret"))
+	frame := sealed(t, newSecret(t), proto.RolePublish, []byte("secret"))
 
-	eavesdropper, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, newToken(t), proto.RoleSubscribe)
+	eavesdropper, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, newSecret(t), proto.RoleSubscribe)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := eavesdropper.Read(make([]byte, 64)); err == nil {
-		t.Fatal("a different token decrypted the frame")
+		t.Fatal("a different secret decrypted the frame")
 	}
 }
 
@@ -346,10 +436,10 @@ func TestWrongTokenCannotDecrypt(t *testing.T) {
 func TestSameRoleBothEndsFails(t *testing.T) {
 	t.Parallel()
 
-	token := newToken(t)
-	frame := sealed(t, token, proto.RolePublish, []byte("hello"))
+	secret := newSecret(t)
+	frame := sealed(t, secret, proto.RolePublish, []byte("hello"))
 
-	same, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, token, proto.RolePublish)
+	same, err := proto.NewEncryptedConn(source{bytes.NewReader(frame)}, secret, proto.RolePublish)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,9 +451,9 @@ func TestSameRoleBothEndsFails(t *testing.T) {
 
 func TestReadAcrossChangingFrameSizes(t *testing.T) {
 	t.Parallel()
-	token := newToken(t)
+	secret := newSecret(t)
 	var wire, want bytes.Buffer
-	writer, err := proto.NewEncryptedConn(sink{&wire}, token, proto.RolePublish)
+	writer, err := proto.NewEncryptedConn(sink{&wire}, secret, proto.RolePublish)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +464,7 @@ func TestReadAcrossChangingFrameSizes(t *testing.T) {
 			t.Fatal(writeErr)
 		}
 	}
-	reader, err := proto.NewEncryptedConn(source{&wire}, token, proto.RoleSubscribe)
+	reader, err := proto.NewEncryptedConn(source{&wire}, secret, proto.RoleSubscribe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,9 +487,9 @@ func TestReadAcrossChangingFrameSizes(t *testing.T) {
 
 // BenchmarkEncryptedRead includes per-stream setup and decryption of 1 MiB.
 func BenchmarkEncryptedRead(b *testing.B) {
-	var token proto.Token
+	var secret proto.DataSecret
 	var wire bytes.Buffer
-	writer, err := proto.NewEncryptedConn(sink{&wire}, token, proto.RolePublish)
+	writer, err := proto.NewEncryptedConn(sink{&wire}, secret, proto.RolePublish)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -412,7 +502,7 @@ func BenchmarkEncryptedRead(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for b.Loop() {
-		reader, err := proto.NewEncryptedConn(source{bytes.NewReader(raw)}, token, proto.RoleSubscribe)
+		reader, err := proto.NewEncryptedConn(source{bytes.NewReader(raw)}, secret, proto.RoleSubscribe)
 		if err != nil {
 			b.Fatal(err)
 		}

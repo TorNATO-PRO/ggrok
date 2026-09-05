@@ -140,7 +140,7 @@ func (s Session) connect(ctx context.Context, mode proto.Mode, ports uint16) (*t
 		_ = control.Close()
 		return nil, err
 	}
-	if err := proto.Handshake(control, s.role, mode, ports, s.token); err != nil {
+	if err := proto.Handshake(control, s.role, mode, ports, s.creds); err != nil {
 		_ = control.Close()
 		return nil, err
 	}
@@ -155,20 +155,9 @@ func (s Session) connect(ctx context.Context, mode proto.Mode, ports uint16) (*t
 func runSession(ctx context.Context, control *tls.Conn, handle ControlHandler) error {
 	defer func() { _ = control.Close() }()
 
-	// [RunControlLoop]'s read has no way to notice ctx being canceled on
-	// its own - it only unblocks whenever the next ControlPong happens to
-	// arrive, up to a heartbeat interval later. Closing control out from
-	// under it the moment ctx is done is what makes Ctrl+C take effect
-	// immediately instead of that much late.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = control.Close()
-		case <-stop:
-		}
-	}()
+	// Interrupt blocked control I/O as soon as the session is canceled.
+	stop := context.AfterFunc(ctx, func() { _ = control.Close() })
+	defer stop()
 
 	return RunControlLoop(ctx, control, handle)
 }
@@ -180,14 +169,22 @@ func runSession(ctx context.Context, control *tls.Conn, handle ControlHandler) e
 //
 // What isn't is a disagreement the two peers can't settle by trying again.
 // A mode or port count that doesn't match the session's publisher means the
-// two were started with incompatible arguments, and a relay certificate
-// that doesn't verify is a trust problem - both want a human, and looping
+// two were started with incompatible arguments, a relay that denied this peer
+// will deny the identical peer a second later, and a relay certificate that
+// doesn't verify is a trust problem - all of them want a human, and looping
 // on them would bury the one message that explains what to fix.
+//
+// [proto.ErrPublisherExists] is pointedly not in that set: a publisher whose
+// connection was severed rather than closed sees it until relay times the
+// dead registration out, and giving up there would surrender the session over
+// an ordinary flap.
 func retryable(err error) bool {
 	var certErr *tls.CertificateVerificationError
 
 	switch {
 	case errors.Is(err, proto.ErrModeMismatch), errors.Is(err, proto.ErrPortsMismatch):
+		return false
+	case errors.Is(err, proto.ErrDenied):
 		return false
 	case errors.As(err, &certErr):
 		return false

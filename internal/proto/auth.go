@@ -11,12 +11,23 @@ import (
 
 const challengeSize = 32
 
-// NewAuthenticatedConn proves token possession before returning a data stream.
-// Both peers contribute fresh challenges; the transcript binds their roles,
-// the protocol version, and the requested port. Its derived stream secret
-// prevents a relay from replaying ciphertext into another connection, even
-// when the same session token is reused. The caller must set an I/O deadline.
-func NewAuthenticatedConn(conn io.ReadWriteCloser, token Token, role Role, port PortIndex) (*EncryptedConn, error) {
+// NewAuthenticatedConn proves possession of the session's data secret before
+// returning a data stream. Both peers contribute fresh challenges; the
+// transcript binds their roles, the protocol version, and the requested port.
+// Its derived stream secret prevents a relay from replaying ciphertext into
+// another connection, even when the same session is reused. The caller must
+// set an I/O deadline.
+//
+// Both ends of a session hold the same data secret, so this proves membership
+// of the session rather than which end of it a peer is - the publisher slot is
+// gated on the control connection instead (see VerifyPublishClaim), and a data
+// connection is additionally pinned to the certificate that took that slot.
+func NewAuthenticatedConn(
+	conn io.ReadWriteCloser,
+	creds Credentials,
+	role Role,
+	port PortIndex,
+) (*EncryptedConn, error) {
 	if role != RolePublish && role != RoleSubscribe {
 		return nil, fmt.Errorf("authenticate tunnel: invalid role %d", role)
 	}
@@ -29,8 +40,8 @@ func NewAuthenticatedConn(conn io.ReadWriteCloser, token Token, role Role, port 
 	transcript := append([]byte(ALPN), sub[:]...)
 	transcript = append(transcript, pub[:]...)
 	transcript = binary.BigEndian.AppendUint16(transcript, uint16(port))
-	pubProof := tunnelMAC(token, "publisher proof", transcript)
-	subProof := tunnelMAC(token, "subscriber proof", transcript)
+	pubProof := tunnelMAC(creds.data, "publisher proof", transcript)
+	subProof := tunnelMAC(creds.data, "subscriber proof", transcript)
 
 	if role == RolePublish {
 		err = writeFull(conn, pubProof)
@@ -47,9 +58,9 @@ func NewAuthenticatedConn(conn io.ReadWriteCloser, token Token, role Role, port 
 		return nil, fmt.Errorf("authenticate tunnel: %w", err)
 	}
 
-	var streamToken Token
-	copy(streamToken[:], tunnelMAC(token, "stream secret", transcript))
-	return NewEncryptedConn(conn, streamToken, role)
+	var streamSecret DataSecret
+	copy(streamSecret[:], tunnelMAC(creds.data, "stream secret", transcript))
+	return NewEncryptedConn(conn, streamSecret, role)
 }
 
 // exchangeChallenges orders I/O so even an unbuffered transport cannot deadlock.
@@ -72,9 +83,9 @@ func exchangeChallenges(conn io.ReadWriter, role Role) ([challengeSize]byte, [ch
 }
 
 // tunnelMAC uses independent keys for the two proofs and the stream secret.
-func tunnelMAC(token Token, purpose string, transcript []byte) []byte {
+func tunnelMAC(secret DataSecret, purpose string, transcript []byte) []byte {
 	var key [sha256.Size]byte
-	deriveKey(token, "ggrok tunnel "+purpose, key[:])
+	deriveKey(secret[:], "ggrok tunnel "+purpose, key[:])
 	mac := hmac.New(sha256.New, key[:])
 	_, _ = mac.Write(transcript)
 	return mac.Sum(nil)

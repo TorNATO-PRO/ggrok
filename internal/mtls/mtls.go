@@ -14,11 +14,68 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"maps"
 	"os"
+	"sync/atomic"
 
 	"tornato.dev/ggrok/v2/internal/ca"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
+
+// RevocationSet is the set of certificate serials relay currently refuses.
+//
+// It is a handle holding a pointer rather than a plain map because the set
+// has to be replaceable while the listener is live: [LoadConfig] captures it
+// once, at startup, and a captured map could never change - which is what
+// made `ggrok ca revoke` pure bookkeeping until a relay restart. Swapping the
+// pointer is what lets `ggrok admin reload-crl` take effect on the next
+// handshake.
+//
+// The zero value is a usable empty set, so a relay started without a revoked
+// file can still be given one later.
+type RevocationSet struct {
+	v atomic.Pointer[map[string]struct{}]
+}
+
+// NewRevocationSet returns a set holding serials. A nil or empty map is fine
+// and means "refuse nobody, for now".
+func NewRevocationSet(serials map[string]struct{}) *RevocationSet {
+	s := &RevocationSet{}
+	s.Replace(serials)
+
+	return s
+}
+
+// Replace swaps in a new set of serials, atomically, for every subsequent
+// handshake. Connections already established are unaffected - a TLS handshake
+// happens once - which is why reloading a CRL is only half of enforcement and
+// the other half is closing what the new list now covers.
+func (s *RevocationSet) Replace(serials map[string]struct{}) {
+	next := make(map[string]struct{}, len(serials))
+	maps.Copy(next, serials)
+	s.v.Store(&next)
+}
+
+// Contains reports whether serial is currently revoked.
+func (s *RevocationSet) Contains(serial string) bool {
+	current := s.v.Load()
+	if current == nil {
+		return false
+	}
+	_, revoked := (*current)[serial]
+
+	return revoked
+}
+
+// Len is how many serials the set currently holds.
+func (s *RevocationSet) Len() int {
+	current := s.v.Load()
+	if current == nil {
+		return 0
+	}
+
+	return len(*current)
+}
 
 // LoadConfig reads certFile/keyFile as this node's own identity and caFile
 // as the CA used to verify the peer, and builds a [tls.Config] requiring
@@ -29,15 +86,15 @@ import (
 // listen client (which verifies relay's server certificate via the same CA
 // pool instead of the public web PKI, so no InsecureSkipVerify is needed).
 //
-// revokedSerials is relay's revocation list (see ca.ParseRevokedSerials);
-// nil or empty skips the check entirely, and it's only ever consulted when
-// server is true - a chain-valid cert of relay's own is never revoked out
-// from under a dialing share/listen client mid-flow the way a client's can
-// be by its operator.
+// revoked is relay's revocation list (see ca.ParseRevokedSerials and
+// [RevocationSet]); nil means the check can never be enabled on this config,
+// and it's only ever consulted when server is true - a chain-valid cert of
+// relay's own is never revoked out from under a dialing share/listen client
+// mid-flow the way a client's can be by its operator.
 func LoadConfig(
 	certFile, keyFile, caFile string,
 	server bool,
-	revokedSerials map[string]struct{},
+	revoked *RevocationSet,
 ) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -72,8 +129,14 @@ func LoadConfig(
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 		cfg.ClientCAs = pool
 
-		if len(revokedSerials) > 0 {
-			cfg.VerifyPeerCertificate = verifyNotRevoked(revokedSerials)
+		// Installed whenever a set exists, even an empty one, rather than
+		// only when it starts non-empty. Installing conditionally on the
+		// startup contents would mean a relay started without a CRL could
+		// never gain one: the hook it would need was never wired up, and
+		// a config's callbacks cannot be changed once the listener is
+		// live. The empty case is fast-pathed inside the callback instead.
+		if revoked != nil {
+			cfg.VerifyPeerCertificate = verifyNotRevoked(revoked)
 		}
 
 		// A resumed TLS 1.3 connection skips the client Certificate
@@ -82,6 +145,10 @@ func LoadConfig(
 		// session tickets enabled would let a revoked cert keep
 		// authenticating via a cached ticket for the ticket's
 		// lifetime, silently undermining -revoked-file.
+		//
+		// It is load-bearing for the admin role check too: that check
+		// reads the peer's leaf certificate, which a resumed connection
+		// would not have presented.
 		cfg.SessionTicketsDisabled = true
 	} else {
 		cfg.RootCAs = pool
@@ -97,15 +164,21 @@ func LoadConfig(
 // standard chain verification can't express, since a revoked cert would
 // otherwise keep authenticating until it naturally expires (see
 // ca.DefaultDeviceValidity).
-func verifyNotRevoked(revoked map[string]struct{}) func([][]byte, [][]*x509.Certificate) error {
+func verifyNotRevoked(revoked *RevocationSet) func([][]byte, [][]*x509.Certificate) error {
 	return func(_ [][]byte, verifiedChains [][]*x509.Certificate) error {
+		// The common case is an empty set, and this runs on every
+		// handshake: check it once rather than per chain.
+		if revoked.Len() == 0 {
+			return nil
+		}
+
 		for _, chain := range verifiedChains {
 			if len(chain) == 0 {
 				continue
 			}
 
 			leaf := chain[0]
-			if _, isRevoked := revoked[leaf.SerialNumber.Text(ca.SerialTextBase)]; isRevoked {
+			if revoked.Contains(leaf.SerialNumber.Text(ca.SerialTextBase)) {
 				return fmt.Errorf("certificate %q (serial %s) has been revoked",
 					leaf.Subject.CommonName, leaf.SerialNumber.Text(ca.SerialTextBase))
 			}

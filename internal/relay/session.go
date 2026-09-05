@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"tornato.dev/ggrok/v2/internal/proto"
+	"tornato.dev/ggrok/v2/internal/streamio"
 )
 
 // pendingRequestTimeout bounds how long relay waits for a publisher to
@@ -40,6 +41,12 @@ type session struct {
 	// publisher's data connections to present the same one.
 	publisherCert *x509.Certificate
 
+	// publisherPeer is publisherCert rendered for the admin snapshot, and
+	// since is when the publisher registered. Both are set once at
+	// construction and never written again, so neither needs mu.
+	publisherPeer peerIdentity
+	since         time.Time
+
 	mu sync.Mutex
 
 	// closed marks a session whose publisher has gone (see shutdown).
@@ -56,6 +63,13 @@ type session struct {
 
 	nextReqID uint64
 	pending   map[uint64]*pendingRequest
+
+	// streams is every forwarded connection currently being spliced, keyed
+	// by the RequestID that created it. It is what lets an operator see a
+	// tunnel that is working, as opposed to the "stream closed" log line,
+	// which only says one existed - and for a tunnel up for hours, that
+	// line may not appear during an entire operator session.
+	streams map[uint64]*stream
 }
 
 // subscriberConn is what session tracks per attached subscriber: its control
@@ -64,22 +78,58 @@ type session struct {
 type subscriberConn struct {
 	control *tls.Conn
 	certKey string
+
+	// peer is the subscriber's identity, captured at registration. It is
+	// read for the admin snapshot without holding a certificate: certKey
+	// above is raw DER kept for byte-identical binding, which is the wrong
+	// shape to render, and re-parsing the leaf on every snapshot would be
+	// work for no gain.
+	peer peerIdentity
+	// since is when this subscriber attached.
+	since time.Time
+}
+
+// stream is one forwarded connection currently being spliced. It holds both
+// legs so an operator action can close them; counter is written by
+// streamio.SpliceCounted for as long as the copy runs.
+type stream struct {
+	port    proto.PortIndex
+	started time.Time
+	counter *streamio.Counter
+	sub     net.Conn
+	pub     *tls.Conn
 }
 
 type pendingRequest struct {
-	conn  net.Conn
+	conn net.Conn
+	// port is carried from AttachSubscriberData, which is where relay last
+	// sees which port index the request names, through to
+	// AttachPublisherData, which registers the stream and has only a
+	// RequestID to go on.
+	port  proto.PortIndex
+	since time.Time
 	timer *time.Timer
 }
 
 func newSession(mode proto.Mode, ports uint16, publisher *tls.Conn, publisherCert *x509.Certificate) *session {
+	// Register always passes a live connection; the bookkeeping tests
+	// construct a session without one, and an identity is not worth a panic.
+	var addr net.Addr
+	if publisher != nil {
+		addr = publisher.RemoteAddr()
+	}
+
 	return &session{
 		mode:            mode,
 		ports:           ports,
 		publisher:       publisher,
 		publisherCert:   publisherCert,
+		publisherPeer:   identityOf(publisherCert, addr),
+		since:           time.Now(),
 		subscribers:     make(map[proto.SubscriberID]*subscriberConn),
 		pending:         make(map[uint64]*pendingRequest),
 		subscriberCerts: make(map[string]int),
+		streams:         make(map[uint64]*stream),
 	}
 }
 
@@ -103,7 +153,12 @@ func (s *session) addSubscriber(control *tls.Conn) (proto.SubscriberID, func(), 
 
 	id := s.nextSubID
 	s.nextSubID++
-	s.subscribers[id] = &subscriberConn{control: control, certKey: certKey}
+	s.subscribers[id] = &subscriberConn{
+		control: control,
+		certKey: certKey,
+		peer:    identityOf(cert, control.RemoteAddr()),
+		since:   time.Now(),
+	}
 	s.subscriberCerts[certKey]++
 
 	return id, func() { s.removeSubscriber(id) }, true
@@ -130,7 +185,7 @@ func (s *session) removeSubscriber(id proto.SubscriberID) {
 // claims it within pendingRequestTimeout. ok is false if the session has
 // already shut down - there is no publisher left to fulfill the request,
 // so the caller must reject it rather than let conn wait out the timeout.
-func (s *session) addPending(conn net.Conn) (uint64, bool) {
+func (s *session) addPending(conn net.Conn, port proto.PortIndex) (uint64, bool) {
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
 		return 0, false
@@ -152,7 +207,7 @@ func (s *session) addPending(conn net.Conn) (uint64, bool) {
 	}
 	id := s.nextReqID
 	s.nextReqID++
-	req := &pendingRequest{conn: conn}
+	req := &pendingRequest{conn: conn, port: port, since: time.Now()}
 	s.pending[id] = req
 	// Install the timer before releasing mu so a concurrent claim can stop it.
 	req.timer = time.AfterFunc(pendingRequestTimeout, func() { s.removePending(id) })
@@ -164,10 +219,36 @@ func (s *session) addPending(conn net.Conn) (uint64, bool) {
 // failure. It competes with pairing through claimPending, so only the winner
 // owns the connection and an expired callback cannot close a paired stream.
 func (s *session) removePending(id uint64) {
-	conn, ok := s.claimPending(id)
+	conn, _, ok := s.claimPending(id)
 	if ok {
 		_ = conn.Close()
 	}
+}
+
+// addStream records a paired stream for the life of its splice. ok is false
+// if the session has already shut down, in which case the caller must not
+// splice - beginShutdown has already closed everything it knew about, and a
+// stream registered after it would never be closed by anyone.
+func (s *session) addStream(reqID uint64, str *stream) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return false
+	}
+	s.streams[reqID] = str
+
+	return true
+}
+
+// removeStream forgets reqID's stream. It does not close anything: the splice
+// that registered the stream owns both legs and has already closed them by
+// the time this runs.
+func (s *session) removeStream(reqID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.streams, reqID)
 }
 
 // shutdown ends the session for everyone still attached to it: it marks the
@@ -184,6 +265,13 @@ func (s *session) removePending(id uint64) {
 // The pending connections are closed rather than left to their addPending
 // timeouts, since a subscriber whose publisher just vanished shouldn't
 // spend the rest of pendingRequestTimeout finding that out.
+//
+// Already-spliced streams are deliberately left alone. A publisher's control
+// connection severing is the ordinary case reconnect exists for, and cutting
+// every transfer in flight each time one flapped would be a far worse outcome
+// than letting them finish against a session nobody can join any more. They
+// end when either peer closes, and their removeStream is a no-op by then. The
+// transport set still tracks them, so admin kick and CRL reload can close them.
 //
 // Subscriber control connections are closed after the notification: the
 // peer can drain the written notification before observing EOF. One shared
@@ -238,17 +326,18 @@ func notifySessionClosed(controls []*tls.Conn) {
 	}
 }
 
-// claimPending removes and returns id's pending connection, if it's still
-// there (not yet timed out or already claimed).
-func (s *session) claimPending(id uint64) (net.Conn, bool) {
+// claimPending removes and returns id's pending connection and the port index
+// it was opened for, if it's still there (not yet timed out or already
+// claimed).
+func (s *session) claimPending(id uint64) (net.Conn, proto.PortIndex, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	req, ok := s.pending[id]
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	delete(s.pending, id)
 	req.timer.Stop()
-	return req.conn, true
+	return req.conn, req.port, true
 }

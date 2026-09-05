@@ -77,6 +77,16 @@ func TestRetryable(t *testing.T) {
 			err:  fmt.Errorf("dial relay: %w", certErr),
 			want: false,
 		},
+		{
+			// Relay refused this peer for who it is - a publisher that
+			// could not prove the session is its own. A second attempt is
+			// the same peer with the same answer waiting, and redialing
+			// every ten seconds forever would bury the one line that says
+			// the session key is wrong.
+			name: "relay denied this peer",
+			err:  proto.ErrDenied,
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -241,10 +251,15 @@ func newTestSession(t *testing.T, addr string) peer.Session {
 		t.Fatalf("parse %s: %v", addr, err)
 	}
 
-	token, err := proto.NewToken()
+	key, err := proto.NewSessionKey()
 	if err != nil {
-		t.Fatalf("new token: %v", err)
+		t.Fatalf("new session key: %v", err)
 	}
 
-	return peer.NewSession(hp, &tls.Config{MinVersion: tls.VersionTLS13}, token, proto.RolePublish)
+	creds, err := key.Credentials()
+	if err != nil {
+		t.Fatalf("derive credentials: %v", err)
+	}
+
+	return peer.NewSession(hp, &tls.Config{MinVersion: tls.VersionTLS13}, creds, proto.RolePublish)
 }

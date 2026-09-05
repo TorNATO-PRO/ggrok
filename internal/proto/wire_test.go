@@ -42,11 +42,7 @@ func TestReadConnKindRejectsInvalid(t *testing.T) {
 func TestAttachRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	token, err := proto.NewToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sid := proto.DeriveSessionID(token)
+	sid := newCredentials(t).SessionID()
 
 	cases := []proto.Attach{
 		{Kind: proto.AttachSubscriber, SessionID: sid},
@@ -183,12 +179,7 @@ func TestReadRequestDataRejectsShortPayload(t *testing.T) {
 func TestHelloRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	token, err := proto.NewToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sid := proto.DeriveSessionID(token)
+	sid := newCredentials(t).SessionID()
 
 	cases := []proto.Hello{
 		{Role: proto.RolePublish, Mode: proto.ModeTCP, Ports: 1, SessionID: sid},

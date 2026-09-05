@@ -1,10 +1,16 @@
 // The share subcommand creates a TCP+mTLS connection to the relay server and
 // forwards a local TCP service through the tunnel to any number of concurrent
-// listen subscribers holding the session's token.
+// listen subscribers holding the session's subscriber token.
 //
 // -tcp takes a single host:port or a host:first-last range, in which case
 // every port in the range is forwarded and each subscriber binds a range of
 // its own of the same size.
+//
+// share holds two different secrets and they are not interchangeable. The
+// session key is the root secret: it stays here, and anyone who has it can
+// publish this session. The subscriber token is derived from it and is what
+// gets handed out - it can join the session and read its traffic, and it
+// cannot publish.
 
 package main
 
@@ -29,9 +35,13 @@ type shareConfig struct {
 	// addr is the local TCP service being forwarded - one port or a range.
 	addr hostport.Range
 
-	// token scopes which listen subscribers may reach this session. nil
-	// means -token was omitted, so runShare generates one and prints it.
-	token *proto.Token
+	// sessionKey is this session's root secret. nil means no key was
+	// supplied by any source, so runShare generates one.
+	sessionKey *proto.SessionKey
+
+	// tokenOut is where the subscriber token is written. Empty means print
+	// it to stdout, which runShare permits only when stdout is a terminal.
+	tokenOut string
 }
 
 // shareUsage marks the usage string for the share subcommand.
@@ -43,6 +53,11 @@ Usage:
 An <addr> is host:port, or host:first-last to forward a whole range of
 ports at once. Subscribers bind a range of the same size, matched port
 for port from the start of each range.
+
+Prints a subscriber token to hand to whoever should reach this session.
+That token cannot publish the session; the session key it comes from can,
+so keep that one. Reuse a session key with -session-key-file to keep the same
+token across restarts.
 
 Flags:
 `
@@ -94,25 +109,38 @@ func parseShareFlags(args []string) (shareConfig, error) {
 	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg.nodeConnConfig)
 	registerModeFlags(fs, &cfg)
 
-	// The env var fallback keeps the bearer token off the command line,
-	// where it would be visible to every local user via ps and persisted
-	// in shell history. It's applied after parsing rather than as the
-	// flag's default so PrintDefaults never echoes the secret into usage
-	// or flag-error output.
-	var tokenStr string
-	fs.StringVar(&tokenStr, "token", "",
-		"token that scopes which listen subscribers may reach this session "+
-			"(env GGROK_TOKEN; generated and printed if omitted)")
+	// -session-key-file is the documented way in and -session-key is kept
+	// for the case where the secret is already in hand; the env var sits
+	// between them. See secrets.go for why the file wins. They are named
+	// apart from -key-file, which is this node's TLS private key and an
+	// entirely different secret. Both are registered after parsing rather
+	// than as a flag default so PrintDefaults never echoes the secret into
+	// usage or flag-error output.
+	var keyStr, keyFile string
+	fs.StringVar(&keyStr, "session-key", "",
+		"this session's key, reused to keep the same subscriber token across restarts "+
+			"(env GGROK_SESSION_KEY; prefer -session-key-file; generated if omitted)")
+	fs.StringVar(&keyFile, "session-key-file", "",
+		"read the session key from this file instead of -session-key or the environment (\"-\" for stdin)")
+	fs.StringVar(&cfg.tokenOut, "token-out", "",
+		"write the subscriber token to this file instead of stdout (\"-\" forces stdout)")
 
-	if err := parseFlags(fs, args); err != nil {
+	if err = parseFlags(fs, args); err != nil {
 		return shareConfig{}, err
 	}
 
-	if tokenStr == "" {
-		tokenStr = os.Getenv("GGROK_TOKEN")
+	if keyFile != "" {
+		keyStr, err = readSecretFile(keyFile)
+		if err != nil {
+			return shareConfig{}, err
+		}
 	}
 
-	if err := finishConn(); err != nil {
+	if keyStr == "" {
+		keyStr = os.Getenv("GGROK_SESSION_KEY")
+	}
+
+	if err = finishConn(); err != nil {
 		return shareConfig{}, err
 	}
 
@@ -121,58 +149,106 @@ func parseShareFlags(args []string) (shareConfig, error) {
 		return shareConfig{}, fmt.Errorf("-tcp <addr> is required")
 	}
 
-	if tokenStr != "" {
-		token, err := proto.ParseToken(tokenStr)
-		if err != nil {
-			return shareConfig{}, fmt.Errorf("invalid -token: %w", err)
+	if keyStr != "" {
+		key, parseErr := proto.ParseSessionKey(keyStr)
+		if parseErr != nil {
+			return shareConfig{}, fmt.Errorf("invalid session key: %w", parseErr)
 		}
 
-		cfg.token = &token
+		cfg.sessionKey = &key
 	}
 
 	return cfg, nil
 }
 
-// runShare creates a control connection to the relay server, and creates
-// a unique token to address it. Terminating this connection will
-// terminate the share. Additionally, post quantum encryption is enabled
-// on top of classical encryption for the key exchange.
+// runShare creates a control connection to the relay server under a session
+// key that only this process holds, and reports the subscriber token derived
+// from it. Terminating this connection will terminate the share.
+// Additionally, post quantum encryption is enabled on top of classical
+// encryption for the key exchange.
 func runShare(args []string) error {
 	cfg, err := parseShareFlags(args)
 	if err != nil {
 		return err
 	}
 
-	if cfg.token == nil {
-		token, err := proto.NewToken()
-		if err != nil {
-			return fmt.Errorf("generate token: %w", err)
+	if cfg.sessionKey == nil {
+		key, keyErr := proto.NewSessionKey()
+		if keyErr != nil {
+			return keyErr
 		}
 
-		cfg.token = &token
+		cfg.sessionKey = &key
 	}
 
-	fmt.Fprintf(
-		os.Stdout,
-		"token: %s\n\nTo connect from another machine, run:\n  ggrok listen -tcp %s -server %s %s\n\n",
-		*cfg.token, suggestedListenAddr(cfg.addr), cfg.server, *cfg.token,
-	)
+	creds, err := cfg.sessionKey.Credentials()
+	if err != nil {
+		return err
+	}
+
+	if err := reportToken(cfg, creds.SubscriberToken()); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	return share.Run(ctx, share.Config{
-		Server:   cfg.server,
-		CertFile: cfg.certFile,
-		KeyFile:  cfg.keyFile,
-		CAFile:   cfg.caFile,
-		Mode:     proto.ModeTCP,
-		Addr:     cfg.addr,
-		Token:    *cfg.token,
+		Server:     cfg.server,
+		CertFile:   cfg.certFile,
+		KeyFile:    cfg.keyFile,
+		CAFile:     cfg.caFile,
+		Mode:       proto.ModeTCP,
+		Addr:       cfg.addr,
+		SessionKey: *cfg.sessionKey,
 
 		OnDisconnect: reportDisconnect,
 		OnReconnect:  reportReconnect,
 	})
+}
+
+// reportToken hands the subscriber token to whoever started this share:
+// to -token-out if one was given, and otherwise to stdout - but only when
+// stdout is a terminal.
+//
+// Refusing the non-terminal case is the point rather than an inconvenience.
+// A share whose stdout is a pipe, a log file, or a CI job's output is a share
+// whose token is about to be written somewhere durable and readable, which is
+// exactly how bearer secrets leak. -token-out names a file created 0600
+// instead, and "-token-out -" is there for someone who has weighed that and
+// wants the pipe anyway.
+func reportToken(cfg shareConfig, token proto.SubscriberToken) error {
+	if cfg.tokenOut != "" {
+		if err := writeSecretFile(cfg.tokenOut, token.String()); err != nil {
+			return err
+		}
+
+		if cfg.tokenOut != stdioPath {
+			fmt.Fprintf(os.Stderr, "subscriber token written to %s\n", cfg.tokenOut)
+		}
+
+		return nil
+	}
+
+	if !stdoutIsTerminal() {
+		return fmt.Errorf(
+			"refusing to print the subscriber token to a non-terminal stdout: " +
+				"pass -token-out <file>, or -token-out - to print it anyway",
+		)
+	}
+
+	// The suggested command passes the token through the environment rather
+	// than as an argument. A ready-to-paste command with the secret in argv
+	// would teach exactly the exposure -token-file exists to avoid, and the
+	// tool printing it is what makes people do it.
+	fmt.Fprintf(
+		os.Stdout,
+		"subscriber token: %s\n\nTo connect from another machine, run:\n"+
+			"  GGROK_TOKEN=%s ggrok listen -tcp %s -server %s\n\n",
+		token, token, suggestedListenAddr(cfg.addr), cfg.server,
+	)
+
+	return nil
 }
 
 // reportDisconnect and reportReconnect narrate what share and listen do

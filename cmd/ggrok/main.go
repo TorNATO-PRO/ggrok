@@ -31,6 +31,7 @@ Usage:
   ggrok listen -tcp <addr> [flags] <token>
   ggrok relay [flags]
   ggrok ca <init|issue|list|revoke> [flags]
+  ggrok admin <ls|kick|reload-crl> [flags]
 
 An <addr> is host:port, or host:first-last for a range of ports.
 The share stays alive until this process exits.
@@ -96,6 +97,7 @@ var commands = map[string]func(args []string) error{
 	"listen": runListen,
 	"relay":  runRelay,
 	"ca":     runCA,
+	"admin":  runAdmin,
 }
 
 // runUsage prints the top-level usage and reports it as a help request,

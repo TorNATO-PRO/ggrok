@@ -7,6 +7,7 @@
 package main
 
 import (
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"net"
@@ -197,6 +198,11 @@ type caIssueConfig struct {
 	// reach it (e.g. -ip 127.0.0.1, or -dns-name relay.example.com).
 	dnsNames []string
 	ips      []net.IP
+
+	// admin authorizes the certificate on relay's admin plane. It is the
+	// only certificate distinction that is an authorization decision, which
+	// is why it rides on an extended key usage rather than on the CN.
+	admin bool
 }
 
 // runCAIssue issues a leaf certificate, signed by the root CA, for a given
@@ -214,7 +220,13 @@ func runCAIssue(args []string) error {
 		&cfg.server,
 		"server",
 		false,
-		"also mark the certificate for server authentication (required for relay's identity)",
+		"mark the certificate for server authentication instead of client (required for relay's identity)",
+	)
+	fs.BoolVar(
+		&cfg.admin,
+		"admin",
+		false,
+		"authorize the certificate on relay's admin plane (see `ggrok admin`; relay must run with -admin)",
 	)
 	fs.Func(
 		"dns-name",
@@ -269,6 +281,7 @@ func runCAIssue(args []string) error {
 		CommonName: cfg.commonName,
 		Validity:   cfg.ttl,
 		Server:     cfg.server,
+		Admin:      cfg.admin,
 		DNSNames:   cfg.dnsNames,
 		IPs:        cfg.ips,
 	})
@@ -293,6 +306,44 @@ func runCAIssue(args []string) error {
 		bundle.Cert.NotAfter.Format(time.RFC3339))
 
 	return nil
+}
+
+// extKeyUsageNames maps the extended key usages `ca issue` puts on a leaf to
+// the role names `ca list` shows.
+//
+//nolint:exhaustive // deliberately only the usages ca issue writes; certRole renders anything else by number
+var extKeyUsageNames = map[x509.ExtKeyUsage]string{
+	x509.ExtKeyUsageServerAuth: "server",
+	x509.ExtKeyUsageClientAuth: "node",
+}
+
+// certRole renders what a certificate is authorized to do, for `ca list`.
+//
+// It is worth a column because losing a role fails silently: a bundle
+// reissued by an older binary, or with the flag forgotten, produces a
+// perfectly valid certificate that is simply refused by the one path it was
+// meant for - with nothing at issuance time to say so. This is where that
+// becomes visible before someone needs it.
+func certRole(cert *x509.Certificate) string {
+	var roles []string
+	// Only the two usages `ca issue` puts on a leaf are named. Anything else
+	// came from outside this tool and is reported by number rather than
+	// silently dropped, so an unexpected certificate looks unexpected.
+	for _, usage := range cert.ExtKeyUsage {
+		name, known := extKeyUsageNames[usage]
+		if !known {
+			name = fmt.Sprintf("eku(%d)", usage)
+		}
+		roles = append(roles, name)
+	}
+	if ca.HasAdminEKU(cert) {
+		roles = append(roles, "admin")
+	}
+	if len(roles) == 0 {
+		return "-"
+	}
+
+	return strings.Join(roles, "+")
 }
 
 // caListConfig is the parsed and validated input to `ca list`.
@@ -328,7 +379,7 @@ func runCAList(args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, tableTabWidth, tableColumnPadding, ' ', 0)
-	fmt.Fprintln(w, "COMMON NAME\tSERIAL\tSTATUS\tEXPIRES")
+	fmt.Fprintln(w, "COMMON NAME\tSERIAL\tROLE\tSTATUS\tEXPIRES")
 	for _, c := range certs {
 		status := "issued"
 		switch {
@@ -338,9 +389,9 @@ func runCAList(args []string) error {
 			status = "expired"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-			c.Cert.Subject.CommonName, c.Cert.SerialNumber.Text(ca.SerialTextBase), status,
-			c.Cert.NotAfter.Format(time.RFC3339))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			c.Cert.Subject.CommonName, c.Cert.SerialNumber.Text(ca.SerialTextBase), certRole(c.Cert),
+			status, c.Cert.NotAfter.Format(time.RFC3339))
 	}
 
 	return w.Flush()
