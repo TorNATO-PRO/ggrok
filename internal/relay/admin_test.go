@@ -585,7 +585,7 @@ func TestAdminReloadCRLEnforces(t *testing.T) {
 		t.Fatal("reloading an unchanged list disturbed a live session")
 	}
 
-	if err := os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
+	if err = os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -742,5 +742,59 @@ func TestKickClosesStreamAfterSessionEnds(t *testing.T) {
 	var timeout net.Error
 	if _, readErr := subscriber.Read(data[:]); readErr == nil || (errors.As(readErr, &timeout) && timeout.Timeout()) {
 		t.Fatalf("retired stream was not closed: %v", readErr)
+	}
+}
+
+// A certificate can be used by both a tunnel and its operator. Evicting it
+// must acknowledge the mutation before closing the requesting admin socket.
+func TestAdminSelfEvictionAcknowledgesThenCloses(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []proto.AdminType{proto.AdminKick, proto.AdminReloadCRL} {
+		t.Run(operation.String(), func(t *testing.T) {
+			t.Parallel()
+			testAdminSelfEviction(t, operation)
+		})
+	}
+}
+
+func testAdminSelfEviction(t *testing.T, operation proto.AdminType) {
+	t.Helper()
+
+	revokedFile := filepath.Join(t.TempDir(), "revoked.txt")
+	if err := os.WriteFile(revokedFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addr, root, registry := adminRelay(t.Context(), t, relay.TestServerConfig{
+		Admin: true, Revoked: mtls.NewRevocationSet(nil), RevokedFile: revokedFile,
+	})
+	cfg := roleTLSConfig(t, root, true)
+	cert, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := cert.SerialNumber.Text(ca.SerialTextBase)
+	pub, _ := newSession(t)
+	registerControl(t, addr.String(), cfg, pub, proto.RolePublish)
+	conn, ack, err := dialAdmin(t, addr.String(), cfg)
+	if err != nil || !ack.OK {
+		t.Fatalf("admin refused: %v %+v", err, ack)
+	}
+	var payload any = proto.AdminKickPayload{Serial: serial}
+	if operation == proto.AdminReloadCRL {
+		if err = os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		payload = nil
+	}
+	result := requestMutation(t, conn, operation, payload)
+	if !result.OK || result.Affected != 2 {
+		t.Fatalf("self eviction = %+v, want OK and 2 affected", result)
+	}
+	waitForNoSessions(t, registry)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = proto.ReadAdminFrame(conn)
+	var timeout net.Error
+	if err == nil || (errors.As(err, &timeout) && timeout.Timeout()) {
+		t.Fatalf("requesting admin was not closed: %v", err)
 	}
 }

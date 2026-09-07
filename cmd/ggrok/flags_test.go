@@ -196,3 +196,19 @@ func TestReportTokenRefusesNonTerminalStdout(t *testing.T) {
 		t.Fatal("the token written to -token-out is not this session's")
 	}
 }
+
+//nolint:paralleltest // t.Setenv changes process-wide state.
+func TestShareRejectsEmptyKeyFileWithoutFallback(t *testing.T) {
+	key, _ := testSession(t)
+	path := filepath.Join(t.TempDir(), "empty.key")
+	if err := os.WriteFile(path, []byte(" \n\t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, env := range []string{"", key.String()} {
+		t.Setenv("GGROK_SESSION_KEY", env)
+		args := append([]string{"-tcp", "127.0.0.1:8080", "-session-key-file", path}, connFlags(t)...)
+		if _, err := parseShareFlags(args); err == nil {
+			t.Fatal("empty file generated a key or selected another secret source")
+		}
+	}
+}

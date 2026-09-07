@@ -49,19 +49,50 @@ func (s *connectionSet) authenticate(conn net.Conn, serial string, revoked *mtls
 // closeMatching covers every authenticated socket, independently of sessions.
 // Close raw transports outside the lock so TLS writes cannot delay eviction.
 func (s *connectionSet) closeMatching(matches func(string) bool) int {
+	closed, finish := s.closeMatchingAfterReply(matches, nil)
+	finish()
+	return closed
+}
+
+// closeMatchingAfterReply evicts matching transports immediately, except the
+// requesting admin transport. Its caller must defer finish until after writing
+// the result, and bound that write with a deadline. The deferred socket stays
+// tracked so shutdown, concurrent eviction, and the capacity limit still cover it.
+func (s *connectionSet) closeMatchingAfterReply(matches func(string) bool, replyConn net.Conn) (int, func()) {
+	if tracked, ok := replyConn.(*trackedConn); ok {
+		replyConn = tracked.Conn
+	}
 	s.mu.Lock()
 	var conns []net.Conn
+	var deferred net.Conn
 	for conn, serial := range s.conns {
-		if serial != "" && matches(serial) {
-			conns = append(conns, conn)
-			delete(s.conns, conn)
+		if serial == "" || !matches(serial) {
+			continue
 		}
+		if conn == replyConn {
+			deferred = conn
+			continue
+		}
+		conns = append(conns, conn)
+		delete(s.conns, conn)
 	}
 	s.mu.Unlock()
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
-	return len(conns)
+	closed := len(conns)
+	if deferred != nil {
+		closed++
+	}
+	return closed, func() {
+		if deferred == nil {
+			return
+		}
+		_ = deferred.Close()
+		s.mu.Lock()
+		delete(s.conns, deferred)
+		s.mu.Unlock()
+	}
 }
 
 // closeAll runs after the accept loop has stopped, so no new sockets can join.

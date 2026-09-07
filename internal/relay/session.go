@@ -89,15 +89,12 @@ type subscriberConn struct {
 	since time.Time
 }
 
-// stream is one forwarded connection currently being spliced. It holds both
-// legs so an operator action can close them; counter is written by
-// streamio.SpliceCounted for as long as the copy runs.
+// stream holds the metadata and counters shown in admin snapshots.
+// The transport set owns eviction independently of session bookkeeping.
 type stream struct {
 	port    proto.PortIndex
 	started time.Time
 	counter *streamio.Counter
-	sub     net.Conn
-	pub     *tls.Conn
 }
 
 type pendingRequest struct {

@@ -19,6 +19,10 @@ import (
 // indefinitely.
 const adminIdleTimeout = 5 * time.Minute
 
+// adminReplyTimeout bounds the grace period for acknowledging an eviction
+// that includes the requesting operator. A stalled reader cannot avoid closure.
+const adminReplyTimeout = 5 * time.Second
+
 // Snapshot returns everything relay is currently carrying, as one consistent-
 // enough picture: sessions are collected under the registry lock, then each
 // session's own contents under its lock. The two locks are never held at
@@ -217,7 +221,11 @@ func (s *server) serveKick(ctx context.Context, conn *tls.Conn, body []byte) err
 		})
 	}
 
-	closed := s.connections.closeMatching(func(serial string) bool { return serial == req.Serial })
+	closed, finish := s.connections.closeMatchingAfterReply(
+		func(serial string) bool { return serial == req.Serial }, conn.NetConn(),
+	)
+	defer finish()
+	_ = conn.SetWriteDeadline(time.Now().Add(adminReplyTimeout))
 	s.logger.InfoContext(ctx, "admin kicked a serial", peerAttr(conn),
 		slog.String("serial", req.Serial), slog.Int("connections_closed", closed))
 
@@ -267,7 +275,9 @@ func (s *server) serveReloadCRL(ctx context.Context, conn *tls.Conn) error {
 	}
 	s.revoked.Replace(serials)
 
-	closed := s.connections.closeMatching(s.revoked.Contains)
+	closed, finish := s.connections.closeMatchingAfterReply(s.revoked.Contains, conn.NetConn())
+	defer finish()
+	_ = conn.SetWriteDeadline(time.Now().Add(adminReplyTimeout))
 
 	s.logger.InfoContext(ctx, "admin reloaded the revocation list", peerAttr(conn),
 		slog.Int("revoked_serials", len(serials)), slog.Int("newly_revoked", added),

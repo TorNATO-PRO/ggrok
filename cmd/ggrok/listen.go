@@ -11,11 +11,13 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/listen"
@@ -33,50 +35,16 @@ type listenConfig struct {
 	token proto.SubscriberToken
 }
 
-// listenUsage marks the usage string for the listen subcommand.
-const listenUsage = `ggrok listen - subscribe to a share's session and forward it to local ports
-
-Usage:
-  ggrok listen -tcp <addr> -token-file <file> [flags]
-
-An <addr> is host:port, or host:first-last to bind a whole range of ports
-at once. The range must be the same size as the one the share forwards;
-the two are matched port for port from the start of each range.
-
-The subscriber token comes from -token-file (or "-" for stdin), the
-GGROK_TOKEN environment variable, or -token. It is still accepted as a
-positional argument, which is deprecated: an argument is visible to every
-local user through ps and is kept in shell history.
-
-Flags:
-`
-
-// parseListenFlags parses the flags and positional token argument for the
-// listen command into a validated listenConfig struct.
-//
-// server, cert-file, key-file and ca-file follow the same precedence chain
-// as share: an explicit flag, an environment variable, or configDir's
-// config.json, with cert-file/key-file/ca-file additionally falling back
-// to a well-known path inside configDir.
-func parseListenFlags(args []string) (listenConfig, error) {
-	configDir, err := defaultConfigDir()
-	if err != nil {
-		return listenConfig{}, err
-	}
-
-	fileCfg, err := loadNodeFileConfig(configDir)
-	if err != nil {
-		return listenConfig{}, err
-	}
-
-	fs := flag.NewFlagSet("listen", flag.ExitOnError)
-	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, listenUsage)
-		fs.PrintDefaults()
-	}
+// newListenCommand registers options without loading local configuration.
+func newListenCommand() (*cobra.Command, *listenConfig) {
+	cmd := newCommand("listen [token]", "Listen locally for connections to a shared service")
+	cmd.Long = cmd.Short + ".\n\nAddresses accept host:port or host:first-last. Ports are matched by position.\nThe positional token is deprecated; prefer --token-file or GGROK_TOKEN."
+	cmd.Example = "  ggrok listen --tcp 127.0.0.1:9090 --token-file token.txt"
+	cmd.Args = cobra.MaximumNArgs(1)
+	fs := cmd.Flags()
 
 	var cfg listenConfig
-	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg.nodeConnConfig)
+	finishConn := registerConnFlags(fs, &cfg.nodeConnConfig)
 
 	fs.Func(
 		"tcp",
@@ -91,7 +59,7 @@ func parseListenFlags(args []string) (listenConfig, error) {
 		},
 	)
 
-	// Registered after parsing rather than as flag defaults, so
+	// Resolved after parsing rather than as flag defaults, so
 	// PrintDefaults never echoes the token into usage or flag-error output.
 	var tokenStr, tokenFile string
 	fs.StringVar(&tokenStr, "token", "",
@@ -99,31 +67,32 @@ func parseListenFlags(args []string) (listenConfig, error) {
 	fs.StringVar(&tokenFile, "token-file", "",
 		"read the subscriber token from this file instead of -token or the environment (\"-\" for stdin)")
 
-	if err = parseFlags(fs, args); err != nil {
-		return listenConfig{}, err
-	}
+	cmd.PreRunE = func(_ *cobra.Command, _ []string) error {
+		var err error
 
-	if err = finishConn(); err != nil {
-		return listenConfig{}, err
-	}
+		if err = finishConn(); err != nil {
+			return err
+		}
 
-	if cfg.addr.Len() == 0 {
-		fs.Usage()
-		return listenConfig{}, fmt.Errorf("-tcp <addr> is required")
-	}
+		if cfg.addr.Len() == 0 {
+			return fmt.Errorf("-tcp <addr> is required")
+		}
 
-	tokenStr, err = resolveSubscriberToken(fs, tokenStr, tokenFile)
-	if err != nil {
-		return listenConfig{}, err
-	}
+		tokenStr, err = resolveSubscriberToken(fs, tokenStr, tokenFile)
+		if err != nil {
+			return err
+		}
 
-	token, err := proto.ParseSubscriberToken(tokenStr)
-	if err != nil {
-		return listenConfig{}, fmt.Errorf("invalid subscriber token: %w", err)
-	}
-	cfg.token = token
+		token, err := proto.ParseSubscriberToken(tokenStr)
+		if err != nil {
+			return fmt.Errorf("invalid subscriber token: %w", err)
+		}
+		cfg.token = token
 
-	return cfg, nil
+		return nil
+	}
+	cmd.RunE = func(_ *cobra.Command, _ []string) error { return runListen(cfg) }
+	return cmd, &cfg
 }
 
 // resolveSubscriberToken picks the token out of the sources listen accepts,
@@ -133,9 +102,8 @@ func parseListenFlags(args []string) (listenConfig, error) {
 // The positional form is deprecated rather than removed - it is what every
 // existing script and every README predating -token-file passes - so it still
 // works and says why it shouldn't.
-func resolveSubscriberToken(fs *flag.FlagSet, tokenStr, tokenFile string) (string, error) {
+func resolveSubscriberToken(fs *pflag.FlagSet, tokenStr, tokenFile string) (string, error) {
 	if fs.NArg() > 1 {
-		fs.Usage()
 		return "", fmt.Errorf("at most one token argument is accepted")
 	}
 
@@ -147,12 +115,12 @@ func resolveSubscriberToken(fs *flag.FlagSet, tokenStr, tokenFile string) (strin
 	case os.Getenv("GGROK_TOKEN") != "":
 		return os.Getenv("GGROK_TOKEN"), nil
 	case fs.NArg() == 1:
-		fmt.Fprintln(os.Stderr,
+		fmt.Fprintln(os.Stderr, stderrColors().yellow(
 			"warning: passing the subscriber token as an argument is deprecated - "+
-				"it is visible in process listings and shell history; use -token-file or GGROK_TOKEN")
+				"it is visible in process listings and shell history; use -token-file or GGROK_TOKEN",
+		))
 		return fs.Arg(0), nil
 	default:
-		fs.Usage()
 		return "", fmt.Errorf("a subscriber token is required (-token-file, -token, or GGROK_TOKEN)")
 	}
 }
@@ -160,14 +128,11 @@ func resolveSubscriberToken(fs *flag.FlagSet, tokenStr, tokenFile string) (strin
 // runListen runs the listen command, subscribing to a share's session by
 // token and forwarding its local port through the tunnel until the
 // process exits.
-func runListen(args []string) error {
-	cfg, err := parseListenFlags(args)
-	if err != nil {
-		return err
-	}
-
+func runListen(cfg listenConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	p := stdoutColors()
 
 	return listen.Run(ctx, listen.Config{
 		Server:   cfg.server,
@@ -178,7 +143,7 @@ func runListen(args []string) error {
 		Addr:     cfg.addr,
 		Token:    cfg.token,
 		OnListen: func(addr net.Addr) {
-			fmt.Fprintf(os.Stdout, "listening on %s\n", addr)
+			fmt.Fprintf(os.Stdout, "%s %s\n", p.green("listening on"), p.bold(addr.String()))
 		},
 		OnDisconnect: reportDisconnect,
 		OnReconnect:  reportReconnect,

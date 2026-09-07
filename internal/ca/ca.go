@@ -89,7 +89,7 @@ type CA struct {
 	// key is the private key - remember not to upload this
 	// to a relay server. This should live on a node that is
 	// acting as the host for the CA.
-	key any // *mldsa.SigningKey65
+	key *mldsa.PrivateKey
 }
 
 // IssueRequest describes a certificate to be signed.
@@ -221,7 +221,7 @@ func Load(certPEM, keyPEM []byte) (*CA, error) {
 	}
 
 	// Verify that the key matches the certificate's public key
-	keyPublicKey := key.(*mldsa.PrivateKey).PublicKey() //nolint:errcheck // PublicKey() does not return an error
+	keyPublicKey := key.PublicKey()
 	if !keyPublicKey.Equal(cert.PublicKey) {
 		return nil, fmt.Errorf("CA Key does not match CA certificate")
 	}
@@ -556,7 +556,7 @@ func buildBundle(derEncodedCertificate []byte, key *mldsa.PrivateKey) (*Bundle, 
 }
 
 // parsePrivateKey takes a PEM block and returns the ML-DSA private key.
-func parsePrivateKey(block *pem.Block) (any, error) {
+func parsePrivateKey(block *pem.Block) (*mldsa.PrivateKey, error) {
 	if block.Type != "PRIVATE KEY" {
 		return nil, fmt.Errorf("expected PKCS#8 private key, got %q", block.Type)
 	}

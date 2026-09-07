@@ -16,12 +16,14 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/proto"
@@ -44,26 +46,8 @@ type shareConfig struct {
 	tokenOut string
 }
 
-// shareUsage marks the usage string for the share subcommand.
-const shareUsage = `ggrok share - forward a local TCP service through a relay
-
-Usage:
-  ggrok share -tcp <addr> [flags]
-
-An <addr> is host:port, or host:first-last to forward a whole range of
-ports at once. Subscribers bind a range of the same size, matched port
-for port from the start of each range.
-
-Prints a subscriber token to hand to whoever should reach this session.
-That token cannot publish the session; the session key it comes from can,
-so keep that one. Reuse a session key with -session-key-file to keep the same
-token across restarts.
-
-Flags:
-`
-
 // registerModeFlags registers -tcp on fs, writing into cfg.
-func registerModeFlags(fs *flag.FlagSet, cfg *shareConfig) {
+func registerModeFlags(fs *pflag.FlagSet, cfg *shareConfig) {
 	fs.Func(
 		"tcp",
 		"local TCP service to forward, e.g. 127.0.0.1:5432 or 127.0.0.1:8000-8010",
@@ -78,42 +62,22 @@ func registerModeFlags(fs *flag.FlagSet, cfg *shareConfig) {
 	)
 }
 
-// parseShareFlags parses the flags for the share command
-// into a validated shareConfig struct. It can fail, however,
-// and when it does so an error is returned.
-//
-// server, cert-file, key-file and ca-file may each come from, in order of
-// precedence: an explicit flag, an environment variable, or configDir's
-// config.json. cert-file, key-file and ca-file additionally fall back to a
-// well-known path inside configDir, since that's where we tell people to
-// keep them; server has no such fallback and is required from one of the
-// three sources.
-func parseShareFlags(args []string) (shareConfig, error) {
-	configDir, err := defaultConfigDir()
-	if err != nil {
-		return shareConfig{}, err
-	}
-
-	fileCfg, err := loadNodeFileConfig(configDir)
-	if err != nil {
-		return shareConfig{}, err
-	}
-
-	fs := flag.NewFlagSet("share", flag.ExitOnError)
-	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, shareUsage)
-		fs.PrintDefaults()
-	}
+// newShareCommand registers options without loading local configuration.
+func newShareCommand() (*cobra.Command, *shareConfig) {
+	cmd := newCommand("share", "Forward a local TCP service through a relay")
+	cmd.Long = cmd.Short + ".\n\nAddresses accept host:port or host:first-last. Subscribers bind a range of the same size.\nKeep the session key private; only the subscriber token is meant to be handed out."
+	cmd.Example = "  ggrok share --tcp 127.0.0.1:8080 --token-out token.txt"
+	fs := cmd.Flags()
 
 	var cfg shareConfig
-	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg.nodeConnConfig)
+	finishConn := registerConnFlags(fs, &cfg.nodeConnConfig)
 	registerModeFlags(fs, &cfg)
 
 	// -session-key-file is the documented way in and -session-key is kept
 	// for the case where the secret is already in hand; the env var sits
 	// between them. See secrets.go for why the file wins. They are named
 	// apart from -key-file, which is this node's TLS private key and an
-	// entirely different secret. Both are registered after parsing rather
+	// entirely different secret. Both are resolved after parsing rather
 	// than as a flag default so PrintDefaults never echoes the secret into
 	// usage or flag-error output.
 	var keyStr, keyFile string
@@ -125,40 +89,41 @@ func parseShareFlags(args []string) (shareConfig, error) {
 	fs.StringVar(&cfg.tokenOut, "token-out", "",
 		"write the subscriber token to this file instead of stdout (\"-\" forces stdout)")
 
-	if err = parseFlags(fs, args); err != nil {
-		return shareConfig{}, err
-	}
+	cmd.PreRunE = func(_ *cobra.Command, _ []string) error {
+		var err error
 
-	if keyFile != "" {
-		keyStr, err = readSecretFile(keyFile)
-		if err != nil {
-			return shareConfig{}, err
-		}
-	}
-
-	if keyStr == "" {
-		keyStr = os.Getenv("GGROK_SESSION_KEY")
-	}
-
-	if err = finishConn(); err != nil {
-		return shareConfig{}, err
-	}
-
-	if cfg.addr.Len() == 0 {
-		fs.Usage()
-		return shareConfig{}, fmt.Errorf("-tcp <addr> is required")
-	}
-
-	if keyStr != "" {
-		key, parseErr := proto.ParseSessionKey(keyStr)
-		if parseErr != nil {
-			return shareConfig{}, fmt.Errorf("invalid session key: %w", parseErr)
+		if keyFile != "" {
+			keyStr, err = readSecretFile(keyFile)
+			if err != nil {
+				return err
+			}
 		}
 
-		cfg.sessionKey = &key
-	}
+		if keyStr == "" {
+			keyStr = os.Getenv("GGROK_SESSION_KEY")
+		}
 
-	return cfg, nil
+		if err = finishConn(); err != nil {
+			return err
+		}
+
+		if cfg.addr.Len() == 0 {
+			return fmt.Errorf("-tcp <addr> is required")
+		}
+
+		if keyStr != "" {
+			key, parseErr := proto.ParseSessionKey(keyStr)
+			if parseErr != nil {
+				return fmt.Errorf("invalid session key: %w", parseErr)
+			}
+
+			cfg.sessionKey = &key
+		}
+
+		return nil
+	}
+	cmd.RunE = func(_ *cobra.Command, _ []string) error { return runShare(cfg) }
+	return cmd, &cfg
 }
 
 // runShare creates a control connection to the relay server under a session
@@ -166,12 +131,7 @@ func parseShareFlags(args []string) (shareConfig, error) {
 // from it. Terminating this connection will terminate the share.
 // Additionally, post quantum encryption is enabled on top of classical
 // encryption for the key exchange.
-func runShare(args []string) error {
-	cfg, err := parseShareFlags(args)
-	if err != nil {
-		return err
-	}
-
+func runShare(cfg shareConfig) error {
 	if cfg.sessionKey == nil {
 		key, keyErr := proto.NewSessionKey()
 		if keyErr != nil {
@@ -224,7 +184,7 @@ func reportToken(cfg shareConfig, token proto.SubscriberToken) error {
 		}
 
 		if cfg.tokenOut != stdioPath {
-			fmt.Fprintf(os.Stderr, "subscriber token written to %s\n", cfg.tokenOut)
+			fmt.Fprintf(os.Stderr, "subscriber token written to %s\n", stderrColors().bold(cfg.tokenOut))
 		}
 
 		return nil
@@ -241,11 +201,13 @@ func reportToken(cfg shareConfig, token proto.SubscriberToken) error {
 	// than as an argument. A ready-to-paste command with the secret in argv
 	// would teach exactly the exposure -token-file exists to avoid, and the
 	// tool printing it is what makes people do it.
+	p := stdoutColors()
 	fmt.Fprintf(
 		os.Stdout,
-		"subscriber token: %s\n\nTo connect from another machine, run:\n"+
-			"  GGROK_TOKEN=%s ggrok listen -tcp %s -server %s\n\n",
-		token, token, suggestedListenAddr(cfg.addr), cfg.server,
+		"subscriber token: %s\n\nTo connect from another machine, run:\n  %s\n\n",
+		p.highlight(token.String()),
+		p.cyan(fmt.Sprintf("GGROK_TOKEN=%s ggrok listen -tcp %s -server %s",
+			token, suggestedListenAddr(cfg.addr), cfg.server)),
 	)
 
 	return nil
@@ -257,13 +219,16 @@ func reportToken(cfg shareConfig, token proto.SubscriberToken) error {
 // which people pipe into other things, and a tunnel that flaps for an hour
 // shouldn't append an hour of commentary to that.
 func reportDisconnect(err error, retryIn time.Duration) {
-	fmt.Fprintf(os.Stderr, "lost relay connection: %v; retrying in %s\n", err, retryIn.Round(time.Millisecond))
+	fmt.Fprintln(os.Stderr, stderrColors().yellow(fmt.Sprintf(
+		"lost relay connection: %s; retrying in %s",
+		terminalText(err.Error()), retryIn.Round(time.Millisecond),
+	)))
 }
 
 // reportReconnect notes that a session came back, which is the only signal
 // that the gap reportDisconnect announced is over.
 func reportReconnect() {
-	fmt.Fprintln(os.Stderr, "reconnected to relay")
+	fmt.Fprintln(os.Stderr, stderrColors().green("reconnected to relay"))
 }
 
 // suggestedListenAddr is the local address the printed listen command

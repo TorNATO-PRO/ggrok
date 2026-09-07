@@ -64,3 +64,32 @@ func TestRevocationAdmissionAndEviction(t *testing.T) {
 		t.Fatal("admitted a peer verified before reload")
 	}
 }
+
+func TestDeferredEvictionRemainsTrackedUntilReply(t *testing.T) {
+	t.Parallel()
+	for _, shutdown := range []bool{false, true} {
+		var set connectionSet
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		tracked, _ := set.track(a)
+		if !set.authenticate(tracked, "123", nil) {
+			t.Fatal("admission failed")
+		}
+		closed, finish := set.closeMatchingAfterReply(func(serial string) bool { return serial == "123" }, tracked)
+		if closed != 1 || len(set.conns) != 1 {
+			t.Fatal("deferred socket lost its capacity slot")
+		}
+		if shutdown {
+			set.closeAll()
+		} else {
+			finish()
+		}
+		if len(set.conns) != 0 {
+			t.Fatal("evicted socket still tracked")
+		}
+		if _, err := b.Write([]byte("x")); err == nil {
+			t.Fatal("evicted transport stayed open")
+		}
+		finish()
+	}
+}

@@ -32,6 +32,26 @@ that domain isn't wired up to redirect here - clone-and-install is the supported
 Cross-compiled binaries for Linux/macOS/Windows on amd64/arm64 can be built in one shot with `just
 build-all` (see the `justfile`), landing in `dist/`.
 
+### Command help and completion
+
+Use `ggrok --help`, `ggrok help share`, or `ggrok ca --help` to explore the
+commands. Long flags use `--tcp`, `--server`, and so on; the existing single-dash
+forms (`-tcp`, `-server`) remain supported. Flags can also follow positional
+arguments. `--color` is available on every command, including before the command
+name; `--color=always` forces color when piping output.
+
+Generate shell completion with `ggrok completion bash`, `zsh`, `fish`, or
+`powershell`. Run `ggrok completion <shell> --help` for installation instructions.
+For example, enable completion in the current Bash session with:
+
+```bash
+source <(ggrok completion bash)
+```
+
+Help and completion work even when the local config file is missing or malformed.
+Connection settings for share, listen, and admin still use flags, then `GGROK_*`
+environment variables, then `~/.ggrok/config.json`, then default certificate paths.
+
 ### Docker, if you'd rather
 
 There's a `Dockerfile` too - it's `scratch` plus the static binary and nothing else, so the image is

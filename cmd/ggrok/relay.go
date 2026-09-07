@@ -13,10 +13,10 @@ package main
 
 import (
 	"context"
-	"flag"
-	"fmt"
 	"os"
 	"os/signal"
+
+	"github.com/spf13/cobra"
 
 	hostport "tornato.dev/ggrok/v2/internal"
 	"tornato.dev/ggrok/v2/internal/relay"
@@ -52,24 +52,10 @@ type relayConfig struct {
 	admin bool
 }
 
-// relayUsage marks the usage string for the relay subcommand.
-const relayUsage = `ggrok relay - run the rendezvous server that brokers shares and gets
-
-Usage:
-  ggrok relay [flags]
-
-Flags:
-`
-
-// parseRelayFlags parses the flags for the relay command into a validated
-// relayConfig struct.
-func parseRelayFlags(args []string) (relayConfig, error) {
-	fs := flag.NewFlagSet("relay", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
-	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, relayUsage)
-		fs.PrintDefaults()
-	}
+// newRelayCommand registers options without loading local configuration.
+func newRelayCommand() (*cobra.Command, *relayConfig) {
+	cmd := newCommand("relay", "Run the rendezvous server")
+	fs := cmd.Flags()
 
 	var cfg relayConfig
 	fs.Func("listen", "the address to bind relay's listener to", func(hostPortPair string) error {
@@ -90,27 +76,22 @@ func parseRelayFlags(args []string) (relayConfig, error) {
 	fs.BoolVar(&cfg.admin, "admin", false,
 		"accept admin connections from clients holding a certificate issued with `ggrok ca issue -admin`")
 
-	if err := parseFlags(fs, args); err != nil {
-		return relayConfig{}, err
-	}
-
-	for _, path := range []*string{&cfg.certFile, &cfg.keyFile, &cfg.caFile, &cfg.revokedFile} {
-		if err := expandHomeInto(path); err != nil {
-			return relayConfig{}, err
+	cmd.PreRunE = func(_ *cobra.Command, _ []string) error {
+		for _, path := range []*string{&cfg.certFile, &cfg.keyFile, &cfg.caFile, &cfg.revokedFile} {
+			if err := expandHomeInto(path); err != nil {
+				return err
+			}
 		}
-	}
 
-	return cfg, nil
+		return nil
+	}
+	cmd.RunE = func(_ *cobra.Command, _ []string) error { return runRelay(cfg) }
+	return cmd, &cfg
 }
 
 // runRelay runs the relay command, brokering connections between shares
 // and listeners without ever terminating the tunnelled service itself.
-func runRelay(args []string) error {
-	cfg, err := parseRelayFlags(args)
-	if err != nil {
-		return err
-	}
-
+func runRelay(cfg relayConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 

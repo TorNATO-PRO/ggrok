@@ -8,28 +8,19 @@ package main
 
 import (
 	"crypto/x509"
-	"flag"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"text/tabwriter"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"tornato.dev/ggrok/v2/internal/ca"
 )
-
-// caUsage marks the usage string for the ca command space.
-const caUsage = `ggrok ca - manage the private certificate authority
-
-Usage:
-  ggrok ca init   [flags]
-  ggrok ca issue  [flags]
-  ggrok ca list   [flags]
-  ggrok ca revoke [flags]
-  ggrok ca crl    [flags]
-`
 
 // caCertFile and caKeyFile are the well-known names `ca init` writes the
 // root CA's certificate and key under, and every other ca sub-verb reads
@@ -43,35 +34,12 @@ const (
 // other than init, which writes the directory instead of reading it.
 const caDirFlagHelp = "directory containing the root CA's key and certificate (default ~/.ggrok/ca)"
 
-// tableTabWidth and tableColumnPadding are the column spacing `ca list`
-// renders its table with.
+// tableTabWidth and tableColumnPadding are the column spacing every ggrok
+// table - `ca list`, `admin ls` - is rendered with.
 const (
 	tableTabWidth      = 4
 	tableColumnPadding = 2
 )
-
-// caCommands maps a ca sub-verb to the function that handles it.
-var caCommands = map[string]func(args []string) error{
-	"init":   runCAInit,
-	"issue":  runCAIssue,
-	"list":   runCAList,
-	"revoke": runCARevoke,
-	"crl":    runCACRL,
-}
-
-// runCA dispatches to the proper ca sub-verb. Unlike the top-level share
-// default, there is no sensible default sub-verb, so a bare `ggrok ca`
-// prints usage instead of silently doing nothing.
-func runCA(args []string) error {
-	return dispatch(caCommands, args, runCAUsage)
-}
-
-// runCAUsage prints the ca command space's usage and reports it as a usage
-// error, since a bare `ggrok ca` with no sub-verb isn't a valid invocation.
-func runCAUsage(_ []string) error {
-	fmt.Fprint(os.Stderr, caUsage)
-	return errUsage
-}
 
 // defaultCADir returns ~/.ggrok/ca, the well-known location `ca init` uses
 // and every other ca sub-verb falls back to when -ca-dir is omitted.
@@ -134,40 +102,40 @@ type caInitConfig struct {
 	validity time.Duration
 }
 
-// runCAInit generates a new root CA keypair and self-signed certificate.
-func runCAInit(args []string) error {
-	fs := flag.NewFlagSet("ca init", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
+// newCAInitCommand generates a new root CA keypair and self-signed certificate.
+func newCAInitCommand() *cobra.Command {
+	cmd := newCommand("init", "Create a private certificate authority")
+	fs := cmd.Flags()
 
 	var cfg caInitConfig
 	fs.StringVar(&cfg.out, "out", "", "directory to write the root CA's key and certificate to (default ~/.ggrok/ca)")
 	fs.StringVar(&cfg.commonName, "common-name", "ggrok root CA", "identity embedded in the root CA's certificate")
 	fs.DurationVar(&cfg.validity, "validity", ca.DefaultCAValidity, "how long the root certificate is valid")
 
-	if err := parseFlags(fs, args); err != nil {
-		return err
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		if err := resolveCADir(&cfg.out); err != nil {
+			return err
+		}
+
+		bundle, err := ca.Init(cfg.commonName, cfg.validity)
+		if err != nil {
+			return fmt.Errorf("generate root CA: %w", err)
+		}
+
+		if err := writeCredentials(cfg.out, map[string][]byte{
+			caCertFile: bundle.CertPEM,
+			caKeyFile:  bundle.KeyPEM,
+		}); err != nil {
+			return err
+		}
+
+		p := stdoutColors()
+		fmt.Fprintf(os.Stdout, "%s root CA %q in %s, valid until %s\n",
+			p.green("initialized"), cfg.commonName, cfg.out, bundle.Cert.NotAfter.Format(time.RFC3339))
+
+		return nil
 	}
-
-	if err := resolveCADir(&cfg.out); err != nil {
-		return err
-	}
-
-	bundle, err := ca.Init(cfg.commonName, cfg.validity)
-	if err != nil {
-		return fmt.Errorf("generate root CA: %w", err)
-	}
-
-	if err := writeCredentials(cfg.out, map[string][]byte{
-		caCertFile: bundle.CertPEM,
-		caKeyFile:  bundle.KeyPEM,
-	}); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stdout, "initialized root CA %q in %s, valid until %s\n",
-		cfg.commonName, cfg.out, bundle.Cert.NotAfter.Format(time.RFC3339))
-
-	return nil
+	return cmd
 }
 
 // caIssueConfig is the parsed and validated input to `ca issue`.
@@ -205,11 +173,11 @@ type caIssueConfig struct {
 	admin bool
 }
 
-// runCAIssue issues a leaf certificate, signed by the root CA, for a given
+// newCAIssueCommand issues a leaf certificate, signed by the root CA, for a given
 // client or relay identity.
-func runCAIssue(args []string) error {
-	fs := flag.NewFlagSet("ca issue", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
+func newCAIssueCommand() *cobra.Command {
+	cmd := newCommand("issue", "Issue a peer certificate")
+	fs := cmd.Flags()
 
 	var cfg caIssueConfig
 	fs.StringVar(&cfg.caDir, "ca-dir", "", caDirFlagHelp)
@@ -250,62 +218,60 @@ func runCAIssue(args []string) error {
 		},
 	)
 
-	if err := parseFlags(fs, args); err != nil {
-		return err
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		if cfg.commonName == "" {
+			return fmt.Errorf("-common-name is required")
+		}
+
+		if cfg.out == "" {
+			return fmt.Errorf("-out is required")
+		}
+
+		if err := expandHomeInto(&cfg.out); err != nil {
+			return err
+		}
+
+		if err := resolveCADir(&cfg.caDir); err != nil {
+			return err
+		}
+
+		root, err := loadCA(cfg.caDir)
+		if err != nil {
+			return err
+		}
+
+		bundle, err := root.Issue(ca.IssueRequest{
+			CommonName: cfg.commonName,
+			Validity:   cfg.ttl,
+			Server:     cfg.server,
+			Admin:      cfg.admin,
+			DNSNames:   cfg.dnsNames,
+			IPs:        cfg.ips,
+		})
+		if err != nil {
+			return fmt.Errorf("issue certificate: %w", err)
+		}
+
+		if err := ca.Store(cfg.caDir, bundle.Cert, bundle.CertPEM); err != nil {
+			return fmt.Errorf("record issued certificate: %w", err)
+		}
+
+		if err := writeCredentials(cfg.out, map[string][]byte{
+			"cert.pem": bundle.CertPEM,
+			"key.pem":  bundle.KeyPEM,
+			"ca.pem":   root.CertPEM,
+		}); err != nil {
+			return err
+		}
+
+		p := stdoutColors()
+		fmt.Fprintf(os.Stdout, "%s certificate for %q (serial %s) in %s, valid until %s\n",
+			p.green("issued"), cfg.commonName, bundle.Cert.SerialNumber.Text(ca.SerialTextBase), cfg.out,
+			bundle.Cert.NotAfter.Format(time.RFC3339))
+
+		return nil
 	}
-
-	if cfg.commonName == "" {
-		fs.Usage()
-		return fmt.Errorf("-common-name is required")
-	}
-
-	if cfg.out == "" {
-		fs.Usage()
-		return fmt.Errorf("-out is required")
-	}
-
-	if err := expandHomeInto(&cfg.out); err != nil {
-		return err
-	}
-
-	if err := resolveCADir(&cfg.caDir); err != nil {
-		return err
-	}
-
-	root, err := loadCA(cfg.caDir)
-	if err != nil {
-		return err
-	}
-
-	bundle, err := root.Issue(ca.IssueRequest{
-		CommonName: cfg.commonName,
-		Validity:   cfg.ttl,
-		Server:     cfg.server,
-		Admin:      cfg.admin,
-		DNSNames:   cfg.dnsNames,
-		IPs:        cfg.ips,
-	})
-	if err != nil {
-		return fmt.Errorf("issue certificate: %w", err)
-	}
-
-	if err := ca.Store(cfg.caDir, bundle.Cert, bundle.CertPEM); err != nil {
-		return fmt.Errorf("record issued certificate: %w", err)
-	}
-
-	if err := writeCredentials(cfg.out, map[string][]byte{
-		"cert.pem": bundle.CertPEM,
-		"key.pem":  bundle.KeyPEM,
-		"ca.pem":   root.CertPEM,
-	}); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stdout, "issued certificate for %q (serial %s) in %s, valid until %s\n",
-		cfg.commonName, bundle.Cert.SerialNumber.Text(ca.SerialTextBase), cfg.out,
-		bundle.Cert.NotAfter.Format(time.RFC3339))
-
-	return nil
+	return cmd
 }
 
 // extKeyUsageNames maps the extended key usages `ca issue` puts on a leaf to
@@ -352,49 +318,55 @@ type caListConfig struct {
 	caDir string
 }
 
-// runCAList lists certificates issued by the root CA.
-func runCAList(args []string) error {
-	fs := flag.NewFlagSet("ca list", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
+// newCAListCommand lists certificates issued by the root CA.
+func newCAListCommand() *cobra.Command {
+	cmd := newCommand("list", "List issued certificates")
+	fs := cmd.Flags()
 
 	var cfg caListConfig
 	fs.StringVar(&cfg.caDir, "ca-dir", "", caDirFlagHelp)
 
-	if err := parseFlags(fs, args); err != nil {
-		return err
-	}
-
-	if err := resolveCADir(&cfg.caDir); err != nil {
-		return err
-	}
-
-	certs, err := ca.List(cfg.caDir)
-	if err != nil {
-		return fmt.Errorf("list certificates: %w", err)
-	}
-
-	if len(certs) == 0 {
-		fmt.Fprintln(os.Stdout, "no certificates issued")
-		return nil
-	}
-
-	w := tabwriter.NewWriter(os.Stdout, 0, tableTabWidth, tableColumnPadding, ' ', 0)
-	fmt.Fprintln(w, "COMMON NAME\tSERIAL\tROLE\tSTATUS\tEXPIRES")
-	for _, c := range certs {
-		status := "issued"
-		switch {
-		case c.Revoked:
-			status = "revoked"
-		case time.Now().After(c.Cert.NotAfter):
-			status = "expired"
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		if err := resolveCADir(&cfg.caDir); err != nil {
+			return err
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			c.Cert.Subject.CommonName, c.Cert.SerialNumber.Text(ca.SerialTextBase), certRole(c.Cert),
-			status, c.Cert.NotAfter.Format(time.RFC3339))
-	}
+		certs, err := ca.List(cfg.caDir)
+		if err != nil {
+			return fmt.Errorf("list certificates: %w", err)
+		}
 
-	return w.Flush()
+		p := stdoutColors()
+		if len(certs) == 0 {
+			fmt.Fprintln(os.Stdout, p.dim("no certificates issued"))
+			return nil
+		}
+
+		t := newTable()
+		t.rowf(p.bold, "COMMON NAME\tSERIAL\tROLE\tSTATUS\tEXPIRES\n")
+		for _, c := range certs {
+			// A certificate that can no longer be used is the reason to run this
+			// command at all, so the row it is on carries the color rather than
+			// the status word: whatever the reader's eye lands on first is the
+			// line, and one word four columns in is easy to scan past.
+			status := "issued"
+
+			var style func(string) string
+			switch {
+			case c.Revoked:
+				status, style = "revoked", p.red
+			case time.Now().After(c.Cert.NotAfter):
+				status, style = "expired", p.yellow
+			}
+
+			t.rowf(style, "%s\t%s\t%s\t%s\t%s\n",
+				terminalText(c.Cert.Subject.CommonName), c.Cert.SerialNumber.Text(ca.SerialTextBase), certRole(c.Cert),
+				status, c.Cert.NotAfter.Format(time.RFC3339))
+		}
+
+		return t.flush(os.Stdout)
+	}
+	return cmd
 }
 
 // caRevokeConfig is the parsed and validated input to `ca revoke`.
@@ -406,35 +378,33 @@ type caRevokeConfig struct {
 	commonName string
 }
 
-// runCARevoke revokes a previously issued certificate.
-func runCARevoke(args []string) error {
-	fs := flag.NewFlagSet("ca revoke", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
+// newCARevokeCommand revokes a previously issued certificate.
+func newCARevokeCommand() *cobra.Command {
+	cmd := newCommand("revoke", "Revoke certificates for an identity")
+	fs := cmd.Flags()
 
 	var cfg caRevokeConfig
 	fs.StringVar(&cfg.caDir, "ca-dir", "", caDirFlagHelp)
 	fs.StringVar(&cfg.commonName, "common-name", "", "identity whose certificate should be revoked")
 
-	if err := parseFlags(fs, args); err != nil {
-		return err
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		if cfg.commonName == "" {
+			return fmt.Errorf("-common-name is required")
+		}
+
+		if err := resolveCADir(&cfg.caDir); err != nil {
+			return err
+		}
+
+		if err := ca.Revoke(cfg.caDir, cfg.commonName); err != nil {
+			return fmt.Errorf("revoke certificate: %w", err)
+		}
+
+		fmt.Fprintf(os.Stdout, "%s certificate(s) for %q\n", stdoutColors().green("revoked"), cfg.commonName)
+
+		return nil
 	}
-
-	if cfg.commonName == "" {
-		fs.Usage()
-		return fmt.Errorf("-common-name is required")
-	}
-
-	if err := resolveCADir(&cfg.caDir); err != nil {
-		return err
-	}
-
-	if err := ca.Revoke(cfg.caDir, cfg.commonName); err != nil {
-		return fmt.Errorf("revoke certificate: %w", err)
-	}
-
-	fmt.Fprintf(os.Stdout, "revoked certificate(s) for %q\n", cfg.commonName)
-
-	return nil
+	return cmd
 }
 
 // caCRLConfig is the parsed and validated input to `ca crl`.
@@ -446,52 +416,71 @@ type caCRLConfig struct {
 	out string
 }
 
-// runCACRL exports every revoked certificate's serial number to a plain
+// newCACRLCommand exports every revoked certificate's serial number to a plain
 // newline-delimited file, meant to be copied out to the relay (see the
 // relay -revoked-file flag) so ca revoke actually cuts a peer off instead
 // of being pure local bookkeeping - relay never holds the CA's private key
 // or directory, so this file is the only way it learns what's revoked.
-func runCACRL(args []string) error {
-	fs := flag.NewFlagSet("ca crl", flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
+func newCACRLCommand() *cobra.Command {
+	cmd := newCommand("crl", "Export revoked certificate serials")
+	fs := cmd.Flags()
 
 	var cfg caCRLConfig
 	fs.StringVar(&cfg.caDir, "ca-dir", "", caDirFlagHelp)
 	fs.StringVar(&cfg.out, "out", "", "path to write the revoked-serial list to")
 
-	if err := parseFlags(fs, args); err != nil {
-		return err
-	}
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		if cfg.out == "" {
+			return fmt.Errorf("-out is required")
+		}
 
-	if cfg.out == "" {
-		fs.Usage()
-		return fmt.Errorf("-out is required")
-	}
+		if err := expandHomeInto(&cfg.out); err != nil {
+			return err
+		}
 
-	if err := expandHomeInto(&cfg.out); err != nil {
-		return err
-	}
+		if err := resolveCADir(&cfg.caDir); err != nil {
+			return err
+		}
 
-	if err := resolveCADir(&cfg.caDir); err != nil {
-		return err
-	}
+		serials, err := ca.RevokedSerials(cfg.caDir)
+		if err != nil {
+			return fmt.Errorf("read revoked certificates: %w", err)
+		}
 
-	serials, err := ca.RevokedSerials(cfg.caDir)
-	if err != nil {
-		return fmt.Errorf("read revoked certificates: %w", err)
-	}
+		if err := writeRevokedSerials(cfg.out, serials); err != nil {
+			return fmt.Errorf("write %s: %w", cfg.out, err)
+		}
 
+		fmt.Fprintf(os.Stdout, "%s %d revoked serial(s) to %s\n",
+			stdoutColors().green("wrote"), len(serials), cfg.out)
+
+		return nil
+	}
+	return cmd
+}
+
+// writeRevokedSerials writes a complete CRL before replacing the destination.
+// On Unix, the same-directory rename is atomic for concurrent reloads.
+// The destination directory must be controlled by the operator.
+func writeRevokedSerials(path string, serials map[string]struct{}) error {
 	var b strings.Builder
-	for serial := range serials {
+	for _, serial := range slices.Sorted(maps.Keys(serials)) {
 		b.WriteString(serial)
 		b.WriteByte('\n')
 	}
-
-	if err := os.WriteFile(cfg.out, []byte(b.String()), 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", cfg.out, err)
+	f, err := os.CreateTemp(filepath.Dir(path), ".ggrok-crl-*")
+	if err != nil {
+		return err
 	}
-
-	fmt.Fprintf(os.Stdout, "wrote %d revoked serial(s) to %s\n", len(serials), cfg.out)
-
-	return nil
+	defer func() { _ = f.Close(); _ = os.Remove(f.Name()) }()
+	if _, err := f.WriteString(b.String()); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }

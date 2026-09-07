@@ -355,7 +355,7 @@ func (r *Registry) AttachPublisherData(sessionID proto.SessionID, reqID uint64, 
 	// that shut down between claimPending and here has already been told
 	// there is nothing left to tear down, so splicing into it would leave a
 	// stream nothing owns - close both legs instead.
-	str := &stream{port: port, started: started, counter: &streamio.Counter{}, sub: subConn, pub: pubConn}
+	str := &stream{port: port, started: started, counter: &streamio.Counter{}}
 	if !sess.addStream(reqID, str) {
 		_ = subConn.Close()
 		_ = pubConn.Close()

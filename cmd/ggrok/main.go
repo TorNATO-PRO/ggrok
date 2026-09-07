@@ -1,130 +1,132 @@
-// Command ggrok forwards one or more local TCP ports through a relay
-// to any number of subscribers holding the session's token, for the full
-// lifecycle of the process.
-//
-// The relay only ever learns that a token maps to a given session, and is
-// the sole authority of the aforesaid. Traffic is encrypted up until the
-// TLS termination boundary. At that point, all bets are off. I recommend
-// using Caddy or something along those lines as a reverse proxy and for
-// automated certificate management and such. A relay can only ever ask
-// "open a connection for token X" - it can never induce this process to
-// reach an address of the relay's choosing, since the local addresses are
-// fixed by the flags this process was started with. Additionally, the
-// relay must authenticate itself and prove provenance with a certificate
-// issued by our CA.
-
+// Command ggrok forwards local TCP ports through an mTLS relay.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-// a usage string to describe how the CLI utility is meant to be used.
-const usage = `ggrok: forward local TCP ports through a relay you run yourself.
+var errUsage = errors.New("invalid arguments")
 
-Usage:
-  ggrok share -tcp <addr> [flags]
-  ggrok listen -tcp <addr> [flags] <token>
-  ggrok relay [flags]
-  ggrok ca <init|issue|list|revoke> [flags]
-  ggrok admin <ls|kick|reload-crl> [flags]
-
-An <addr> is host:port, or host:first-last for a range of ports.
-The share stays alive until this process exits.
-
-Run a command with -h for its own flags.
-`
-
-// errUsage marks a failure the flag package has already written to stderr,
-// together with the usage text. Returning it lets main exit non-zero without
-// printing a second, redundant description of the same problem.
-var errUsage = errors.New("invalid flags")
-
-// errUnknownCommand marks a verb passed by the user that no command map
-// recognizes, whether at the top level (e.g. `ggrok bogus`) or within a
-// space that has its own sub-verbs (e.g. `ggrok ca bogus`).
-var errUnknownCommand = errors.New("unknown command")
-
-// exitUsageError is the conventional Unix exit code for a command invoked
-// with invalid arguments, as opposed to exitFailure for everything else.
 const exitUsageError = 2
 
-// dispatch looks up args[0] in cmds and invokes it with the remaining
-// arguments. When args is empty, or its first element is a help flag,
-// fallback is invoked instead (if non-nil) - this lets a bare `ggrok` or
-// `ggrok -h` print the top-level usage, and a bare/`-h`'d `ggrok ca` print
-// its own usage instead of being treated as an unrecognized sub-verb.
-func dispatch(cmds map[string]func(args []string) error, args []string, fallback func(args []string) error) error {
-	isHelp := len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "-help")
-	if len(args) > 0 && !isHelp {
-		if cmd, ok := cmds[args[0]]; ok {
-			return cmd(args[1:])
+// newCommand keeps parsing errors separate from runtime failures. Each
+// constructor owns its options, so building help never reads config files.
+func newCommand(use, short string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use: use, Short: short, Args: cobra.NoArgs,
+		SilenceUsage: true, SilenceErrors: true,
+	}
+	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return fmt.Errorf("%w: %w", errUsage, err)
+	})
+	return cmd
+}
+
+func showCommandHelp(cmd *cobra.Command, _ []string) error { return cmd.Help() }
+
+func newRootCommand() *cobra.Command {
+	root := newCommand("ggrok", "Forward local TCP ports through a relay you run yourself")
+	// Let Cobra diagnose unknown subcommands and suggest close matches.
+	root.Args = nil
+	root.Long = root.Short + ".\n\nConnection settings use flags, GGROK_* environment variables, then ~/.ggrok/config.json.\nLegacy single-dash long flags are also accepted."
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
+	registerColorFlag(root.PersistentFlags(), &colorFlag)
+	share, _ := newShareCommand()
+	listen, _ := newListenCommand()
+	relay, _ := newRelayCommand()
+	ca := newCommand("ca", "Manage the private certificate authority")
+	ca.RunE = showCommandHelp
+	ca.AddCommand(newCAInitCommand(), newCAIssueCommand(), newCAListCommand(), newCARevokeCommand(), newCACRLCommand())
+	admin := newCommand("admin", "Inspect and manage a running relay")
+	admin.RunE = showCommandHelp
+	admin.Long = admin.Short + ".\n\nRequires a certificate issued with ggrok ca issue --admin and a relay started with --admin."
+	admin.AddCommand(newAdminListCommand(), newAdminKickCommand(), newAdminReloadCRLCommand())
+	root.AddCommand(share, listen, relay, ca, admin)
+	return root
+}
+
+// normalizeLegacyFlags accepts the documented Go-style -long flags alongside
+// GNU-style --long flags. Walk the command tree and skip flag values: a value
+// such as "-server" must never be rewritten, nor anything following "--".
+func normalizeLegacyFlags(cmd *cobra.Command, args []string) []string {
+	result := append([]string(nil), args...)
+	for i := 0; i < len(result); i++ {
+		arg := result[i]
+		if arg == "--" {
+			break
 		}
-
-		return fmt.Errorf("%w: %q", errUnknownCommand, args[0])
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			var consumesValue bool
+			result[i], consumesValue = normalizeLegacyFlag(cmd, arg)
+			if consumesValue {
+				i++
+			}
+			continue
+		}
+		for _, child := range cmd.Commands() {
+			if child.Name() == arg {
+				cmd = child
+				break
+			}
+		}
 	}
+	return result
+}
 
-	if fallback != nil {
-		return fallback(args)
+// normalizeLegacyFlag reports whether the following word is a flag value.
+func normalizeLegacyFlag(cmd *cobra.Command, arg string) (string, bool) {
+	name, _, attached := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-"), "=")
+	if name == "help" && strings.HasPrefix(arg, "-help") {
+		return "-" + arg, false
 	}
-
-	return fmt.Errorf("%w: no command given", errUnknownCommand)
-}
-
-// parseFlags parses args and collapses the two outcomes the flag package
-// reports itself: -h, which is not a failure, and a malformed flag, which
-// needs no further explanation from the caller.
-func parseFlags(fs *flag.FlagSet, args []string) error {
-	err := fs.Parse(args)
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, flag.ErrHelp):
-		return flag.ErrHelp
-	default:
-		return errUsage
+	f := lookupFlag(cmd, name)
+	if f == nil {
+		return arg, false
 	}
+	if !strings.HasPrefix(arg, "--") && len(name) > 1 {
+		arg = "-" + arg
+	}
+	return arg, !attached && f.NoOptDefVal == ""
 }
 
-// commands defines a mapping from verbs to a function that
-// accepts as a list of argument strings as an input.
-var commands = map[string]func(args []string) error{
-	"share":  runShare,
-	"listen": runListen,
-	"relay":  runRelay,
-	"ca":     runCA,
-	"admin":  runAdmin,
+func lookupFlag(cmd *cobra.Command, name string) *pflag.Flag {
+	for current := cmd; current != nil; current = current.Parent() {
+		if f := current.Flags().Lookup(name); f != nil {
+			return f
+		}
+		if f := current.PersistentFlags().Lookup(name); f != nil {
+			return f
+		}
+	}
+	return nil
 }
 
-// runUsage prints the top-level usage and reports it as a help request,
-// which main treats as a clean exit. It's what a bare `ggrok` and `ggrok
-// -h` get: every command needs a verb and an explicit address, so there's
-// nothing sensible to guess at when given neither.
-func runUsage([]string) error {
-	fmt.Fprint(os.Stderr, usage)
-	return flag.ErrHelp
+func executeCommand(cmd *cobra.Command, args []string) error {
+	cmd.SetArgs(normalizeLegacyFlags(cmd, args))
+	return cmd.Execute()
 }
 
-// run runs a command over arguments passed by a user, dispatching to the
-// proper command or printing usage when no command is given.
 func run(args []string) error {
-	return dispatch(commands, args, runUsage)
+	colorFlag = colorModeFromEnv()
+	return executeCommand(newRootCommand(), args)
 }
 
 func main() {
 	err := run(os.Args[1:])
-	switch {
-	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, flag.ErrHelp):
+	if err == nil || errors.Is(err, context.Canceled) {
 		return
-	case errors.Is(err, errUsage):
-		// The flag package already described the problem and printed usage.
-		os.Exit(exitUsageError)
-	default:
-		fmt.Fprintf(os.Stderr, "ggrok: %v\n", err)
-		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stderr, "%s %s\n", stderrColors().red("ggrok:"), terminalText(err.Error()))
+	if errors.Is(err, errUsage) {
+		os.Exit(exitUsageError)
+	}
+	os.Exit(1)
 }

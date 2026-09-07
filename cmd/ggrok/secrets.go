@@ -55,20 +55,32 @@ func readSecretFile(path string) (string, error) {
 	if len(data) > maxSecretBytes {
 		return "", fmt.Errorf("secret exceeds %d bytes", maxSecretBytes)
 	}
-	return strings.TrimSpace(string(data)), nil
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return "", fmt.Errorf("secret file is empty")
+	}
+	return secret, nil
 }
 
-// stdoutIsTerminal reports whether stdout is a character device - a terminal
-// someone is watching, rather than a file, a pipe, or a CI log. A Stat that
-// fails is treated as "not a terminal", which is the safe direction: it means
-// a secret is withheld rather than written somewhere durable on a guess.
-func stdoutIsTerminal() bool {
-	info, err := os.Stdout.Stat()
+// isTerminal reports whether f is a character device - a terminal someone is
+// watching, rather than a file, a pipe, or a CI log. A Stat that fails is
+// treated as "not a terminal", which is the safe direction for both callers:
+// a secret is withheld rather than written somewhere durable on a guess, and
+// escape sequences are withheld rather than written into something that will
+// only store them.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
 	if err != nil {
 		return false
 	}
 
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// stdoutIsTerminal reports whether stdout is a terminal, which is what gates
+// printing the subscriber token.
+func stdoutIsTerminal() bool {
+	return isTerminal(os.Stdout)
 }
 
 // writeSecretFile writes secret plus a newline to path, or to stdout if path

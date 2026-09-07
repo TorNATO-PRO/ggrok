@@ -12,90 +12,31 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sort"
-	"text/tabwriter"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"tornato.dev/ggrok/v2/internal/mtls"
 	"tornato.dev/ggrok/v2/internal/proto"
 )
-
-// adminUsage marks the usage string for the admin command space.
-const adminUsage = `ggrok admin - inspect and manage a running relay
-
-Usage:
-  ggrok admin ls         [flags]
-  ggrok admin kick       -serial <serial> [flags]
-  ggrok admin reload-crl [flags]
-
-Requires a certificate issued with ` + "`ggrok ca issue -admin`" + `, and a relay
-started with -admin.
-`
 
 // adminDialTimeout bounds connecting and completing the admin handshake.
 // An operator running this interactively should not wait on a relay that is
 // not answering.
 const adminDialTimeout = 10 * time.Second
 
-// adminCommands maps an admin sub-verb to the function that handles it.
-var adminCommands = map[string]func(args []string) error{
-	"ls":         runAdminList,
-	"kick":       runAdminKick,
-	"reload-crl": runAdminReloadCRL,
-}
-
-// runAdmin dispatches to the proper admin sub-verb.
-func runAdmin(args []string) error {
-	return dispatch(adminCommands, args, runAdminUsage)
-}
-
-// runAdminUsage prints the admin command space's usage and reports it as a
-// usage error, since a bare `ggrok admin` isn't a valid invocation.
-func runAdminUsage(_ []string) error {
-	fmt.Fprint(os.Stderr, adminUsage)
-	return errUsage
-}
-
-// parseAdminFlags parses the connection flags shared by every admin sub-verb,
-// following the same precedence chain as share and listen: an explicit flag,
-// an environment variable, or configDir's config.json.
-func parseAdminFlags(name, usage string, args []string, extra func(*flag.FlagSet)) (nodeConnConfig, error) {
-	configDir, err := defaultConfigDir()
-	if err != nil {
-		return nodeConnConfig{}, err
-	}
-
-	fileCfg, err := loadNodeFileConfig(configDir)
-	if err != nil {
-		return nodeConnConfig{}, err
-	}
-
-	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	fs.SetOutput(os.Stderr)
-	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, usage)
-		fs.PrintDefaults()
-	}
-
+// newAdminPeerCommand shares connection options across admin operations.
+func newAdminPeerCommand(use, short string) (*cobra.Command, *nodeConnConfig) {
+	cmd := newCommand(use, short)
 	var cfg nodeConnConfig
-	finishConn := registerConnFlags(fs, configDir, fileCfg, &cfg)
-	if extra != nil {
-		extra(fs)
-	}
-
-	if err := parseFlags(fs, args); err != nil {
-		return nodeConnConfig{}, err
-	}
-
-	if err := finishConn(); err != nil {
-		return nodeConnConfig{}, err
-	}
-
-	return cfg, nil
+	finish := registerConnFlags(cmd.Flags(), &cfg)
+	cmd.PreRunE = func(*cobra.Command, []string) error { return finish() }
+	return cmd, &cfg
 }
 
 // dialAdmin opens an admin connection to relay and completes the hello/ack
@@ -166,22 +107,14 @@ func adminHandshake(conn *tls.Conn) error {
 	return nil
 }
 
-// adminListUsage marks the usage string for `ggrok admin ls`.
-const adminListUsage = `ggrok admin ls - list what a relay is currently carrying
+// newAdminListCommand prints one snapshot of relay's live sessions.
+func newAdminListCommand() *cobra.Command {
+	cmd, cfg := newAdminPeerCommand("ls", "List live sessions and connections")
+	cmd.RunE = func(*cobra.Command, []string) error { return runAdminList(*cfg) }
+	return cmd
+}
 
-Usage:
-  ggrok admin ls [flags]
-
-Flags:
-`
-
-// runAdminList prints one snapshot of relay's live sessions.
-func runAdminList(args []string) error {
-	cfg, err := parseAdminFlags("admin ls", adminListUsage, args, nil)
-	if err != nil {
-		return err
-	}
-
+func runAdminList(cfg nodeConnConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -196,64 +129,29 @@ func runAdminList(args []string) error {
 		return err
 	}
 
-	return printSnapshot(os.Stdout, snapshot)
+	return printSnapshot(os.Stdout, stdoutColors(), snapshot)
 }
 
-// adminKickUsage marks the usage string for `ggrok admin kick`.
-const adminKickUsage = `ggrok admin kick - drop every live connection for one certificate
-
-Usage:
-  ggrok admin kick -serial <serial> [flags]
-
-The serial is the one ` + "`ggrok admin ls`" + ` and ` + "`ggrok ca list`" + ` both show. This
-closes connections; it does not revoke the certificate, so the peer may
-reconnect immediately. To keep it out, revoke it and reload:
-
-  ggrok ca revoke -common-name <name>
-  ggrok ca crl -out <revoked-file>
-  ggrok admin reload-crl
-
-Flags:
-`
-
-// runAdminKick closes every live connection belonging to one serial.
-func runAdminKick(args []string) error {
+// newAdminKickCommand closes every live connection belonging to one serial.
+func newAdminKickCommand() *cobra.Command {
+	cmd, cfg := newAdminPeerCommand("kick", "Disconnect every connection for a certificate")
+	cmd.Long = cmd.Short + ".\n\nThis does not revoke the certificate; the peer may reconnect. To prevent that,\nrevoke its certificate and reload the relay's revoked certificate list."
 	var serial string
-	cfg, err := parseAdminFlags("admin kick", adminKickUsage, args, func(fs *flag.FlagSet) {
-		fs.StringVar(&serial, "serial", "",
-			"the certificate serial to drop, as shown by `ggrok admin ls`")
-	})
-	if err != nil {
-		return err
+	cmd.Flags().StringVar(&serial, "serial", "", "certificate serial shown by ggrok admin ls")
+	cmd.RunE = func(*cobra.Command, []string) error {
+		if serial == "" {
+			return fmt.Errorf("--serial is required")
+		}
+		return runAdminMutation(*cfg, proto.AdminKick, proto.AdminKickPayload{Serial: serial})
 	}
-	if serial == "" {
-		return fmt.Errorf("-serial is required")
-	}
-
-	return runAdminMutation(cfg, proto.AdminKick, proto.AdminKickPayload{Serial: serial})
+	return cmd
 }
 
-// adminReloadCRLUsage marks the usage string for `ggrok admin reload-crl`.
-const adminReloadCRLUsage = `ggrok admin reload-crl - re-read the revoked-serial list and enforce it
-
-Usage:
-  ggrok admin reload-crl [flags]
-
-Relay re-reads the -revoked-file it was started with, then closes every live
-connection the new list now covers. Without this, ` + "`ggrok ca revoke`" + ` affects
-no connection - live or new - until relay is restarted.
-
-Flags:
-`
-
-// runAdminReloadCRL asks relay to re-read its revoked-serial file.
-func runAdminReloadCRL(args []string) error {
-	cfg, err := parseAdminFlags("admin reload-crl", adminReloadCRLUsage, args, nil)
-	if err != nil {
-		return err
-	}
-
-	return runAdminMutation(cfg, proto.AdminReloadCRL, nil)
+// newAdminReloadCRLCommand asks relay to re-read its revoked-serial file.
+func newAdminReloadCRLCommand() *cobra.Command {
+	cmd, cfg := newAdminPeerCommand("reload-crl", "Reload and enforce the relay's revoked certificate list")
+	cmd.RunE = func(*cobra.Command, []string) error { return runAdminMutation(*cfg, proto.AdminReloadCRL, nil) }
+	return cmd
 }
 
 // runAdminMutation sends one mutating request and reports relay's verdict.
@@ -277,7 +175,7 @@ func runAdminMutation(cfg nodeConnConfig, typ proto.AdminType, payload any) erro
 		return fmt.Errorf("relay refused: %s", result.Detail)
 	}
 
-	fmt.Fprintln(os.Stdout, result.Detail)
+	fmt.Fprintln(os.Stdout, stdoutColors().green(terminalText(result.Detail)))
 
 	return nil
 }
@@ -327,9 +225,9 @@ func requestAdmin[T any](ctx context.Context, conn *tls.Conn, typ, expected prot
 // printSnapshot renders a snapshot as one block per session. Sessions are
 // sorted by tag so consecutive runs are diffable rather than reordered by
 // whatever the relay's map iteration happened to produce.
-func printSnapshot(out *os.File, snapshot proto.Snapshot) error {
+func printSnapshot(out io.Writer, p palette, snapshot proto.Snapshot) error {
 	if len(snapshot.Sessions) == 0 {
-		fmt.Fprintln(out, "no active sessions")
+		fmt.Fprintln(out, p.dim("no active sessions"))
 		return nil
 	}
 
@@ -340,54 +238,57 @@ func printSnapshot(out *os.File, snapshot proto.Snapshot) error {
 		if i > 0 {
 			fmt.Fprintln(out)
 		}
-		fmt.Fprintf(out, "session %s  %s  %d port(s)  up %s\n",
-			sess.Tag, sess.Mode, sess.Ports, roundedSince(snapshot.Now, sess.Since))
+		fmt.Fprintf(out, "%s %s  %s  %d port(s)  up %s\n",
+			p.dim("session"), p.highlight(terminalText(sess.Tag)), terminalText(sess.Mode),
+			sess.Ports, roundedSince(snapshot.Now, sess.Since))
 
-		w := tabwriter.NewWriter(out, 0, tableTabWidth, tableColumnPadding, ' ', 0)
-		fmt.Fprintln(w, "  ROLE\tCOMMON NAME\tSERIAL\tADDRESS\tUP")
-		fmt.Fprintf(w, "  publisher\t%s\t%s\t%s\t%s\n",
+		t := newTable()
+		t.rowf(p.bold, "  ROLE\tCOMMON NAME\tSERIAL\tADDRESS\tUP\n")
+		t.rowf(nil, "  publisher\t%s\t%s\t%s\t%s\n",
 			dash(sess.Publisher.CN), dash(sess.Publisher.Serial), dash(sess.Publisher.Addr),
 			roundedSince(snapshot.Now, sess.Publisher.Since))
 		for _, sub := range sess.Subscribers {
-			fmt.Fprintf(w, "  subscriber\t%s\t%s\t%s\t%s\n",
+			t.rowf(nil, "  subscriber\t%s\t%s\t%s\t%s\n",
 				dash(sub.CN), dash(sub.Serial), dash(sub.Addr), roundedSince(snapshot.Now, sub.Since))
 		}
-		if err := w.Flush(); err != nil {
+		if err := t.flush(out); err != nil {
 			return err
 		}
 
-		printStreams(out, snapshot.Now, sess)
+		printStreams(out, p, snapshot.Now, sess)
 	}
 
 	return nil
 }
 
 // printStreams renders one session's live and pending streams.
-func printStreams(out *os.File, now time.Time, sess proto.SessionSummary) {
+func printStreams(out io.Writer, p palette, now time.Time, sess proto.SessionSummary) {
 	if len(sess.Streams) == 0 && len(sess.Pending) == 0 {
-		fmt.Fprintln(out, "  (no streams)")
+		fmt.Fprintln(out, p.dim("  (no streams)"))
 		return
 	}
 
 	streams := sess.Streams
 	sort.Slice(streams, func(i, j int) bool { return streams[i].ReqID < streams[j].ReqID })
 
-	w := tabwriter.NewWriter(out, 0, tableTabWidth, tableColumnPadding, ' ', 0)
-	fmt.Fprintln(w, "  STREAM\tPORT\tAGE\tTO SUBSCRIBER\tMb/s\tTO PUBLISHER\tMb/s")
+	t := newTable()
+	t.rowf(p.bold, "  STREAM\tPORT\tAGE\tTO SUBSCRIBER\tMb/s\tTO PUBLISHER\tMb/s\n")
 	for _, str := range streams {
-		fmt.Fprintf(w, "  %d\t%d\t%s\t%d\t%s\t%d\t%s\n",
+		t.rowf(nil, "  %d\t%d\t%s\t%d\t%s\t%d\t%s\n",
 			str.ReqID, str.Port, roundedSince(now, str.Started),
 			str.BytesToSub, megabitsPerSecond(str.BytesToSub, now, str.Started),
 			str.BytesToPub, megabitsPerSecond(str.BytesToPub, now, str.Started))
 	}
 	// A pending request is a subscriber waiting on a publisher that has not
 	// answered yet. Showing it separately is the point: a tunnel that is
-	// stuck looks entirely different from one that is merely quiet.
+	// stuck looks entirely different from one that is merely quiet - which is
+	// also why the whole row is yellow rather than the four columns that have
+	// no number to show yet.
 	for _, req := range sess.Pending {
-		fmt.Fprintf(w, "  %d\t%d\t%s\tpending\tpending\tpending\tpending\n",
+		t.rowf(p.yellow, "  %d\t%d\t%s\tpending\tpending\tpending\tpending\n",
 			req.ReqID, req.Port, roundedSince(now, req.Since))
 	}
-	_ = w.Flush()
+	_ = t.flush(out)
 }
 
 // bitsPerByte and bitsPerMegabit convert a byte count into the decimal
@@ -432,5 +333,5 @@ func dash(s string) string {
 		return "-"
 	}
 
-	return s
+	return terminalText(s)
 }
