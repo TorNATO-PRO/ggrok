@@ -146,14 +146,11 @@ func runShare(cfg shareConfig) error {
 		return err
 	}
 
-	if err := reportToken(cfg, creds.SubscriberToken()); err != nil {
-		return err
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	return share.Run(ctx, share.Config{
+	reportConnecting(cfg.server)
+	err = share.Run(ctx, share.Config{
 		Server:     cfg.server,
 		CertFile:   cfg.certFile,
 		KeyFile:    cfg.keyFile,
@@ -161,10 +158,21 @@ func runShare(cfg shareConfig) error {
 		Mode:       proto.ModeTCP,
 		Addr:       cfg.addr,
 		SessionKey: *cfg.sessionKey,
+		OnReady: func() error {
+			if tokenErr := reportToken(cfg, creds.SubscriberToken()); tokenErr != nil {
+				return tokenErr
+			}
+			fmt.Fprintln(os.Stderr, stderrColors().green(
+				"ready: sharing TCP "+cfg.addr.String()+" through "+cfg.server.String(),
+			))
+			return nil
+		},
+		OnForwardError: newForwardErrorReporter(os.Stderr),
 
 		OnDisconnect: reportDisconnect,
 		OnReconnect:  reportReconnect,
 	})
+	return explainSessionError(err)
 }
 
 // reportToken hands the subscriber token to whoever started this share:
@@ -220,7 +228,7 @@ func reportToken(cfg shareConfig, token proto.SubscriberToken) error {
 // shouldn't append an hour of commentary to that.
 func reportDisconnect(err error, retryIn time.Duration) {
 	fmt.Fprintln(os.Stderr, stderrColors().yellow(fmt.Sprintf(
-		"lost relay connection: %s; retrying in %s",
+		"connection interrupted: %s; retrying in %s",
 		terminalText(err.Error()), retryIn.Round(time.Millisecond),
 	)))
 }
@@ -228,7 +236,7 @@ func reportDisconnect(err error, retryIn time.Duration) {
 // reportReconnect notes that a session came back, which is the only signal
 // that the gap reportDisconnect announced is over.
 func reportReconnect() {
-	fmt.Fprintln(os.Stderr, stderrColors().green("reconnected to relay"))
+	fmt.Fprintln(os.Stderr, stderrColors().green("ready: reconnected to relay"))
 }
 
 // suggestedListenAddr is the local address the printed listen command

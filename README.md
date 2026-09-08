@@ -115,7 +115,7 @@ That TCP port needs to be reachable from outside - it's the only one relay liste
 ggrok share -tcp 127.0.0.1:8080 -server relay.example.com:4443
 ```
 
-Prints a **subscriber token** - that's the only thing a `listen` subscriber needs to reach this
+After relay accepts the session, prints a **subscriber token** - that's the only thing a `listen` subscriber needs to reach this
 session, and it deliberately cannot publish the session (see [Two secrets, not
 one](#two-secrets-not-one)). Once `-server`/`-cert-file`/`-key-file`/`-ca-file` are set in
 `~/.ggrok/config.json` (see below) or their `GGROK_*` env var, day-to-day this shrinks to just `ggrok
@@ -141,6 +141,27 @@ Binds `127.0.0.1:9090` locally; every connection to it is forwarded through rela
 is serving. The token can also come from `GGROK_TOKEN` or `-token`; `-token-file -` reads it from
 stdin. Passing it as a positional argument still works but is deprecated - an argument is visible to
 every local user through `ps` and is kept in shell history.
+
+Both commands report `connecting to relay` followed by `ready` once relay accepts their
+registration. `listen` prints its bound addresses only after it has subscribed successfully.
+Readiness means the tunnel session is connected; the shared service is contacted when a local
+client connects. If that fails, `share` reports the target address and the reason on stderr.
+Tunnel setup failures and local capacity limits are also reported, with repeated forwarding
+errors limited to one message every five seconds to keep busy clients from flooding the terminal.
+
+To start the subscriber before the publisher (or relay) is online, add `--wait`:
+
+```bash
+ggrok listen --tcp 127.0.0.1:9090 --token-file token.txt --wait
+```
+
+It reports whether it is waiting for relay or the publisher and retries with backoff until
+connected. Ctrl+C cancels the wait. An incompatible port range, forwarding mode, or rejected
+certificate still stops the command with an error. Without `--wait`, a failed initial connection
+exits immediately; after a successful connection, automatic reconnection remains enabled in both
+cases. Local ports stay bound while waiting or reconnecting, but connections arriving before
+readiness are closed so clients can retry. Status and diagnostics go to stderr; tokens and bound
+addresses remain on stdout (or the requested token file).
 
 ### Upgrading the wire protocol
 

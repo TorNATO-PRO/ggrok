@@ -9,6 +9,7 @@ package peer
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -37,6 +38,9 @@ const dialTimeout = 10 * time.Second
 
 // MaxTunnels bounds concurrent active and establishing tunnels per peer process.
 const MaxTunnels = 256
+
+// ErrProtocolMismatch means relay and this peer need compatible versions.
+var ErrProtocolMismatch = errors.New("relay protocol mismatch; upgrade relay, share, and listen together")
 
 // Session is everything a peer needs to open connections to relay for one
 // session: where relay is, how to authenticate to it, and the credentials
@@ -111,7 +115,7 @@ func (s Session) OpenTunnel(ctx context.Context, attach proto.Attach) (*proto.En
 func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedConn, error) {
 	attach.SessionID = s.id
 	if err := proto.WriteDataAttach(conn, attach); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("send tunnel request: %w", err)
 	}
 
 	// Only a subscriber's attach is acked: it asks relay to find it a
@@ -122,11 +126,11 @@ func (s Session) attach(conn *tls.Conn, attach proto.Attach) (*proto.EncryptedCo
 	if attach.Kind == proto.AttachSubscriber {
 		status, err := proto.ReadAck(conn)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read relay tunnel response: %w", err)
 		}
 
 		if err := status.Err(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("relay refused tunnel: %w", err)
 		}
 	}
 
@@ -159,7 +163,7 @@ func (s Session) dial(ctx context.Context) (*tls.Conn, error) {
 
 	if tlsConn.ConnectionState().NegotiatedProtocol != proto.ALPN {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("relay did not negotiate %s", proto.ALPN)
+		return nil, fmt.Errorf("%w (expected %s)", ErrProtocolMismatch, proto.ALPN)
 	}
 
 	_ = tlsConn.SetDeadline(time.Now().Add(dialTimeout))

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	hostport "tornato.dev/ggrok/v2/internal"
@@ -50,6 +51,21 @@ type Config struct {
 	// carries the secret sealing its traffic. It is what share hands out;
 	// it deliberately cannot publish the session (see proto.SubscriberToken).
 	Token proto.SubscriberToken
+
+	// Wait retries temporary startup failures until relay and publisher
+	// become available. Configuration and certificate failures still stop Run.
+	Wait bool
+
+	// OnReady runs once after subscribing successfully, after OnListen has
+	// reported every bound address. Returning an error stops the session.
+	OnReady func() error
+
+	// OnWaiting reports retries before the first successful subscription.
+	OnWaiting func(err error, retryIn time.Duration)
+
+	// OnForwardError reports failed tunnel setup and capacity rejections.
+	// Calls may arrive concurrently; normal shutdown is not reported.
+	OnForwardError func(error)
 
 	// OnListen, if non-nil, is called once per port with that socket's
 	// actual bound address right after it's bound - the requested address
@@ -159,6 +175,7 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 	}()
 
 	serveErr := make(chan error, 1)
+	var ready atomic.Bool
 	go func() {
 		serveErr <- session.Serve(ctx, peer.ServeConfig{
 			Mode:  cfg.Mode,
@@ -175,10 +192,30 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 
 				return nil
 			},
-			OnReconnect:  cfg.OnReconnect,
-			OnDisconnect: cfg.OnDisconnect,
+			Wait:      cfg.Wait,
+			OnWaiting: cfg.OnWaiting,
+			OnReady: func() error {
+				ready.Store(true)
+				if cfg.OnReady != nil {
+					return cfg.OnReady()
+				}
+				return nil
+			},
+			OnReconnect: func() {
+				ready.Store(true)
+				if cfg.OnReconnect != nil {
+					cfg.OnReconnect()
+				}
+			},
+			OnDisconnect: func(err error, retryIn time.Duration) {
+				ready.Store(false)
+				if cfg.OnDisconnect != nil {
+					cfg.OnDisconnect(err, retryIn)
+				}
+			},
 		})
 
+		ready.Store(false)
 		cancel() // the session is past saving; stop accepting local connections
 	}()
 
@@ -191,7 +228,7 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 	for i, ln := range listeners {
 		port := proto.PortIndex(i)
 		go func() {
-			acceptErr <- acceptLoop(ctx, session, ln, port, slots)
+			acceptErr <- acceptLoop(ctx, session, ln, port, slots, &ready, cfg.OnForwardError)
 		}()
 	}
 
@@ -240,28 +277,45 @@ func acceptLoop(
 	ln net.Listener,
 	port proto.PortIndex,
 	slots chan struct{},
+	ready *atomic.Bool,
+	report func(error),
 ) error {
 	for {
 		local, err := ln.Accept()
 		if err != nil {
 			return err
 		}
+		if !ready.Load() {
+			_ = local.Close()
+			if report != nil && ctx.Err() == nil {
+				report(fmt.Errorf("cannot forward connection on %s: tunnel is not ready; "+
+					"wait for the ready message and retry", ln.Addr()))
+			}
+			continue
+		}
 
 		select {
 		case slots <- struct{}{}:
 			go func() {
 				defer func() { <-slots }()
-				forward(ctx, session, local, port)
+				if err := forward(ctx, session, local, port); err != nil && ctx.Err() == nil && report != nil {
+					report(err)
+				}
 			}()
 		default:
 			_ = local.Close()
+			if report != nil && ctx.Err() == nil {
+				report(fmt.Errorf(
+					"listener tunnel limit reached (%d); close unused connections and retry", peer.MaxTunnels,
+				))
+			}
 		}
 	}
 }
 
 // forward opens a tunnel for local, tagged with the port it arrived on, and
 // splices the two once relay has paired it with the publisher's end.
-func forward(ctx context.Context, session peer.Session, local net.Conn, port proto.PortIndex) {
+func forward(ctx context.Context, session peer.Session, local net.Conn, port proto.PortIndex) error {
 	stop := context.AfterFunc(ctx, func() { _ = local.Close() })
 	defer stop()
 
@@ -272,10 +326,11 @@ func forward(ctx context.Context, session peer.Session, local net.Conn, port pro
 		// arriving while the session is between relays gets: closed at once,
 		// so the client sees a failure it can retry rather than a hang.
 		_ = local.Close()
-		return
+		return fmt.Errorf("open tunnel for %s: %w; check the share and relay status", local.LocalAddr(), err)
 	}
 
 	streamio.Splice(local, tunnel)
+	return nil
 }
 
 // sessionClosedErr renders a ControlSessionClosed frame's payload as an

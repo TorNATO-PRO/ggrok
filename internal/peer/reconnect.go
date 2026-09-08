@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"math/rand/v2"
+	"net"
+	"strings"
 	"time"
 
 	"tornato.dev/ggrok/v2/internal/proto"
@@ -55,9 +57,17 @@ type ServeConfig struct {
 	// session - it outlives any one connection, so it must not capture one.
 	Handle ControlHandler
 
+	// Wait retries temporary failures before the first successful connection.
+	Wait bool
+
+	// OnReady runs once after the first successful registration. An error
+	// stops Serve and closes the connection (for example, if saving the
+	// subscriber token fails). OnWaiting reports retries before readiness.
+	OnReady   func() error
+	OnWaiting func(err error, retryIn time.Duration)
+
 	// OnReconnect, if non-nil, is called each time a session is
-	// re-established. Not for the first one: the caller already knows about
-	// that, because Serve returning nothing yet is what says so.
+	// re-established. The first registration is reported through OnReady.
 	OnReconnect func()
 
 	// OnDisconnect, if non-nil, is called each time an established session
@@ -75,8 +85,8 @@ type ServeConfig struct {
 // happened - relay hands out a new session, and the tunnels opened against
 // it are the same tunnels as before.
 //
-// The first connection is not retried. It's the caller's answer about
-// whether the session is viable at all - an unreachable relay, a token
+// Unless Wait is set, the first connection is not retried. It's the caller's
+// answer about whether the session is viable at all - an unreachable relay, a token
 // nobody is publishing, a port count that doesn't match - and those are
 // mistakes to report rather than conditions to wait out. Everything after
 // it is retried on the backoff above, so Serve only ever returns because
@@ -91,8 +101,9 @@ func (s Session) Serve(ctx context.Context, cfg ServeConfig) error {
 	for {
 		control, err := s.connect(ctx, cfg.Mode, cfg.Ports)
 		if err == nil {
-			if connected && cfg.OnReconnect != nil {
-				cfg.OnReconnect()
+			if readyErr := cfg.notifyConnected(connected); readyErr != nil {
+				_ = control.Close()
+				return readyErr
 			}
 			connected = true
 
@@ -107,14 +118,16 @@ func (s Session) Serve(ctx context.Context, cfg ServeConfig) error {
 		switch {
 		case ctx.Err() != nil:
 			return ctx.Err()
-		case !connected, !retryable(err):
+		case (!connected && !cfg.Wait) || !retryable(err):
 			return err
 		}
 
 		delay := retryDelay(attempt)
 		attempt++
 
-		if cfg.OnDisconnect != nil {
+		if !connected && cfg.OnWaiting != nil {
+			cfg.OnWaiting(err, delay)
+		} else if connected && cfg.OnDisconnect != nil {
 			cfg.OnDisconnect(err, delay)
 		}
 
@@ -122,6 +135,21 @@ func (s Session) Serve(ctx context.Context, cfg ServeConfig) error {
 			return err
 		}
 	}
+}
+
+// notifyConnected distinguishes initial readiness from reconnection so a
+// saved token or bound address is only emitted once.
+func (cfg ServeConfig) notifyConnected(connected bool) error {
+	if !connected {
+		if cfg.OnReady != nil {
+			return cfg.OnReady()
+		}
+		return nil
+	}
+	if cfg.OnReconnect != nil {
+		cfg.OnReconnect()
+	}
+	return nil
 }
 
 // connect opens a control connection and completes its handshake, which is
@@ -180,6 +208,7 @@ func runSession(ctx context.Context, control *tls.Conn, handle ControlHandler) e
 // an ordinary flap.
 func retryable(err error) bool {
 	var certErr *tls.CertificateVerificationError
+	var opErr *net.OpError
 
 	switch {
 	case errors.Is(err, proto.ErrModeMismatch), errors.Is(err, proto.ErrPortsMismatch):
@@ -187,6 +216,13 @@ func retryable(err error) bool {
 	case errors.Is(err, proto.ErrDenied):
 		return false
 	case errors.As(err, &certErr):
+		return false
+	case errors.Is(err, ErrProtocolMismatch):
+		return false
+	case errors.As(err, &opErr) && opErr.Op == "remote error" && strings.HasPrefix(opErr.Err.Error(), "tls:"):
+		// crypto/tls exposes fatal peer alerts through net.OpError, but
+		// the alert type itself is private. Retrying a rejected certificate
+		// or incompatible TLS/ALPN configuration will not repair it.
 		return false
 	default:
 		return true

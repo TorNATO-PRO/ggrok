@@ -33,6 +33,9 @@ type listenConfig struct {
 
 	// token identifies which publisher's session to subscribe to.
 	token proto.SubscriberToken
+
+	// wait permits starting listen before the relay or publisher is available.
+	wait bool
 }
 
 // newListenCommand registers options without loading local configuration.
@@ -45,6 +48,7 @@ func newListenCommand() (*cobra.Command, *listenConfig) {
 
 	var cfg listenConfig
 	finishConn := registerConnFlags(fs, &cfg.nodeConnConfig)
+	fs.BoolVar(&cfg.wait, "wait", false, "wait for relay and publisher at startup; Ctrl+C cancels")
 
 	fs.Func(
 		"tcp",
@@ -133,8 +137,10 @@ func runListen(cfg listenConfig) error {
 	defer stop()
 
 	p := stdoutColors()
+	var addresses []net.Addr
+	reportConnecting(cfg.server)
 
-	return listen.Run(ctx, listen.Config{
+	err := listen.Run(ctx, listen.Config{
 		Server:   cfg.server,
 		CertFile: cfg.certFile,
 		KeyFile:  cfg.keyFile,
@@ -142,10 +148,21 @@ func runListen(cfg listenConfig) error {
 		Mode:     proto.ModeTCP,
 		Addr:     cfg.addr,
 		Token:    cfg.token,
+		Wait:     cfg.wait,
 		OnListen: func(addr net.Addr) {
-			fmt.Fprintf(os.Stdout, "%s %s\n", p.green("listening on"), p.bold(addr.String()))
+			addresses = append(addresses, addr)
 		},
-		OnDisconnect: reportDisconnect,
-		OnReconnect:  reportReconnect,
+		OnReady: func() error {
+			for _, addr := range addresses {
+				fmt.Fprintf(os.Stdout, "%s %s\n", p.green("listening on"), p.bold(addr.String()))
+			}
+			fmt.Fprintln(os.Stderr, stderrColors().green("ready: connected to publisher through "+cfg.server.String()))
+			return nil
+		},
+		OnWaiting:      reportWaiting,
+		OnForwardError: newForwardErrorReporter(os.Stderr),
+		OnDisconnect:   reportDisconnect,
+		OnReconnect:    reportReconnect,
 	})
+	return explainSessionError(err)
 }

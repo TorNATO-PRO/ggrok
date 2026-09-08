@@ -54,6 +54,16 @@ func TestRetryable(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "relay rejects client certificate",
+			err:  &net.OpError{Op: "remote error", Err: errors.New("tls: bad certificate")},
+			want: false,
+		},
+		{
+			name: "protocol mismatch",
+			err:  peer.ErrProtocolMismatch,
+			want: false,
+		},
+		{
 			name: "relay is not listening",
 			err:  fmt.Errorf("dial relay: %w", errors.New("connection refused")),
 			want: true,

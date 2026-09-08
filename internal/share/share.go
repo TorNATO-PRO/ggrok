@@ -47,6 +47,14 @@ type Config struct {
 	// (see proto.Credentials).
 	SessionKey proto.SessionKey
 
+	// OnReady runs after relay accepts the publisher, before serving data.
+	// Returning an error stops the session.
+	OnReady func() error
+
+	// OnForwardError reports failed tunnel setup or local service dials.
+	// Calls may arrive concurrently; normal shutdown is not reported.
+	OnForwardError func(error)
+
 	// OnDisconnect and OnReconnect, if non-nil, report the session losing
 	// relay and getting it back. Run keeps redialing rather than returning
 	// on a lost connection (see [peer.Session.Serve]), so without these a
@@ -114,10 +122,13 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 				case slots <- struct{}{}:
 					go func() {
 						defer func() { <-slots }()
-						fulfill(ctx, session, cfg.Addr, reqID, port)
+						cfg.reportForwardError(ctx, fulfill(ctx, session, cfg.Addr, reqID, port))
 					}()
 				default:
 					// relay will expire requests beyond our capacity.
+					cfg.reportForwardError(ctx, fmt.Errorf(
+						"publisher tunnel limit reached (%d); close unused connections and retry", peer.MaxTunnels,
+					))
 				}
 			}
 
@@ -125,7 +136,14 @@ func runTCP(ctx context.Context, session peer.Session, cfg Config) error {
 		},
 		OnReconnect:  cfg.OnReconnect,
 		OnDisconnect: cfg.OnDisconnect,
+		OnReady:      cfg.OnReady,
 	})
+}
+
+func (cfg Config) reportForwardError(ctx context.Context, err error) {
+	if err != nil && ctx.Err() == nil && cfg.OnForwardError != nil {
+		cfg.OnForwardError(err)
+	}
 }
 
 // fulfill answers one ControlRequestData: it opens the tunnel relay asked
@@ -138,19 +156,19 @@ func fulfill(
 	addr hostport.Range,
 	reqID uint64,
 	port proto.PortIndex,
-) {
+) error {
 	// relay checks the index against the port count this share registered,
 	// but relay is the one that supplied it - so it's checked again here
 	// against the range this process actually holds, which is the only
 	// authority on what "index 3" means locally.
 	local, ok := addr.At(int(port))
 	if !ok {
-		return
+		return fmt.Errorf("relay requested port index %d outside the shared range", port)
 	}
 
 	tunnel, err := session.OpenTunnel(ctx, proto.Attach{Kind: proto.AttachPublisher, RequestID: reqID, Port: port})
 	if err != nil {
-		return
+		return fmt.Errorf("open tunnel to %s: %w", local, err)
 	}
 
 	defer func() { _ = tunnel.Close() }()
@@ -161,8 +179,10 @@ func fulfill(
 	localConn, err := dialer.DialContext(ctx, "tcp", local.String())
 	if err != nil {
 		_ = tunnel.Close()
-		return
+		return fmt.Errorf("could not reach local service %s: %w; "+
+			"check that the service is running and the --tcp address is correct", local, err)
 	}
 
 	streamio.Splice(tunnel, localConn)
+	return nil
 }
