@@ -132,17 +132,22 @@ func runAdminList(cfg nodeConnConfig) error {
 	return printSnapshot(os.Stdout, stdoutColors(), snapshot)
 }
 
-// newAdminKickCommand closes every live connection belonging to one serial.
-func newAdminKickCommand() *cobra.Command {
-	cmd, cfg := newAdminPeerCommand("kick", "Disconnect every connection for a certificate")
-	cmd.Long = cmd.Short + ".\n\nThis does not revoke the certificate; the peer may reconnect. To prevent that,\nrevoke its certificate and reload the relay's revoked certificate list."
-	var serial string
-	cmd.Flags().StringVar(&serial, "serial", "", "certificate serial shown by ggrok admin ls")
+// newAdminKillCommand ends one session and keeps it ended.
+func newAdminKillCommand() *cobra.Command {
+	cmd, cfg := newAdminPeerCommand("kill", "End one session and refuse it until the relay restarts")
+	cmd.Long = cmd.Short + ".\n\n" +
+		"The publisher of a killed session is refused when it reconnects and exits\n" +
+		"instead of retrying, so the share stops rather than reappearing.\n\n" +
+		"This ends one share, not one peer: the same certificate can start a new share\n" +
+		"under a new session key. To stop the identity, revoke its certificate.\n\n" +
+		"The relay forgets every kill when it restarts."
+	var session string
+	cmd.Flags().StringVar(&session, "session", "", "session tag shown by ggrok admin ls")
 	cmd.RunE = func(*cobra.Command, []string) error {
-		if serial == "" {
-			return fmt.Errorf("--serial is required")
+		if session == "" {
+			return fmt.Errorf("--session is required")
 		}
-		return runAdminMutation(*cfg, proto.AdminKick, proto.AdminKickPayload{Serial: serial})
+		return runAdminMutation(*cfg, proto.AdminKill, proto.AdminKillPayload{Tag: session})
 	}
 	return cmd
 }

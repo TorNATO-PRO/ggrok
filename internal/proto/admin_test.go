@@ -24,7 +24,7 @@ func TestAdminFrameRoundTrip(t *testing.T) {
 		{name: "ack", typ: proto.AdminAck, payload: proto.AdminAckPayload{OK: true, Version: 1}},
 		{name: "refusal", typ: proto.AdminAck, payload: proto.AdminAckPayload{Err: "nope", Version: 1}},
 		{name: "empty payload", typ: proto.AdminList, payload: nil},
-		{name: "kick", typ: proto.AdminKick, payload: proto.AdminKickPayload{Serial: "deadbeef"}},
+		{name: "kill", typ: proto.AdminKill, payload: proto.AdminKillPayload{Tag: "8f8220ea7b37"}},
 		{
 			name:    "result",
 			typ:     proto.AdminResult,
@@ -251,6 +251,7 @@ func TestAdminTypeStringRendersUnknown(t *testing.T) {
 		proto.AdminKick:      "kick",
 		proto.AdminReloadCRL: "reload-crl",
 		proto.AdminResult:    "result",
+		proto.AdminKill:      "kill",
 	}
 	for typ, want := range known {
 		if got := typ.String(); got != want {

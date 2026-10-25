@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -390,11 +391,11 @@ func requestMutation(t *testing.T, conn *tls.Conn, typ proto.AdminType, payload 
 	return result
 }
 
-// TestKickSerialClosesTheSession is the enforcement half of revocation.
-// Reloading a CRL only affects the next handshake, so a peer that
-// authenticated before the revocation stays connected until something closes
-// it - and this is that something.
-func TestKickSerialClosesTheSession(t *testing.T) {
+// TestAdminKickIsRefusedWithItsReplacement covers an older admin client that
+// still sends kick. The verb is retired, but its value stays on the wire, and
+// what comes back has to be an answer naming what to type instead - not
+// silence, and not a kick that quietly still works.
+func TestAdminKickIsRefusedWithItsReplacement(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -402,61 +403,37 @@ func TestKickSerialClosesTheSession(t *testing.T) {
 
 	addr, root, registry := adminRelay(ctx, t, relay.TestServerConfig{Admin: true})
 	clientCfg := testTLSConfig(t, root, false)
-	pub, sub := newSession(t)
+	pub, _ := newSession(t)
+	registerControl(t, addr.String(), clientCfg, pub, proto.RolePublish)
 
-	pubConn := registerControl(t, addr.String(), clientCfg, pub, proto.RolePublish)
-	registerControl(t, addr.String(), clientCfg, sub, proto.RoleSubscribe)
-
-	before := registry.Snapshot()
-	if len(before.Sessions) != 1 {
-		t.Fatalf("setup produced %d sessions, want 1", len(before.Sessions))
-	}
-	serial := before.Sessions[0].Publisher.Serial
-	if serial == "" {
-		t.Fatal("the snapshot carried no serial to kick by")
-	}
-
-	// An unrelated serial must close nothing: a kick is targeted, and one
-	// that quietly took down bystanders would be far worse than one that
-	// missed.
-	admin, ack, err := dialAdmin(t, addr.String(), roleTLSConfig(t, root, true))
+	conn, ack, err := dialAdmin(t, addr.String(), roleTLSConfig(t, root, true))
 	if err != nil || !ack.OK {
 		t.Fatalf("admin refused: %v %+v", err, ack)
 	}
-	kick := func(serial string) int {
-		return requestMutation(t, admin, proto.AdminKick, proto.AdminKickPayload{Serial: serial}).Affected
+
+	// The body an older client sends: a real serial, in the shape the
+	// retired payload had. The relay must not act on it.
+	serial := requestSnapshot(t, conn).Sessions[0].Publisher.Serial
+	result := requestMutation(t, conn, proto.AdminKick, map[string]string{"serial": serial})
+	if result.OK || result.Affected != 0 {
+		t.Fatalf("retired kick = %+v, want a refusal that closed nothing", result)
 	}
-	if closed := kick("0000deadbeef"); closed != 0 {
-		t.Fatalf("kicking an unknown serial closed %d connections", closed)
+	for _, replacement := range []string{"kill", "reload-crl"} {
+		if !strings.Contains(result.Detail, replacement) {
+			t.Fatalf("refusal %q does not name %s", result.Detail, replacement)
+		}
 	}
-	if len(registry.Snapshot().Sessions) != 1 {
-		t.Fatal("kicking an unknown serial disturbed a live session")
-	}
-	if closed := kick(""); closed != 0 {
-		t.Fatalf("kicking an empty serial closed %d connections", closed)
+	if got := len(registry.Snapshot().Sessions); got != 1 {
+		t.Fatalf("a refused kick disturbed the live session: %d sessions", got)
 	}
 
-	// Publisher and subscriber share one identity here, so both control
-	// connections belong to this serial.
-	closed := kick(serial)
-	if closed != 2 {
-		t.Fatalf("kick closed %d connections, want 2", closed)
-	}
-
-	// Closing the publisher's control connection runs the ordinary
-	// unregister path, which drops the session.
-	waitForNoSessions(t, registry)
-
-	// The peer observes a closed connection, which is what makes its
-	// existing reconnect logic take over - no new frame type involved.
-	_ = pubConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	var buf [1]byte
-	if _, err := pubConn.Read(buf[:]); err == nil {
-		t.Fatal("a kicked publisher's control connection was still readable")
+	// A refusal is an answer, so the admin connection is still usable.
+	if got := requestSnapshot(t, conn); len(got.Sessions) != 1 {
+		t.Fatalf("admin connection unusable after the refusal: %+v", got)
 	}
 }
 
-// waitForNoSessions waits for the registry to become empty. The kick
+// waitForNoSessions waits for the registry to become empty. A kill or reload
 // closes connections; the unregister that drops the session happens on the
 // handler goroutine a moment later.
 func waitForNoSessions(t *testing.T, registry *relay.Registry) {
@@ -473,45 +450,6 @@ func waitForNoSessions(t *testing.T, registry *relay.Registry) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-}
-
-// TestAdminKickOverTheWire drives the kick through the admin plane rather
-// than the registry directly, so the request decoding and the result frame
-// are covered too.
-func TestAdminKickOverTheWire(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	addr, root, registry := adminRelay(ctx, t, relay.TestServerConfig{Admin: true})
-	clientCfg := testTLSConfig(t, root, false)
-	pub, _ := newSession(t)
-	registerControl(t, addr.String(), clientCfg, pub, proto.RolePublish)
-
-	conn, ack, err := dialAdmin(t, addr.String(), roleTLSConfig(t, root, true))
-	if err != nil || !ack.OK {
-		t.Fatalf("admin refused: %v %+v", err, ack)
-	}
-
-	snapshot := requestSnapshot(t, conn)
-	if len(snapshot.Sessions) != 1 {
-		t.Fatalf("setup produced %d sessions, want 1", len(snapshot.Sessions))
-	}
-	serial := snapshot.Sessions[0].Publisher.Serial
-
-	// A kick with no serial is refused rather than treated as "kick
-	// everything", which is the failure mode worth being loud about.
-	if empty := requestMutation(t, conn, proto.AdminKick, proto.AdminKickPayload{}); empty.OK {
-		t.Fatal("a kick with no serial was accepted")
-	}
-
-	result := requestMutation(t, conn, proto.AdminKick, proto.AdminKickPayload{Serial: serial})
-	if !result.OK || result.Affected != 1 {
-		t.Fatalf("kick = %+v, want ok with 1 affected", result)
-	}
-
-	waitForNoSessions(t, registry)
 }
 
 // TestAdminReloadCRLWithoutAFile covers the arm an operator hits by running
@@ -680,9 +618,20 @@ func TestReloadRevokesExistingAdminConnection(t *testing.T) {
 	}
 }
 
-func TestKickClosesStreamAfterSessionEnds(t *testing.T) {
+// TestReloadCRLClosesStreamAfterSessionEnds covers the streams session.shutdown
+// deliberately leaves running. They outlive the session that paired them, so
+// the registry can no longer see them - only the transport set can, and a
+// revocation has to reach them there or a revoked publisher keeps a live
+// stream for as long as it cares to.
+func TestReloadCRLClosesStreamAfterSessionEnds(t *testing.T) {
 	t.Parallel()
-	addr, root, registry := adminRelay(t.Context(), t, relay.TestServerConfig{Admin: true})
+	revokedFile := filepath.Join(t.TempDir(), "revoked.txt")
+	if err := os.WriteFile(revokedFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addr, root, registry := adminRelay(t.Context(), t, relay.TestServerConfig{
+		Admin: true, Revoked: mtls.NewRevocationSet(nil), RevokedFile: revokedFile,
+	})
 	pubCfg, subCfg := testTLSConfig(t, root, false), testTLSConfig(t, root, false)
 	pub, sub := newSession(t)
 	control := registerControl(t, addr.String(), pubCfg, pub, proto.RolePublish)
@@ -735,9 +684,12 @@ func TestKickClosesStreamAfterSessionEnds(t *testing.T) {
 	if err != nil || !ack.OK {
 		t.Fatalf("admin refused: %v %+v", err, ack)
 	}
-	result := requestMutation(t, admin, proto.AdminKick, proto.AdminKickPayload{Serial: serial})
+	if err = os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := requestMutation(t, admin, proto.AdminReloadCRL, nil)
 	if !result.OK || result.Affected != 1 {
-		t.Fatalf("kick retired stream: %+v", result)
+		t.Fatalf("reload against a retired stream: %+v", result)
 	}
 	var timeout net.Error
 	if _, readErr := subscriber.Read(data[:]); readErr == nil || (errors.As(readErr, &timeout) && timeout.Timeout()) {
@@ -745,20 +697,11 @@ func TestKickClosesStreamAfterSessionEnds(t *testing.T) {
 	}
 }
 
-// A certificate can be used by both a tunnel and its operator. Evicting it
-// must acknowledge the mutation before closing the requesting admin socket.
+// A certificate can be used by both a tunnel and its operator. Revoking it
+// must acknowledge the reload before closing the requesting admin socket -
+// otherwise the operator who ran it learns only that their connection died.
 func TestAdminSelfEvictionAcknowledgesThenCloses(t *testing.T) {
 	t.Parallel()
-	for _, operation := range []proto.AdminType{proto.AdminKick, proto.AdminReloadCRL} {
-		t.Run(operation.String(), func(t *testing.T) {
-			t.Parallel()
-			testAdminSelfEviction(t, operation)
-		})
-	}
-}
-
-func testAdminSelfEviction(t *testing.T, operation proto.AdminType) {
-	t.Helper()
 
 	revokedFile := filepath.Join(t.TempDir(), "revoked.txt")
 	if err := os.WriteFile(revokedFile, nil, 0o600); err != nil {
@@ -779,14 +722,10 @@ func testAdminSelfEviction(t *testing.T, operation proto.AdminType) {
 	if err != nil || !ack.OK {
 		t.Fatalf("admin refused: %v %+v", err, ack)
 	}
-	var payload any = proto.AdminKickPayload{Serial: serial}
-	if operation == proto.AdminReloadCRL {
-		if err = os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		payload = nil
+	if err = os.WriteFile(revokedFile, []byte(serial+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	result := requestMutation(t, conn, operation, payload)
+	result := requestMutation(t, conn, proto.AdminReloadCRL, nil)
 	if !result.OK || result.Affected != 2 {
 		t.Fatalf("self eviction = %+v, want OK and 2 affected", result)
 	}

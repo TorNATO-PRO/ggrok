@@ -34,6 +34,8 @@ import (
 var (
 	errPublisherExists  = errors.New("session already has an active publisher")
 	errNoSuchSession    = errors.New("no active session for this identifier")
+	errSessionKilled    = errors.New("session was ended by an operator")
+	errAmbiguousTag     = errors.New("session tag matches more than one session")
 	errModeMismatch     = errors.New("mode does not match this session's publisher")
 	errPortsMismatch    = errors.New("port count does not match this session's publisher")
 	errPortOutOfRange   = errors.New("port index is past the end of this session's range")
@@ -57,6 +59,19 @@ type Registry struct {
 
 	mu       sync.Mutex
 	sessions map[proto.SessionID]*session
+
+	// killed is every SessionID an operator has ended with Kill. It is what
+	// makes a kill outlast the connection it closed: a publisher whose
+	// control connection simply drops cannot tell that from a flap and comes
+	// straight back, so ending a session for good means refusing the next
+	// registration too, not just severing this one.
+	//
+	// It only grows, and only in memory. A relay restart forgets every kill,
+	// which is the honest scope of the feature - a permanent decision about a
+	// peer is a revocation, and lives in the CA rather than here. Growth is
+	// bounded by how many sessions an operator kills by hand; each entry is a
+	// 32-byte key.
+	killed map[proto.SessionID]struct{}
 }
 
 // NewRegistry returns an empty Registry. logger records session lifecycle
@@ -67,7 +82,11 @@ func NewRegistry(logger *slog.Logger) *Registry {
 		logger = slog.Default()
 	}
 
-	return &Registry{logger: logger, sessions: make(map[proto.SessionID]*session)}
+	return &Registry{
+		logger:   logger,
+		sessions: make(map[proto.SessionID]*session),
+		killed:   make(map[proto.SessionID]struct{}),
+	}
 }
 
 // peerAttr describes who is on the other end of conn for a log line: its
@@ -95,7 +114,7 @@ func peerAttr(conn net.Conn) slog.Attr {
 // peerIdentity is who a connection belongs to, in the form an operator reads
 // and acts on. It is peerAttr's content captured as data rather than as a log
 // record, because the same three facts answer "who is attached" in a snapshot
-// and "which connections does this serial cover" for a kick.
+// and "which connections does this serial cover" for a CRL reload.
 //
 // Serial is rendered in ca.SerialTextBase, the same form ca crl writes and
 // verifyNotRevoked compares, so a serial read off a listing can be pasted
@@ -155,6 +174,17 @@ func (r *Registry) Register(control *tls.Conn, hello proto.Hello) (func(), error
 	}
 
 	r.mu.Lock()
+	// Checked here rather than before the claim, for the same reason the
+	// occupancy check is: a claimant that cannot prove the session is its own
+	// learns nothing about it, including whether it was killed. AckDenied is
+	// terminal on the peer side (see peer.retryable), so the publisher this
+	// turns away prints the refusal and exits instead of reconnecting - which
+	// is what makes a kill outlast the connection it closed.
+	if _, killed := r.killed[sessionID]; killed {
+		r.mu.Unlock()
+		_ = proto.WriteAck(control, proto.AckDenied)
+		return nil, fmt.Errorf("register publisher: %w", errSessionKilled)
+	}
 	if _, exists := r.sessions[sessionID]; exists {
 		r.mu.Unlock()
 		_ = proto.WriteAck(control, proto.AckPublisherExists)
@@ -248,6 +278,70 @@ func (r *Registry) Subscribe(control *tls.Conn, hello proto.Hello) (proto.Subscr
 		r.logger.Info("subscriber detached",
 			peerAttr(control), sessionAttr(sessionID), slog.Any("mode", mode), slog.Any("sub", id))
 	}, nil
+}
+
+// Kill ends the session an admin snapshot showed as tag and refuses that
+// SessionID for the rest of this relay's life. It returns how many
+// subscribers were notified.
+//
+// Closing connections alone cannot do this: a closed connection is
+// indistinguishable from a severed one, so share reconnects through it by
+// design (see peer.retryable) - which is why admin kick, which did only that,
+// was retired. Kill removes the session, closes
+// the publisher's control connection, tells the subscribers, and remembers the
+// SessionID - so the reconnect that follows is answered with AckDenied, which
+// the publisher treats as terminal and exits on.
+//
+// What it does not do is stop the peer. The ban is keyed on the SessionID,
+// which is a function of the session key, so the same certificate can start a
+// fresh share under a new key and be a session this has never heard of.
+// Stopping an identity rather than a session is what ca revoke is for.
+//
+// Streams already spliced are left running, exactly as an ordinary publisher
+// disconnect leaves them (see session.shutdown). In practice they end within a
+// reconnect attempt, because the publisher that owns both of their ends is on
+// its way to exiting.
+func (r *Registry) Kill(tag string) (int, error) {
+	r.mu.Lock()
+
+	var (
+		found   proto.SessionID
+		sess    *session
+		matches int
+	)
+	for id, candidate := range r.sessions {
+		if id.LogTag() == tag {
+			found, sess, matches = id, candidate, matches+1
+		}
+	}
+
+	switch {
+	case matches == 0:
+		r.mu.Unlock()
+		return 0, fmt.Errorf("%w: %s", errNoSuchSession, tag)
+	case matches > 1:
+		// A tag is a truncation, so two live sessions sharing one is
+		// possible even though it is vanishingly unlikely. Refusing beats
+		// killing whichever the map happened to yield last.
+		r.mu.Unlock()
+		return 0, fmt.Errorf("%w: %s", errAmbiguousTag, tag)
+	}
+
+	r.killed[found] = struct{}{}
+	delete(r.sessions, found)
+	r.mu.Unlock()
+
+	// Closing the publisher's control connection is what ends the session
+	// from its side; the ban above is what keeps it ended. Order matters
+	// only in that both happen before this returns, so the operator's
+	// "killed" is true by the time they read it.
+	_ = sess.publisher.Close()
+	notified := sess.shutdown()
+
+	r.logger.Info("session killed",
+		sessionAttr(found), slog.Int("subscribers_notified", notified))
+
+	return notified, nil
 }
 
 // sessionFor looks up sessionID's session, if any.

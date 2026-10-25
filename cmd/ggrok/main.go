@@ -48,7 +48,7 @@ func newRootCommand() *cobra.Command {
 	admin := newCommand("admin", "Inspect and manage a running relay")
 	admin.RunE = showCommandHelp
 	admin.Long = admin.Short + ".\n\nRequires a certificate issued with ggrok ca issue --admin and a relay started with --admin."
-	admin.AddCommand(newAdminListCommand(), newAdminKickCommand(), newAdminReloadCRLCommand())
+	admin.AddCommand(newAdminListCommand(), newAdminKillCommand(), newAdminReloadCRLCommand())
 	root.AddCommand(share, listen, relay, ca, admin)
 	return root
 }

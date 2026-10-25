@@ -268,7 +268,7 @@ func (s *session) removeStream(reqID uint64) {
 // every transfer in flight each time one flapped would be a far worse outcome
 // than letting them finish against a session nobody can join any more. They
 // end when either peer closes, and their removeStream is a no-op by then. The
-// transport set still tracks them, so admin kick and CRL reload can close them.
+// transport set still tracks them, so a CRL reload can close them.
 //
 // Subscriber control connections are closed after the notification: the
 // peer can drain the written notification before observing EOF. One shared
@@ -290,6 +290,15 @@ func (s *session) shutdown() int {
 func (s *session) beginShutdown() (map[uint64]*pendingRequest, []*tls.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A killed session is shut down twice: once by Registry.Kill, and again
+	// by the unregister the publisher's own handler runs on its way out.
+	// Returning nothing the second time keeps that from writing a second
+	// session-closed frame to subscribers that have already been told and
+	// closed.
+	if s.closed {
+		return nil, nil
+	}
 
 	s.closed = true
 	pending := s.pending

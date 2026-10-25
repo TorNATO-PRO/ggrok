@@ -187,7 +187,10 @@ func (s *server) serveAdminRequest(
 		return proto.WriteAdminFrame(conn, proto.AdminSnapshot, s.registry.Snapshot())
 
 	case proto.AdminKick:
-		return s.serveKick(ctx, conn, body)
+		return s.refuseRetiredKick(ctx, conn)
+
+	case proto.AdminKill:
+		return s.serveKill(ctx, conn, body)
 
 	case proto.AdminReloadCRL:
 		return s.serveReloadCRL(ctx, conn)
@@ -200,46 +203,71 @@ func (s *server) serveAdminRequest(
 	}
 }
 
-// serveKick drops every live connection belonging to one certificate serial.
+// refuseRetiredKick answers a kick from an older admin client.
 //
-// It does not consult the revocation set: kicking and revoking are separate
-// decisions. Revoking without kicking leaves an authenticated peer connected
-// (see connectionSet.closeMatching), and kicking without revoking is a legitimate thing to
-// want on its own - evicting a misbehaving but still-trusted peer, which
-// reconnects immediately. An operator who wants the peer gone for good runs
-// ca revoke, ca crl, and then reload-crl, which does both.
-func (s *server) serveKick(ctx context.Context, conn *tls.Conn, body []byte) error {
-	var req proto.AdminKickPayload
-	if err := proto.DecodeAdminPayload(body, &req); err != nil {
-		return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
-			Detail: fmt.Sprintf("malformed kick request: %v", err),
-		})
-	}
-	if req.Serial == "" {
-		return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
-			Detail: "kick requires a certificate serial",
-		})
-	}
-
-	closed, finish := s.connections.closeMatchingAfterReply(
-		func(serial string) bool { return serial == req.Serial }, conn.NetConn(),
-	)
-	defer finish()
-	_ = conn.SetWriteDeadline(time.Now().Add(adminReplyTimeout))
-	s.logger.InfoContext(ctx, "admin kicked a serial", peerAttr(conn),
-		slog.String("serial", req.Serial), slog.Int("connections_closed", closed))
+// It is an answer rather than a close for the reason refuseAdminRequest is,
+// and it names the replacement rather than saying "unsupported": an operator
+// whose muscle memory is `admin kick` has a live problem in front of them, and
+// the useful thing to hand them is which verb to type instead.
+func (s *server) refuseRetiredKick(ctx context.Context, conn *tls.Conn) error {
+	s.logger.WarnContext(ctx, "admin kick is retired", peerAttr(conn))
 
 	return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
-		OK:       true,
-		Detail:   fmt.Sprintf("closed %d connection(s) for serial %s", closed, req.Serial),
-		Affected: closed,
+		Detail: "kick is retired: it only closed connections, which a peer reopens at once. " +
+			"Use kill to end one session, or revoke the serial and reload-crl to end an identity",
+	})
+}
+
+// serveKill ends one session named by its snapshot tag, and keeps it ended.
+//
+// Revocation answers "this identity is no longer trusted"; this answers the
+// narrower question revocation is too blunt for: end this one share. Revoking
+// could do it, but only by disowning the certificate, which needs the CA's
+// private key and takes every other session that peer has with it.
+func (s *server) serveKill(ctx context.Context, conn *tls.Conn, body []byte) error {
+	var req proto.AdminKillPayload
+	if err := proto.DecodeAdminPayload(body, &req); err != nil {
+		return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
+			Detail: fmt.Sprintf("malformed kill request: %v", err),
+		})
+	}
+	if req.Tag == "" {
+		return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
+			Detail: "kill requires a session tag",
+		})
+	}
+
+	notified, err := s.registry.Kill(req.Tag)
+	if err != nil {
+		// A tag that names nothing is an operator's typo, not a transport
+		// failure, so it comes back as a refusal they can read rather than
+		// as a dropped admin connection.
+		s.logger.InfoContext(ctx, "admin kill found no session", peerAttr(conn),
+			slog.String("session", req.Tag), slog.Any("err", err))
+
+		return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
+			Detail: err.Error(),
+		})
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(adminReplyTimeout))
+	s.logger.InfoContext(ctx, "admin killed a session", peerAttr(conn),
+		slog.String("session", req.Tag), slog.Int("subscribers_notified", notified))
+
+	return proto.WriteAdminFrame(conn, proto.AdminResult, proto.AdminResultPayload{
+		OK: true,
+		Detail: fmt.Sprintf(
+			"ended session %s and notified %d subscriber(s); it cannot re-register until this relay restarts",
+			req.Tag, notified,
+		),
+		Affected: notified,
 	})
 }
 
 // serveReloadCRL re-reads the revoked-serial file and then closes whatever
 // the new list covers.
 //
-// The kick is not a separate courtesy: reloading alone only affects the next
+// Closing them is not a separate courtesy: reloading alone only affects the next
 // handshake, so a peer that authenticated before the revocation would stay
 // connected indefinitely. Doing both here is what turns ca revoke from
 // bookkeeping into enforcement, which is the whole reason this request

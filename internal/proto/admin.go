@@ -29,16 +29,35 @@ const (
 	// AdminSnapshot carries the answer to AdminList.
 	AdminSnapshot
 
-	// AdminKick asks relay to drop every live connection belonging to one
-	// certificate serial.
+	// AdminKick is retired and no relay serves it any more. It closed every
+	// live connection belonging to one certificate serial and did nothing
+	// else, so the peer reconnected at once - which made it the one admin
+	// verb that could not finish what it started. Ending a share is
+	// AdminKill, and ending an identity is a revoked serial plus
+	// AdminReloadCRL, which closes the connections its new list covers
+	// without needing a separate request.
+	//
+	// The constant stays because the value is what travels: removing it
+	// would renumber every type below and an older client's reload-crl
+	// would arrive as a result frame. Relays answer it with a refusal that
+	// names the replacement.
 	AdminKick
 
 	// AdminReloadCRL asks relay to re-read its revoked-serial file and then
-	// kick whatever the new list covers.
+	// close every live connection the new list covers.
 	AdminReloadCRL
 
 	// AdminResult carries the outcome of a mutating request.
 	AdminResult
+
+	// AdminKill asks relay to end one session and refuse it for the rest of
+	// this relay's life.
+	//
+	// Appended rather than grouped with the verbs it belongs beside: these
+	// values travel as a byte, so inserting one would renumber every type
+	// after it and an older admin client's request would arrive as a
+	// different one entirely. New verbs go on the end, always.
+	AdminKill
 )
 
 // String renders typ for logs and errors. The default arm matters: an admin
@@ -60,6 +79,8 @@ func (t AdminType) String() string {
 		return "reload-crl"
 	case AdminResult:
 		return "result"
+	case AdminKill:
+		return "kill"
 	default:
 		return fmt.Sprintf("AdminType(%d)", uint8(t))
 	}
@@ -95,11 +116,16 @@ type AdminAckPayload struct {
 	Version int    `json:"v"`
 }
 
-// AdminKickPayload names the certificate serial to drop, in the same text
-// form ca crl writes and relay's revocation check compares, so a serial read
-// off a snapshot can be used here unchanged.
-type AdminKickPayload struct {
-	Serial string `json:"serial"`
+// AdminKillPayload names the session to end, by the Tag an admin snapshot
+// shows for it.
+//
+// Deliberately the tag and not the SessionID. The tag is a truncation, and the
+// whole SessionID is what a peer presents to attach to a session (see
+// SessionSummary.Tag) - so an operator names a session on this plane with the
+// same six bytes they can read off a listing or say out loud, and the value
+// that would let someone join one never travels here either.
+type AdminKillPayload struct {
+	Tag string `json:"tag"`
 }
 
 // AdminResultPayload is the outcome of a mutating request. Affected counts

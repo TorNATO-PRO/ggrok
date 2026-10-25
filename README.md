@@ -264,7 +264,7 @@ certificates carry the role before you need one.
 
 ```bash
 ggrok admin ls                                # what is connected, and what it is carrying
-ggrok admin kick -serial <serial>             # drop one identity's connections
+ggrok admin kill --session <tag>              # end one session, and keep it ended
 ggrok admin reload-crl                        # re-read the revoked list, and enforce it
 ```
 
@@ -290,10 +290,52 @@ but it does make that traffic pattern queryable rather than merely inferable fro
 named by the same truncated tag the logs use; the full SessionID, which is what would let someone
 join a tunnel, never appears.
 
-`kick` closes connections and nothing more, so a peer whose certificate is still valid reconnects
-immediately. That is the point of having it separate: evicting a misbehaving but still-trusted peer
-is a different decision from withdrawing its identity. To make it stick, revoke first and then
-`reload-crl`, which does both.
+#### Ending things: kill and revoke
+
+Two levers, differing in scope and in how long they last. Both end whatever is running the moment
+you use them, and - unlike simply closing a connection - both keep it ended.
+
+| | granularity | after it | lasts until |
+|---|---|---|---|
+| `admin kill` | **one session** | publisher is refused and exits | the relay restarts |
+| revoked serial + `reload-crl` | certificate | peer is refused at the handshake | the serial is removed |
+
+`kill` is the one to reach for when a particular share should stop. It takes the session tag `ls`
+prints, ends that session, and remembers it - so the publisher's next registration is refused
+outright and `share` exits with `relay denied this peer` rather than reappearing under the same tag
+a fraction of a second later:
+
+```bash
+ggrok admin ls                                # find the tag
+ggrok admin kill --session 8f8220ea7b37
+```
+
+Two things it deliberately is not. It ends **one share, not one peer**: the same certificate can
+start a new `share` under a new session key, which is a session the relay has never seen and is not
+covered. And the memory of it is the relay process's - a restart forgets every kill. Both of those
+are revocation's job, which is the only lever that disowns an identity, and the only one that
+survives a restart, because it lives in a file rather than in the relay's memory.
+
+The tag is what an operator names a session by, here and everywhere: the full SessionID, which is
+what would let someone *join* the tunnel, never travels on the admin plane either.
+
+There used to be an `admin kick`, which closed a certificate's connections and did nothing else. It
+was retired because it could not finish what it started: `share` cannot tell a closed connection
+from a flapped one, so the peer was back within a fraction of a second. A relay still answers an
+older client's kick, with a refusal naming `kill` and `reload-crl`.
+
+Revoking doesn't strictly need the CA's private key, either. The revoked file is a plain list of hex
+serials, so an operator who can't reach the CA can block a certificate on the spot, provided the
+relay was started with `-revoked-file`:
+
+```bash
+echo 5e4bfca97dc4d74ad8e20739cff609d7 >> /etc/ggrok/revoked.txt
+ggrok admin reload-crl
+```
+
+That leaves the CA's own records disagreeing with the relay - `ca list` won't show the certificate
+as revoked, and the next file `ca crl` writes won't contain it. Treat it as break-glass, and follow
+up with `ca revoke` so the serial isn't silently dropped the next time you copy a fresh list over.
 
 ### Features
 
